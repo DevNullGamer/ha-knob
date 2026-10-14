@@ -177,13 +177,14 @@ struct MergeResult {
 //    the web password off).
 //  - Wi-Fi guard: if wifi.ssid changes (byte for byte) to a non-empty value, the same
 //    patch must carry wifi.password as a string (new password) or null (open network),
-//    else "wifi.password"/"password_required". Changing the SSID to "" (unconfigure)
-//    clears the stored password. An unchanged SSID keeps the normal secret rules.
+//    else "wifi.password"/"password_required". Whenever the patched SSID is ""
+//    (unconfigured), the password is cleared, even if the patch supplied one. An
+//    unchanged non-empty SSID keeps the normal secret rules.
 //  - Token guard: if ha.url moves to a different host:port (lower-cased host, default
 //    port 80/443) or is downgraded from https to http, a non-empty new URL requires a new
-//    ha.token in the same patch (else "ha.token"/"token_required"), and a cleared URL
-//    clears the stored token. A path-only change or an http -> https upgrade on the same
-//    host:port keeps the stored token.
+//    ha.token in the same patch (else "ha.token"/"token_required"). Whenever the patched
+//    URL is "" (unconfigured), the token is cleared, even if the patch supplied one. A
+//    path-only change or an http -> https upgrade on the same host:port keeps the token.
 //  - The merged config must pass validate().
 // Errors use the same {field, message} shape as validate(); malformed JSON gives
 // field "" / "invalid_json".

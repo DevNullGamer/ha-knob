@@ -89,23 +89,37 @@ assets, so `uploadfs` never touches the config.
 
 ### Partition table
 
-`partitions.csv` (16 MB flash), based on Arduino-ESP32's `default_16MB.csv` with the NVS
-partition enlarged from 20 KB to 64 KB. Rewriting the 8 KB `cfg` blob needs space for the
-old and the new copy (about 16.5 KB) next to the secrets and the Wi-Fi/PHY calibration
-data, which does not fit reliably in 20 KB.
+`partitions.csv` (16 MB flash), derived from Arduino-ESP32's `default_16MB.csv`:
 
 | Name | Type | Offset | Size |
 |---|---|---|---|
-| nvs | data/nvs | 0x9000 | 0x10000 (64 KB) |
-| otadata | data/ota | 0x19000 | 0x2000 (8 KB) |
-| app0 | app/ota_0 | 0x20000 | 0x630000 (6.19 MB) |
-| app1 | app/ota_1 | 0x650000 | 0x630000 (6.19 MB) |
-| spiffs (LittleFS) | data/spiffs | 0xC80000 | 0x370000 (3.44 MB) |
+| (unused) | | 0x9000 | 0x5000 (20 KB) |
+| otadata | data/ota | 0xE000 | 0x2000 (8 KB) |
+| app0 | app/ota_0 | 0x10000 | 0x630000 (6.19 MB) |
+| app1 | app/ota_1 | 0x640000 | 0x630000 (6.19 MB) |
+| spiffs (LittleFS) | data/spiffs | 0xC70000 | 0x370000 (3.44 MB) |
+| nvs | data/nvs | 0xFE0000 | 0x10000 (64 KB) |
 | coredump | data/coredump | 0xFF0000 | 0x10000 (64 KB) |
 
-The 20 KB between otadata and app0 is unused padding (app partitions must be 64 KB
-aligned). **Changing the partition table requires `pio run -e t-encoder-pro -t erase`
-followed by an upload**; this wipes the config, all secrets and `ap_pw`.
+Why it looks like this:
+
+- **NVS is 64 KB** (20 KB in the default table): rewriting the 8 KB `cfg` blob needs space
+  for the old and the new copy (about 16.5 KB) next to the secrets and the Wi-Fi/PHY data.
+- **otadata must stay at 0xE000 and app0 at 0x10000.** PlatformIO does not take the upload
+  addresses from the partition table: the Arduino builder always flashes `boot_app0.bin`
+  to 0xE000, and PlatformIO flashes the app to the board's `upload.offset_address`
+  (default 0x10000). A first version of this table moved app0 to 0x20000; the app then
+  landed outside app0 and the board boot-looped (`rst:0x3 RTC_SW_SYS_RST`).
+- So NVS cannot grow in place before 0xE000; it sits at the end of flash instead. ESP-IDF,
+  `Preferences` and the PHY calibration find it by its label `nvs`, not by offset. The old
+  NVS area 0x9000-0xE000 is left unused.
+
+Upload writes against this table: `bootloader.bin` 0x0 (bootloader area), `partitions.bin`
+0x8000 (table), `boot_app0.bin` 0xE000 (otadata), `firmware.bin` 0x10000 (app0);
+`uploadfs` takes its offset from the table (0xC70000, spiffs).
+
+**Changing the partition table requires `pio run -e t-encoder-pro -t erase` followed by an
+upload**; this wipes the config, all secrets and `ap_pw`.
 
 | NVS key | Type | Content |
 |---|---|---|
@@ -180,7 +194,7 @@ never handed to a different (possibly rogue) access point:
 | SSID change | Stored Wi-Fi password |
 |---|---|
 | To a different non-empty SSID | The same request must carry `wifi.password`: a string (new password, 8 to 63 characters) or `null` (open network), else `password_required` |
-| To `""` (unconfigure) | Cleared |
+| To `""` (unconfigure), or an empty SSID in general | Cleared, even if the request carries a password |
 | Unchanged | Normal secret rules (keep / set / clear) |
 
 Token guard for `ha.url` changes:
@@ -189,7 +203,7 @@ Token guard for `ha.url` changes:
 |---|---|
 | Different host:port (host lower-cased, default port 80/443) | New `ha.token` required in the same request, else `token_required` |
 | `https` to `http` on the same host:port (TLS downgrade) | New `ha.token` required, else `token_required` |
-| URL cleared (`""`) | Cleared |
+| URL `""` (unconfigured), cleared or already empty | Cleared, even if the request carries a token |
 | Path-only change, or `http` to `https` (TLS upgrade) on the same host:port | Kept |
 
 Secrets are never returned: the redacted JSON only carries `wifi.password_set`,

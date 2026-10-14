@@ -599,16 +599,14 @@ MergeResult mergePatch(const Config &current, const char *patchJson, size_t leng
                        secrets.wifiPassword);
         if (!r.ok) return fail(r);
         const bool ssidChanged = merged.wifi.ssid != current.wifi.ssid;  // byte for byte
-        if (ssidChanged) {
-            if (merged.wifi.ssid.empty()) {
-                // Unconfigured: a password without an SSID is meaningless.
-                secrets.wifiPassword = SecretChange();
-                secrets.wifiPassword.kind = SecretChange::Kind::Clear;
-            } else if (secrets.wifiPassword.kind == SecretChange::Kind::Keep) {
-                // Never pair the stored password with a new SSID (rogue AP guard): the
-                // patch must give a new password or an explicit null (open network).
-                return fail(ValidationResult::failure("wifi.password", "password_required"));
-            }
+        if (merged.wifi.ssid.empty()) {
+            // Not configured: a password without an SSID is meaningless, never store one.
+            secrets.wifiPassword = SecretChange();
+            secrets.wifiPassword.kind = SecretChange::Kind::Clear;
+        } else if (ssidChanged && secrets.wifiPassword.kind == SecretChange::Kind::Keep) {
+            // Never pair the stored password with a new SSID (rogue AP guard): the patch
+            // must give a new password or an explicit null (open network).
+            return fail(ValidationResult::failure("wifi.password", "password_required"));
         }
         restartWifi = ssidChanged || secrets.wifiPassword.kind != SecretChange::Kind::Keep;
     }
@@ -626,6 +624,11 @@ MergeResult mergePatch(const Config &current, const char *patchJson, size_t leng
             if (secrets.haToken.kind == SecretChange::Kind::Keep) {
                 secrets.haToken.kind = SecretChange::Kind::Clear;
             }
+        }
+        if (merged.ha.url.empty()) {
+            // Not configured: a token without a URL is never stored (mirrors Wi-Fi).
+            secrets.haToken = SecretChange();
+            secrets.haToken.kind = SecretChange::Kind::Clear;
         }
     }
 

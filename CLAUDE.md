@@ -133,8 +133,9 @@ line, not only on `BOOT`.
   change or an http -> https upgrade on the same host:port keeps it.
 - Wi-Fi guard (mirrors the token guard, against rogue APs): a `wifi.ssid` change (byte for
   byte) to a non-empty value needs `wifi.password` in the same patch, as a string or `null`
-  (open network), else `wifi.password`/`password_required`; changing the SSID to `""`
-  clears `wifi_pw`.
+  (open network), else `wifi.password`/`password_required`. An empty SSID after the patch
+  always clears `wifi_pw`; likewise an empty `ha.url` always clears `ha_token` (a secret is
+  never stored without the setting it belongs to).
 - `ConfigStore::applyPatch` sets `MergeResult::cfgWritten` when the cfg blob was written,
   even if a later secret write failed (`ok=false`, `nvs_write_failed`).
 - `ConfigStore::save` order: remove the old `ha_token`/`wifi_pw` if they change (abort on
@@ -144,8 +145,16 @@ line, not only on `BOOT`.
   at that point). A stored `cfg` that is empty, > 8 KB or unreadable is `Corrupt` (never
   overwritten automatically).
 - **Custom `partitions.csv`, NVS 64 KB** (was 20 KB in `default_16MB.csv`) so the 8 KB cfg
-  blob can be rewritten safely; app0/app1 0x630000 each, spiffs 0x370000. Changing the
-  table requires `pio run -e t-encoder-pro -t erase` + upload.
+  blob can be rewritten safely. otadata 0xE000, app0 0x10000 / app1 0x640000 (0x630000
+  each), spiffs 0xC70000 (0x370000), **nvs 0xFE0000**, coredump 0xFF0000; 0x9000-0xE000
+  unused. Changing the table requires `pio run -e t-encoder-pro -t erase` + upload.
+- **PlatformIO offset pitfall:** upload addresses do NOT come from the partition table.
+  The Arduino builder always writes `boot_app0.bin` to 0xE000 and PlatformIO writes the app
+  to `upload.offset_address` (default 0x10000). otadata must stay at 0xE000 and app0 at
+  0x10000, otherwise the board boot-loops (`rst:0x3 RTC_SW_SYS_RST`; happened in Step 3
+  with app0 at 0x20000). NVS is found by label, so it may live anywhere. Check after any
+  table change: `pio run -e t-encoder-pro -t envdump` (FLASH_EXTRA_IMAGES,
+  ESP32_APP_OFFSET) against `gen_esp32part.py .pio/build/t-encoder-pro/partitions.bin`.
 - Size: 24 controls with 48-byte labels and typical entity ids serialise to about 3.8-4 KB;
   extreme cases (255-char entity ids) are rejected by `validate()` as `controls/too_large`.
 - `parseUrlEndpoint()` in ConfigModel is a minimal URL check; Step 5's `HaUrl` should take it

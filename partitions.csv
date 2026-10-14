@@ -1,11 +1,18 @@
-# HA Knob partition table (16 MB flash). Based on Arduino-ESP32's default_16MB.csv with
-# NVS enlarged from 20 KB to 64 KB: rewriting the 8 KB "cfg" blob needs room for the old
-# and new copy (~16.5 KB) next to the secrets and the Wi-Fi/PHY data.
+# HA Knob partition table (16 MB flash).
+#
+# Why it looks like this:
+# - otadata MUST stay at 0xe000 and app0 at 0x10000: the Arduino builder always flashes
+#   boot_app0.bin to 0xe000 and PlatformIO flashes the app to board upload.offset_address
+#   (default 0x10000), whatever this table says. Moving them breaks booting.
+# - NVS is 64 KB (default_16MB.csv has 20 KB) so the 8 KB "cfg" blob can be rewritten
+#   safely next to the secrets and Wi-Fi/PHY data. It cannot grow in place before 0xe000,
+#   so it lives at the end of flash; IDF and Preferences find it by its label "nvs".
+# - 0x9000-0xe000 (20 KB) is unused.
 # Changing this table requires `pio run -e t-encoder-pro -t erase` before the next upload.
 # Name,   Type, SubType,  Offset,   Size,     Flags
-nvs,      data, nvs,      0x9000,   0x10000,
-otadata,  data, ota,      0x19000,  0x2000,
-app0,     app,  ota_0,    0x20000,  0x630000,
-app1,     app,  ota_1,    0x650000, 0x630000,
-spiffs,   data, spiffs,   0xC80000, 0x370000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x630000,
+app1,     app,  ota_1,    0x640000, 0x630000,
+spiffs,   data, spiffs,   0xC70000, 0x370000,
+nvs,      data, nvs,      0xFE0000, 0x10000,
 coredump, data, coredump, 0xFF0000, 0x10000,
