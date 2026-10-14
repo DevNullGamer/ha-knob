@@ -2,14 +2,17 @@
 //
 // Serial log lines:
 //   BOOT fw=<v> psram=<bytes> flash=<bytes> touch=<CST816|CHSC5816|none> heap=<bytes>
+//        cfg=<defaults|loaded>
 //   ENC d=<+1|-1> count=<n>
 //   BTN down | up | short | long | verylong
 //   TOUCH swipe=<left|right>
-//   HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n>   (every 5 s)
+//   HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<..>   (every 5 s)
+//   CFG ...   config store events (see src/config/ConfigStore.h)
 
 #include <Arduino.h>
 #include <lvgl.h>
 
+#include "config/ConfigStore.h"
 #include "hal/Button.h"
 #include "hal/Buzzer.h"
 #include "hal/Display.h"
@@ -23,22 +26,26 @@ namespace {
 constexpr uint32_t kHeartbeatMs = 5000;
 constexpr uint32_t kLoopDelayMs = 5;
 
+ConfigStore configStore;
+const char *bootCfgSource = "defaults";  // how this boot got its config: defaults | loaded
 bool displayOk = false;
 int32_t shownCount = 0;
 uint32_t lastHeartbeatMs = 0;
 
 void printBootLine() {
-    Serial.printf("BOOT fw=%s psram=%u flash=%u touch=%s heap=%u\n", FW_VERSION,
+    Serial.printf("BOOT fw=%s psram=%u flash=%u touch=%s heap=%u cfg=%s\n", FW_VERSION,
                   static_cast<unsigned>(ESP.getPsramSize()),
                   static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
-                  static_cast<unsigned>(ESP.getFreeHeap()));
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  bootCfgSource);
 }
 
 void printHeartbeat(uint32_t nowMs) {
-    Serial.printf("HB up=%u psram=%u flash=%u touch=%s count=%d\n",
+    Serial.printf("HB up=%u psram=%u flash=%u touch=%s count=%d ctl=%u cfg=%s\n",
                   static_cast<unsigned>(nowMs / 1000), static_cast<unsigned>(ESP.getPsramSize()),
                   static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
-                  static_cast<int>(shownCount));
+                  static_cast<int>(shownCount),
+                  static_cast<unsigned>(configStore.config().controls.size()), bootCfgSource);
 }
 
 void handleEncoder() {
@@ -98,7 +105,14 @@ void setup() {
     Serial.begin(115200);
     Serial.setTxTimeoutMs(0);  // never block when no USB host is attached
 
+    configStore.begin();
+    bootCfgSource = configStore.loadedFromNvs() ? "loaded" : "defaults";
+    const core::config::Config config = configStore.config();
+
     displayOk = hal::display::begin();
+    if (displayOk) {
+        hal::display::setBrightnessPercent(config.device.brightness);
+    }
     hal::touch::begin();
     hal::encoder::begin();
     hal::button::begin();

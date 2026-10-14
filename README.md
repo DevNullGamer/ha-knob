@@ -4,10 +4,11 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.2.0, Step 2 (input core and UI shell).** The firmware has its final module
-structure for the hardware (display, touch swipes, encoder, button, buzzer) and shows a boot
-screen followed by a status screen ("Wi-Fi: not configured"). Wi-Fi, the web UI and the
-Home Assistant connection come in later steps.
+**Status: v0.3.0, Step 3 (config model and persistent store).** The firmware has its final
+module structure for the hardware (display, touch swipes, encoder, button, buzzer), shows a
+boot screen followed by a status screen ("Wi-Fi: not configured"), and loads its
+configuration from NVS (applying the display brightness). Wi-Fi, the web UI and the Home
+Assistant connection come in later steps.
 
 ## Prerequisites
 
@@ -26,6 +27,7 @@ The project path may contain spaces; this is verified to work.
 | Build firmware | `pio run -e t-encoder-pro` |
 | Flash firmware | `pio run -e t-encoder-pro -t upload` |
 | Flash web UI files (from a later step) | `pio run -e t-encoder-pro -t uploadfs` |
+| Erase the whole flash (resets the config and all secrets, incl. `ap_pw`; upload again afterwards) | `pio run -e t-encoder-pro -t erase` |
 | Serial monitor | `pio device monitor` |
 | Host unit tests | `pio test -e native` |
 | Serial assertions | see below |
@@ -59,7 +61,13 @@ every 5 seconds.
 ### Serial log lines
 
 ```
-BOOT fw=<version> psram=<bytes> flash=<bytes> touch=<CST816|CHSC5816|none> heap=<bytes>
+BOOT fw=<version> psram=<bytes> flash=<bytes> touch=<CST816|CHSC5816|none> heap=<bytes> cfg=<defaults|loaded>
+CFG loaded controls=<n>                  config read from NVS
+CFG defaults reason=<missing|corrupt|schema|invalid>[ field=.. error=..]
+CFG ap_pw generated                      first boot only
+CFG saved controls=<n> bytes=<n>
+CFG secrets wifi_pw_set=<0|1> ha_token_set=<0|1> web_pw_set=<0|1> ap_pw_set=<0|1>[ token_set len=<n>]
+CFG factory reset ok=<0|1>
 ENC d=<+1|-1> count=<n>                  one line per detent, clockwise = +1
 BTN down                                 debounced press (the buzzer clicks)
 BTN up + BTN short                       release before 600 ms
@@ -67,8 +75,87 @@ BTN long                                 held 600 ms (fired while held; no "shor
 BTN verylong                             held 10 s
 BTN up                                   release after long / verylong
 TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
-HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n>   every 5 s
+HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded>   every 5 s
 ```
+
+The CFG lines are printed at boot, usually before the PC has attached, so `BOOT ... cfg=`
+and `HB ... ctl= cfg=` are the reliable way to see the load state (`cfg` = how this boot
+got its config).
+
+## Configuration
+
+The configuration is stored in NVS, namespace `haknob`. LittleFS only ever holds web
+assets, so `uploadfs` never touches the config.
+
+| NVS key | Type | Content |
+|---|---|---|
+| `cfg` | blob | Non-secret config JSON (below), at most 8 KB |
+| `wifi_pw` | string | Wi-Fi password (secret) |
+| `ha_token` | string | Home Assistant long-lived token (secret, at most 512 characters) |
+| `web_pw` | string | Optional web UI password (secret; none = no password, the default) |
+| `ap_pw` | string | Random 10-character WPA2 password for the setup AP; generated on first boot, kept by factory reset |
+
+On the very first boot (nothing stored) the defaults are used and saved, so the next boot
+logs `CFG loaded`. A corrupt or invalid stored config, or one with a newer schema, gives
+defaults for that boot and is left in place until the next save.
+
+Non-secret config, schema 1 (defaults shown; `controls` example):
+
+```json
+{
+  "schema": 1,
+  "device":  { "hostname": "ha-knob", "brightness": 80, "dim_after_s": 30, "dim_level": 15,
+               "off_after_s": 300, "buzzer": true, "encoder_reverse": false, "accel": true,
+               "send_interval_ms": 250 },
+  "wifi":    { "ssid": "" },
+  "ha":      { "url": "" },
+  "controls": [
+    { "entity_id": "light.kitchen", "label": "", "action": "brightness", "step": 5, "press": "toggle" }
+  ]
+}
+```
+
+Validation (`lib/core/src/config/ConfigModel.cpp`, first failure is reported as
+`{field, message}`):
+
+| Field | Rule |
+|---|---|
+| `device.hostname` | `[a-z0-9-]`, 1 to 32 characters |
+| `device.brightness` | 5 to 100 |
+| `device.dim_level` | 0 to 100 |
+| `device.dim_after_s`, `device.off_after_s` | 0 to 86400 (0 = never) |
+| `device.send_interval_ms` | 100 to 2000 |
+| `wifi.ssid` | empty (not configured) or at most 32 bytes |
+| `wifi.password` | 8 to 63 printable ASCII characters (none stored = open network) |
+| `ha.url` | empty (not configured) or `http(s)://host[:port][/prefix]`, host up to 253 characters, port 1 to 65535 |
+| `ha.token` | up to 512 printable ASCII characters, no spaces |
+| `web.password` | up to 64 characters, no control characters |
+| `controls` | at most 24; the serialised config must fit in 8 KB |
+| `entity_id` | `[a-z_]+\.[a-z0-9_]+`, at most 255 characters, domain light, climate, cover, fan, media_player, switch or input_boolean |
+| `label` | at most 48 bytes of UTF-8 (æ ø å etc. allowed), no control characters |
+| `action`, `press`, `step` | must be offered by the domain (`lib/core/src/control/DomainActions.cpp`); `step` within the action's range |
+
+The same `entity_id` may appear in several controls (e.g. one for brightness and one for
+colour temperature). A control without `action`, `step` or `press` gets the domain's
+defaults. Unknown keys are ignored; a missing section takes its defaults.
+
+Encoder actions per domain (default first) and step default / range:
+
+| Domain | Encoder actions | Press actions |
+|---|---|---|
+| light | `brightness` 5 (1-25), `hue` 10 (1-60), `color_temp` 100 (25-1000), `none` | `toggle`, `none` |
+| climate | `target_temp` 0.5 (0.1-5), `none` | `none`, `toggle` |
+| cover | `position` 10 (1-25), `none` | `toggle`, `stop`, `none` |
+| fan | `percentage` 10 (1-50), `none` | `toggle`, `none` |
+| media_player | `volume` 2 (1-20), `none` | `play_pause`, `toggle`, `mute`, `none` |
+| switch, input_boolean | `none` | `toggle`, `none` |
+
+Patch semantics (`mergePatch`, used by `POST /api/config` from Step 4): a section present
+in the patch replaces that section; secrets (`wifi.password`, `ha.token`, `web.password`)
+are kept when absent or `""`, set when a string, cleared when `null`. Changing `ha.url` to a
+different host:port requires a new `ha.token` in the same request (`token_required`), and
+the stored token is cleared on any URL change. Secrets are never returned: the redacted
+JSON only carries `wifi.password_set`, `ha.token_set` and `web.password_set`.
 
 ## Hardware notes
 
@@ -148,10 +235,11 @@ All versions are pinned exactly in `platformio.ini`.
 | `moononournation/GFX Library for Arduino` | 1.5.0 | Upstream `Arduino_CO5300` + `Arduino_ESP32QSPI`; same version as the vendor uses; builds on core 2.0.17 |
 | `lvgl/lvgl` | 9.2.2 | Maintained v9 line; matches the vendor `lvgl_9` example |
 | `lewisxhe/SensorLib` | 0.3.4 | CST816 and CHSC5816 touch drivers; latest 0.3.x release, builds on core 2.0.17 |
+| `bblanchon/ArduinoJson` | 7.4.3 | Config JSON (both envs); current v7 release, custom allocator support for PSRAM |
 | `throwtheswitch/Unity` | 2.6.1 | Host test framework (native env); pinned to the version PlatformIO resolved |
 
 Licences:
-- LVGL MIT, SensorLib MIT.
+- LVGL MIT, SensorLib MIT, ArduinoJson MIT.
 - Fonts: the Montserrat and FontAwesome Free font files are SIL OFL 1.1; the FontAwesome
   Free icon designs are CC BY 4.0. The generated `src/ui/fonts/*.c` are derived fonts, so
   before any public release the OFL notices (and FontAwesome attribution) must ship with
@@ -167,9 +255,12 @@ Licences:
 ```
 include/          board_pins.h (GPIO map), lv_conf.h (LVGL config), version.h
 src/main.cpp      setup()/loop() wiring only
-src/hal/          Display, Touch, Encoder, Button, Buzzer (hardware glue)
+src/hal/          Display, Touch, Encoder, Button, Buzzer, PsramAllocator (hardware glue)
+src/config/       ConfigStore (NVS persistence, mutex)
 src/ui/           Ui (screen manager), Widgets, screens/, fonts/ (generated)
 lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the host
+  src/config/     ConfigModel (schema, JSON, validation, redaction, patch merge)
+  src/control/    DomainActions (per-domain actions, presses and step ranges)
   src/input/      QuadratureDecoder, ButtonFsm, Acceleration, SwipeClassifier
   src/ui/         Presenter (number formatting)
   src/util/       MathUtil
@@ -179,6 +270,10 @@ tools/            serial_check.py, gen_fonts.sh
 
 ## Security
 
-- No secrets (Wi-Fi passwords, Home Assistant tokens) are ever committed. They will live
-  only in the device's NVS, entered through the device web UI. `.gitignore` excludes
-  `*.local.ini`, `secrets*` and `.env*`.
+- No secrets (Wi-Fi passwords, Home Assistant tokens) are ever committed. They live only
+  in the device's NVS, entered through the device web UI (from Step 4). `.gitignore`
+  excludes `*.local.ini`, `secrets*` and `.env*`.
+- Secrets are stored separately from the config JSON, are never returned by the API (only
+  `*_set` flags) and are never logged (at most `token_set len=N`).
+- NVS is not encrypted: anyone with physical access can read the token. Use a dedicated
+  non-admin Home Assistant user for the knob's token.
