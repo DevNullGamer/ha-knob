@@ -21,7 +21,9 @@ uint32_t bootStartMs = 0;
 void begin(uint32_t nowMs) {
     bootScr = bootScreen::create();
     statusScr = statusScreen::create();
+    lv_obj_t *defaultScr = lv_screen_active();  // empty screen made by lv_display_create()
     lv_screen_load(bootScr);
+    lv_obj_delete(defaultScr);
     booting = true;
     bootStartMs = nowMs;
 }

@@ -10,7 +10,8 @@ namespace core {
 // Events:
 //  Pressed        debounced press (raw level stable for 30 ms)
 //  ShortPress     release of a press that did not reach LongPress
-//  LongPress      held >= 600 ms (measured from the press edge), fired once while held
+//  LongPress      held >= 600 ms (measured from the press edge), fired once while held;
+//                 a press whose contact opens before 600 ms ends as ShortPress
 //  VeryLongPress  held >= 10 s, fired once while held
 //  Released       release after LongPress / VeryLongPress (no ShortPress then)
 // At most one event is returned per call.

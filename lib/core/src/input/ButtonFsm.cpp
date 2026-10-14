@@ -19,7 +19,9 @@ ButtonFsm::Event ButtonFsm::update(bool rawDown, uint32_t nowMs) {
         return longFired_ ? Event::Released : Event::ShortPress;
     }
 
-    if (stableDown_) {
+    // Only while the raw level is still down: once the contact has opened, the press is
+    // over (pending the release debounce) and must not turn into a long press.
+    if (stableDown_ && rawDown_) {
         const uint32_t heldMs = nowMs - pressStartMs_;
         if (!longFired_ && heldMs >= kLongPressMs) {
             longFired_ = true;

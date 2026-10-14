@@ -150,10 +150,17 @@ All versions are pinned exactly in `platformio.ini`.
 | `lewisxhe/SensorLib` | 0.3.4 | CST816 and CHSC5816 touch drivers; latest 0.3.x release, builds on core 2.0.17 |
 | `throwtheswitch/Unity` | 2.6.1 | Host test framework (native env); pinned to the version PlatformIO resolved |
 
-Licences: LVGL MIT, SensorLib MIT, Montserrat and FontAwesome Free fonts SIL OFL 1.1. Arduino_GFX: licence unconfirmed / mixed (the 1.5.0
-package ships no LICENSE file; much of it is derived from Adafruit-GFX, which is BSD);
-acceptable for this private project, to be rechecked before any public release. The LilyGo vendor repository is GPL-3.0; this project
-uses only hardware facts (pin numbers, panel quirks) from it and copies none of its files.
+Licences:
+- LVGL MIT, SensorLib MIT.
+- Fonts: the Montserrat and FontAwesome Free font files are SIL OFL 1.1; the FontAwesome
+  Free icon designs are CC BY 4.0. The generated `src/ui/fonts/*.c` are derived fonts, so
+  before any public release the OFL notices (and FontAwesome attribution) must ship with
+  them.
+- Arduino_GFX: licence unconfirmed / mixed (the 1.5.0 package ships no LICENSE file; much
+  of it is derived from Adafruit-GFX, which is BSD); acceptable for this private project,
+  to be rechecked before any public release.
+- The LilyGo vendor repository is GPL-3.0; this project uses only hardware facts (pin
+  numbers, panel quirks) from it and copies none of its files.
 
 ## Project layout
 

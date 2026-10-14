@@ -1,7 +1,6 @@
 #include "ui/screens/StatusScreen.h"
 
 #include "ui/Widgets.h"
-#include "ui/fonts/Fonts.h"
 
 namespace ui {
 namespace statusScreen {
