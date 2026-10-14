@@ -427,6 +427,86 @@ static void test_button_millis_wraparound() {
     TEST_ASSERT_EQUAL_UINT32(base + 700, lp->ms);
 }
 
+// Regression (Step 2 round 1): a release inside the 30 ms debounce window right before the
+// 600 ms / 10 s marks must not turn into LongPress / VeryLongPress.
+static void test_button_release_599ms_is_short_not_long() {
+    ButtonFsm fsm;
+    std::vector<TimedEvent> ev;
+    drive(fsm, true, 0, 599, ev);  // raw down for 599 ms
+    drive(fsm, false, 599, 1500, ev);
+    TEST_ASSERT_EQUAL_INT(0, countOf(ev, ButtonFsm::Event::LongPress));
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::ShortPress));
+    TEST_ASSERT_EQUAL_INT(0, countOf(ev, ButtonFsm::Event::Released));
+}
+
+static void test_button_release_600ms_is_long() {
+    ButtonFsm fsm;
+    std::vector<TimedEvent> ev;
+    drive(fsm, true, 0, 601, ev);  // raw down at t=600 -> held 600 ms
+    drive(fsm, false, 601, 1500, ev);
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::LongPress));
+    TEST_ASSERT_EQUAL_UINT32(600, firstOf(ev, ButtonFsm::Event::LongPress)->ms);
+    TEST_ASSERT_EQUAL_INT(0, countOf(ev, ButtonFsm::Event::ShortPress));
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::Released));
+}
+
+static void test_button_chatter_across_600ms_delays_long_fires_once() {
+    ButtonFsm fsm;
+    std::vector<TimedEvent> ev;
+    drive(fsm, true, 0, 595, ev);
+    drive(fsm, false, 595, 605, ev);  // 10 ms contact chatter across the 600 ms mark
+    TEST_ASSERT_EQUAL_INT(0, countOf(ev, ButtonFsm::Event::LongPress));
+    drive(fsm, true, 605, 1200, ev);  // contact recloses, real hold continues
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::LongPress));
+    TEST_ASSERT_EQUAL_UINT32(605, firstOf(ev, ButtonFsm::Event::LongPress)->ms);
+    drive(fsm, false, 1200, 1500, ev);
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::Pressed));
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::LongPress));
+    TEST_ASSERT_EQUAL_INT(0, countOf(ev, ButtonFsm::Event::ShortPress));
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::Released));
+}
+
+static void test_button_repeated_chatter_after_long_no_refire() {
+    ButtonFsm fsm;
+    std::vector<TimedEvent> ev;
+    drive(fsm, true, 0, 700, ev);
+    for (uint32_t t = 700; t < 1500; t += 50) {
+        drive(fsm, false, t, t + 10, ev);
+        drive(fsm, true, t + 10, t + 50, ev);
+    }
+    drive(fsm, false, 1500, 1800, ev);
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::Pressed));
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::LongPress));
+    TEST_ASSERT_EQUAL_INT(0, countOf(ev, ButtonFsm::Event::ShortPress));
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::Released));
+}
+
+static void test_button_chatter_across_10s_delays_very_long_fires_once() {
+    ButtonFsm fsm;
+    std::vector<TimedEvent> ev;
+    drive(fsm, true, 0, 9995, ev);
+    drive(fsm, false, 9995, 10005, ev);  // chatter across the 10 s mark
+    TEST_ASSERT_EQUAL_INT(0, countOf(ev, ButtonFsm::Event::VeryLongPress));
+    drive(fsm, true, 10005, 12000, ev);
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::VeryLongPress));
+    TEST_ASSERT_EQUAL_UINT32(10005, firstOf(ev, ButtonFsm::Event::VeryLongPress)->ms);
+    drive(fsm, false, 12000, 12500, ev);
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::Pressed));
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::LongPress));
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::VeryLongPress));
+    TEST_ASSERT_EQUAL_INT(0, countOf(ev, ButtonFsm::Event::ShortPress));
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::Released));
+}
+
+static void test_button_release_just_before_10s_no_very_long() {
+    ButtonFsm fsm;
+    std::vector<TimedEvent> ev;
+    drive(fsm, true, 0, 9999, ev);
+    drive(fsm, false, 9999, 11000, ev);
+    TEST_ASSERT_EQUAL_INT(0, countOf(ev, ButtonFsm::Event::VeryLongPress));
+    TEST_ASSERT_EQUAL_INT(1, countOf(ev, ButtonFsm::Event::Released));
+}
+
 static void test_button_event_names() {
     TEST_ASSERT_EQUAL_STRING("short", core::buttonEventName(ButtonFsm::Event::ShortPress));
     TEST_ASSERT_EQUAL_STRING("long", core::buttonEventName(ButtonFsm::Event::LongPress));
@@ -671,6 +751,12 @@ int main() {
     RUN_TEST(test_button_bounce_on_press_edge_single_press);
     RUN_TEST(test_button_two_consecutive_presses);
     RUN_TEST(test_button_millis_wraparound);
+    RUN_TEST(test_button_release_599ms_is_short_not_long);
+    RUN_TEST(test_button_release_600ms_is_long);
+    RUN_TEST(test_button_chatter_across_600ms_delays_long_fires_once);
+    RUN_TEST(test_button_repeated_chatter_after_long_no_refire);
+    RUN_TEST(test_button_chatter_across_10s_delays_very_long_fires_once);
+    RUN_TEST(test_button_release_just_before_10s_no_very_long);
     RUN_TEST(test_button_event_names);
     // Acceleration
     RUN_TEST(test_accel_first_detent_is_one);
