@@ -163,7 +163,11 @@ struct MergeResult {
     ValidationResult error;  // set when !ok
     Config config;           // merged config when ok (unchanged copy of current otherwise)
     SecretChanges secrets;   // what to do with the stored secrets
-    bool restartWifi = false;  // wifi.ssid or wifi.password changed
+    // wifi.ssid changed, or wifi.password is set/cleared for a configured SSID. Not set
+    // when the SSID was and stays "" (the forced password Clear then changes nothing Wi-Fi
+    // uses). A password Set to the value already stored still reports true: mergePatch
+    // cannot see stored secrets, so the device compares the actual credentials.
+    bool restartWifi = false;
     // Set by ConfigStore::applyPatch (never by mergePatch): the cfg blob was written,
     // so the stored config may have changed even if a later secret write failed.
     bool cfgWritten = false;

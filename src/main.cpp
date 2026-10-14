@@ -6,11 +6,19 @@
 //   ENC d=<+1|-1> count=<n>
 //   BTN down | up | short | long | verylong
 //   TOUCH swipe=<left|right>
-//   HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<..>   (every 5 s)
+//   HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<..>
+//      wifi=<off|ap|sta|ap_sta> ip=<ip>   (every 5 s; ip = STA IP, else 192.168.4.1 with the
+//      setup AP up, else 0.0.0.0)
 //   CFG ...   config store events (see src/config/ConfigStore.h)
+//   WIFI ...  Wi-Fi events (see src/net/WifiManager.h)
+//   WEB ...   web server events (see src/net/WebServer.h)
+//   SYS reboot | SYS factory reset
 
 #include <Arduino.h>
 #include <lvgl.h>
+
+#include <string>
+#include <vector>
 
 #include "config/ConfigStore.h"
 #include "hal/Button.h"
@@ -18,6 +26,8 @@
 #include "hal/Display.h"
 #include "hal/Encoder.h"
 #include "hal/Touch.h"
+#include "net/WebServer.h"
+#include "net/WifiManager.h"
 #include "ui/Ui.h"
 #include "version.h"
 
@@ -25,12 +35,18 @@ namespace {
 
 constexpr uint32_t kHeartbeatMs = 5000;
 constexpr uint32_t kLoopDelayMs = 5;
+constexpr uint32_t kSystemRequestDelayMs = 750;  // let the HTTP response go out first
 
 ConfigStore configStore;
 const char *bootCfgSource = "defaults";  // how this boot got its config: defaults | loaded
 bool displayOk = false;
 int32_t shownCount = 0;
 uint32_t lastHeartbeatMs = 0;
+std::string apPassword;  // shown on the setup screen
+net::wifi::Status shownWifi;
+ui::NetworkView shownView;
+net::web::SystemRequest pendingSystem = net::web::SystemRequest::None;
+uint32_t pendingSystemAtMs = 0;
 
 void printBootLine() {
     Serial.printf("BOOT fw=%s psram=%u flash=%u touch=%s heap=%u cfg=%s\n", FW_VERSION,
@@ -41,11 +57,78 @@ void printBootLine() {
 }
 
 void printHeartbeat(uint32_t nowMs) {
-    Serial.printf("HB up=%u psram=%u flash=%u touch=%s count=%d ctl=%u cfg=%s\n",
+    const net::wifi::Status &wifi = net::wifi::status();
+    const char *ip = wifi.staConnected ? wifi.staIp.c_str()
+                     : wifi.apActive   ? net::wifi::kApIp
+                                       : "0.0.0.0";
+    Serial.printf("HB up=%u psram=%u flash=%u touch=%s count=%d ctl=%u cfg=%s wifi=%s ip=%s\n",
                   static_cast<unsigned>(nowMs / 1000), static_cast<unsigned>(ESP.getPsramSize()),
                   static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
                   static_cast<int>(shownCount),
-                  static_cast<unsigned>(configStore.controlCount()), bootCfgSource);
+                  static_cast<unsigned>(configStore.controlCount()), bootCfgSource,
+                  net::wifi::modeName(wifi.mode), ip);
+}
+
+// Publishes Wi-Fi state changes to the web server snapshot and the screens.
+void publishNetwork() {
+    const net::wifi::Status &wifi = net::wifi::status();
+    if (wifi == shownWifi) {
+        return;
+    }
+    shownWifi = wifi;
+    net::web::publishNetwork(wifi);
+
+    ui::NetworkView view;
+    view.ssid = wifi.ssid;
+    view.staConnected = wifi.staConnected;
+    view.staIp = wifi.staIp;
+    view.apActive = wifi.apActive;
+    view.apSsid = wifi.apSsid;
+    view.apPassword = apPassword;
+    view.hostname = wifi.hostname;
+    if (displayOk && view != shownView) {
+        ui::showNetwork(view);
+    }
+    shownView = view;
+}
+
+// Work requested by the web server (whose callbacks run in the async_tcp task).
+void handleWebRequests(uint32_t nowMs) {
+    if (net::web::takeConfigDirty()) {
+        const core::config::Config config = configStore.config();
+        if (displayOk) {
+            hal::display::setBrightnessPercent(config.device.brightness);
+        }
+        net::wifi::applyConfig(config.wifi.ssid, configStore.wifiPassword(), config.device.hostname,
+                               nowMs);
+    }
+
+    if (net::web::takeScanRequest() && !net::wifi::startScan()) {
+        net::web::publishScan({}, true, nowMs);
+    }
+    std::vector<net::wifi::ScanNetwork> networks;
+    bool scanFailed = false;
+    if (net::wifi::takeScanResults(networks, scanFailed)) {
+        net::web::publishScan(networks, scanFailed, nowMs);
+    }
+
+    const net::web::SystemRequest request = net::web::takeSystemRequest();
+    if (request != net::web::SystemRequest::None && pendingSystem == net::web::SystemRequest::None) {
+        pendingSystem = request;
+        pendingSystemAtMs = nowMs + kSystemRequestDelayMs;
+    }
+    if (pendingSystem != net::web::SystemRequest::None &&
+        static_cast<int32_t>(nowMs - pendingSystemAtMs) >= 0) {
+        if (pendingSystem == net::web::SystemRequest::FactoryReset) {
+            Serial.println("SYS factory reset");
+            configStore.factoryReset();
+        } else {
+            Serial.println("SYS reboot");
+        }
+        Serial.flush();
+        delay(50);
+        ESP.restart();
+    }
 }
 
 void handleEncoder() {
@@ -122,6 +205,12 @@ void setup() {
     } else {
         Serial.println("ERR display init failed");
     }
+
+    apPassword = configStore.apPassword();
+    net::wifi::begin(config.wifi.ssid, configStore.wifiPassword(), config.device.hostname, apPassword,
+                     millis());
+    publishNetwork();  // the web server guards need the network state from the start
+    net::web::begin(configStore, hal::touch::variantName());
     printBootLine();
 }
 
@@ -132,6 +221,9 @@ void loop() {
     handleButton(nowMs);
     handleTouch(nowMs);
     hal::buzzer::loop(nowMs);
+    net::wifi::loop(nowMs);
+    handleWebRequests(nowMs);
+    publishNetwork();
 
     if (nowMs - lastHeartbeatMs >= kHeartbeatMs) {
         lastHeartbeatMs = nowMs;

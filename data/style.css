@@ -1,0 +1,92 @@
+/* HA Knob setup UI */
+:root {
+  --bg: #111418;
+  --panel: #1b2026;
+  --text: #e8eaed;
+  --muted: #9aa0a6;
+  --accent: #41bdf5;
+  --danger: #e5534b;
+  --ok: #3fb950;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+header {
+  background: var(--panel);
+  padding: 0.75rem 1rem 0;
+}
+
+h1 { margin: 0 0 0.5rem; font-size: 1.4rem; }
+h2 { margin-top: 0; font-size: 1.2rem; }
+h3 { margin: 1.5rem 0 0.5rem; font-size: 1.05rem; }
+
+nav { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+
+nav button {
+  background: none;
+  border: none;
+  border-bottom: 3px solid transparent;
+  border-radius: 0;
+  color: var(--muted);
+  padding: 0.5rem 0.75rem;
+}
+
+nav button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+main { max-width: 40rem; margin: 0 auto; padding: 1rem; }
+
+label { display: block; margin: 0.75rem 0; color: var(--muted); }
+label.check { color: var(--text); }
+
+input[type="text"], input:not([type]), input[type="password"], input[type="number"] {
+  display: block;
+  width: 100%;
+  margin-top: 0.25rem;
+  padding: 0.5rem;
+  border: 1px solid #3a414a;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 1rem;
+}
+
+input:disabled { opacity: 0.5; }
+
+button {
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+button:disabled { opacity: 0.5; cursor: default; }
+button.danger { border-color: var(--danger); }
+
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0.75rem 0; }
+
+.hint { color: var(--muted); font-size: 0.9rem; }
+
+.message { padding: 0.75rem; border-radius: 4px; background: var(--panel); border-left: 4px solid var(--accent); }
+.message.success { border-left-color: var(--ok); }
+.message.error { border-left-color: var(--danger); }
+.message a { color: var(--accent); }
+
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+
+.networks { list-style: none; padding: 0; margin: 0.5rem 0; }
+.networks li { margin: 0.25rem 0; }
+.networks button { border-color: #3a414a; text-align: left; }
+
+code { color: var(--accent); }

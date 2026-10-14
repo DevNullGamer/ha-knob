@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HA Knob</title>
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>HA Knob</h1>
+  <nav id="tabs">
+    <button type="button" data-tab="status" class="active">Status</button>
+    <button type="button" data-tab="wifi">Wi-Fi</button>
+    <button type="button" data-tab="ha">Home Assistant</button>
+    <button type="button" data-tab="controls">Controls</button>
+    <button type="button" data-tab="device">Device</button>
+  </nav>
+</header>
+
+<main>
+  <p id="message" class="message" hidden></p>
+
+  <section id="tab-status" class="tab">
+    <h2>Status</h2>
+    <dl id="status-list" class="kv"></dl>
+    <button type="button" id="status-refresh">Refresh</button>
+  </section>
+
+  <section id="tab-wifi" class="tab" hidden>
+    <h2>Wi-Fi</h2>
+    <p>Stored network: <strong id="wifi-current">-</strong>
+      (<span id="wifi-password-set">-</span>)</p>
+    <form id="wifi-form" autocomplete="off">
+      <label>Network (SSID)
+        <input id="wifi-ssid" maxlength="32" spellcheck="false" autocapitalize="off">
+      </label>
+      <div class="row">
+        <button type="button" id="wifi-scan">Scan</button>
+        <span id="wifi-scan-state" class="hint"></span>
+      </div>
+      <ul id="wifi-networks" class="networks"></ul>
+      <label>Password
+        <input id="wifi-password" type="password" maxlength="63" autocomplete="new-password"
+               placeholder="leave empty to keep the stored password">
+      </label>
+      <label class="check"><input id="wifi-open" type="checkbox"> Open network (no password)</label>
+      <div class="row">
+        <button type="submit">Save Wi-Fi</button>
+        <button type="button" id="wifi-forget" class="danger">Forget Wi-Fi</button>
+      </div>
+    </form>
+  </section>
+
+  <section id="tab-ha" class="tab" hidden>
+    <h2>Home Assistant</h2>
+    <p class="hint">Available in a later version.</p>
+  </section>
+
+  <section id="tab-controls" class="tab" hidden>
+    <h2>Controls</h2>
+    <p class="hint">Available in a later version.</p>
+  </section>
+
+  <section id="tab-device" class="tab" hidden>
+    <h2>Device</h2>
+    <form id="device-form" autocomplete="off">
+      <label>Hostname (<span id="device-host-hint">ha-knob</span>.local)
+        <input id="dev-hostname" maxlength="32" pattern="[a-z0-9-]{1,32}" spellcheck="false" autocapitalize="off">
+      </label>
+      <label>Brightness (%)
+        <input id="dev-brightness" type="number" min="5" max="100" step="1">
+      </label>
+      <label>Dim after (s, 0 = never)
+        <input id="dev-dim-after" type="number" min="0" max="86400" step="1">
+      </label>
+      <label>Dim level (%)
+        <input id="dev-dim-level" type="number" min="0" max="100" step="1">
+      </label>
+      <label>Screen off after (s, 0 = never)
+        <input id="dev-off-after" type="number" min="0" max="86400" step="1">
+      </label>
+      <label>Send interval to Home Assistant (ms)
+        <input id="dev-send-interval" type="number" min="100" max="2000" step="1">
+      </label>
+      <label class="check"><input id="dev-buzzer" type="checkbox"> Buzzer click</label>
+      <label class="check"><input id="dev-reverse" type="checkbox"> Reverse encoder direction</label>
+      <label class="check"><input id="dev-accel" type="checkbox"> Encoder acceleration</label>
+      <button type="submit">Save device settings</button>
+    </form>
+
+    <h3>Web password</h3>
+    <p>Web password: <strong id="web-password-set">-</strong> (user name <code>admin</code>)</p>
+    <form id="web-form" autocomplete="off">
+      <label>New web password
+        <input id="web-password" type="password" maxlength="64" autocomplete="new-password">
+      </label>
+      <div class="row">
+        <button type="submit">Set password</button>
+        <button type="button" id="web-remove" class="danger">Remove password</button>
+      </div>
+    </form>
+
+    <h3>System</h3>
+    <div class="row">
+      <button type="button" id="reboot">Reboot</button>
+      <button type="button" id="factory-reset" class="danger">Factory reset</button>
+    </div>
+    <p class="hint">Factory reset erases all settings and passwords (not the setup AP password)
+      and restarts the device in setup mode.</p>
+  </section>
+</main>
+</body>
+</html>

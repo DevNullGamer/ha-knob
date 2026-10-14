@@ -608,7 +608,12 @@ MergeResult mergePatch(const Config &current, const char *patchJson, size_t leng
             // must give a new password or an explicit null (open network).
             return fail(ValidationResult::failure("wifi.password", "password_required"));
         }
-        restartWifi = ssidChanged || secrets.wifiPassword.kind != SecretChange::Kind::Keep;
+        // An SSID that was and stays "" means Wi-Fi stays unconfigured (setup AP only):
+        // the forced Clear above removes at most a stale password and changes nothing that
+        // Wi-Fi uses, so it is not a restart.
+        const bool staysUnconfigured = merged.wifi.ssid.empty() && !ssidChanged;
+        restartWifi = ssidChanged ||
+                      (!staysUnconfigured && secrets.wifiPassword.kind != SecretChange::Kind::Keep);
     }
 
     if (!root["ha"].isNull()) {

@@ -4,11 +4,26 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.3.0, Step 3 (config model and persistent store).** The firmware has its final
-module structure for the hardware (display, touch swipes, encoder, button, buzzer), shows a
-boot screen followed by a status screen ("Wi-Fi: not configured"), and loads its
-configuration from NVS (applying the display brightness). Wi-Fi, the web UI and the Home
-Assistant connection come in later steps.
+**Status: v0.4.0, Step 4 (Wi-Fi provisioning and web setup UI).** The firmware drives the
+hardware (display, touch swipes, encoder, button, buzzer), loads its configuration from NVS,
+joins Wi-Fi (or opens a setup access point) and serves a setup web UI for Wi-Fi and device
+settings. The Home Assistant connection and the controls come in later steps.
+
+## First-time setup
+
+1. Flash the firmware and the web UI files once (`-t upload` and `-t uploadfs`, see below).
+2. The device starts its setup access point. The screen shows its name (`HA-Knob-XXXX`) and
+   its WPA2 password (random, generated on first boot).
+3. Join that network with a phone or laptop. The captive portal opens the setup page; if it
+   does not, open `http://192.168.4.1/`.
+4. In the **Wi-Fi** tab, scan or type the network name, enter its password (or tick
+   "Open network") and save. The device joins the network while the access point stays up.
+   Once connected, the page shows the new address, and the access point shuts down 60 s later.
+5. From then on the setup page is at `http://<device IP>/` or `http://ha-knob.local/` (the
+   status screen shows both).
+
+If the device cannot join the configured network within 30 s, it opens the setup access
+point again (and keeps retrying the network every 60 s).
 
 ## Prerequisites
 
@@ -20,13 +35,20 @@ Assistant connection come in later steps.
 
 The project path may contain spaces; this is verified to work.
 
+Upload times (measured in Step 4, nothing to rebuild): `-t upload` about 53 s, of which
+about 30 s are PlatformIO's pre-upload build check and about 16 s the flash write (1.5 MB
+app, compressed to 0.86 MB, about 925 kbit/s); `-t uploadfs` about 45 s (the 3.4 MB LittleFS
+partition is erased and written in full). Any change to `platformio.ini` (flags, libraries,
+partitions) makes the next build a full rebuild of about 3-4 minutes, which is then part of
+the upload command.
+
 ## Commands
 
 | What | Command |
 |---|---|
 | Build firmware | `pio run -e t-encoder-pro` |
 | Flash firmware | `pio run -e t-encoder-pro -t upload` |
-| Flash web UI files (from a later step) | `pio run -e t-encoder-pro -t uploadfs` |
+| Flash web UI files (`data/` to LittleFS) | `pio run -e t-encoder-pro -t uploadfs` |
 | Erase the whole flash (resets the config and all secrets, incl. `ap_pw`; upload again afterwards) | `pio run -e t-encoder-pro -t erase` |
 | Serial monitor | `pio device monitor` |
 | Host unit tests | `pio test -e native` |
@@ -75,8 +97,24 @@ BTN long                                 held 600 ms (fired while held; no "shor
 BTN verylong                             held 10 s
 BTN up                                   release after long / verylong
 TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
-HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded>   every 5 s
+HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip>   every 5 s
+WIFI ap ssid=<HA-Knob-XXXX> ip=192.168.4.1   setup access point up
+WIFI ap off                              setup access point shut down
+WIFI sta connecting ssid=<ssid>
+WIFI sta connected ip=<ip> rssi=<dBm>
+WIFI sta lost
+WIFI fallback ap_sta                     not connected within 30 s: setup AP up as well
+WIFI restart reason=config               Wi-Fi credentials changed
+WIFI mdns host=<hostname>.local ok=<0|1>
+WEB started port=80 fs=<0|1>             fs=0: LittleFS not mounted (run uploadfs)
+WEB config saved restart_wifi=<0|1>
+WEB config rejected field=<field> error=<error>
+WEB reboot requested | WEB factory reset requested
+SYS reboot | SYS factory reset           performed by the main loop just after the response
 ```
+
+In `HB`, `ip` is the station IP when connected, else `192.168.4.1` while the setup AP is up,
+else `0.0.0.0`. SSIDs are logged, passwords never.
 
 The CFG lines are printed at boot, usually before the PC has attached, so `BOOT ... cfg=`
 and `HB ... ctl= cfg=` are the reliable way to see the load state (`cfg` = how this boot
@@ -184,9 +222,16 @@ Encoder actions per domain (default first) and step default / range:
 | media_player | `volume` 2 (1-20), `none` | `play_pause`, `toggle`, `mute`, `none` |
 | switch, input_boolean | `none` | `toggle`, `none` |
 
-Patch semantics (`mergePatch`, used by `POST /api/config` from Step 4): a section present
-in the patch replaces that section; secrets (`wifi.password`, `ha.token`, `web.password`)
-are kept when absent or `""`, set when a string, cleared when `null`.
+Patch semantics (`mergePatch`, used by `POST /api/config`): a section present in the patch
+replaces that section **literally** (keys missing inside it take their defaults, so a
+`wifi` section without `ssid` unconfigures Wi-Fi); secrets (`wifi.password`, `ha.token`,
+`web.password`) are kept when absent or `""`, set when a string, cleared when `null`.
+Clients must therefore always send whole sections, `ssid` in every `wifi` section, `url` in
+every `ha` section, and the Wi-Fi password together with the SSID (`null` = open network).
+`restartWifi` is reported when the SSID changes or the password is set or cleared for a
+configured SSID (not for an SSID that was and stays empty); the web server additionally
+compares the stored credentials before and after, so saving the same password again does
+not restart Wi-Fi.
 
 Wi-Fi guard for `wifi.ssid` changes (compared byte for byte), so a stored WPA2 password is
 never handed to a different (possibly rogue) access point:
@@ -213,6 +258,57 @@ Save order (`ConfigStore::save`): the old `ha_token` / `wifi_pw` are removed fir
 change (the save aborts if that fails), then `cfg` is written, then the new secret values.
 An interrupted save can therefore leave "new URL, no token", never a new URL with the old
 token.
+
+## Wi-Fi
+
+| Situation | Behaviour |
+|---|---|
+| No SSID configured | Setup AP `HA-Knob-XXXX` (last two MAC bytes) at `192.168.4.1`, WPA2 with the stored `ap_pw`; DNS answers every name with `192.168.4.1` (captive portal) |
+| SSID configured | Station connects (one retry after 15 s). Not connected within 30 s: the setup AP comes up as well (`ap_sta`) and the station retries every 60 s |
+| Station connects while the AP is up | AP stays up for 60 s (so the setup page can show the new IP), then shuts down |
+| Connection lost | Reconnect at once; the 30 s fallback applies again |
+| Credentials changed in the web UI | Wi-Fi restarts 1 s after the response; an AP that is up stays up during the attempt |
+| Hostname changed | mDNS restarts with the new name; DHCP uses it from the next connection |
+
+mDNS announces `<hostname>.local` with an `_http._tcp` service. The Wi-Fi driver's own
+credential storage and auto-reconnect are disabled: the password lives only in the
+`haknob` NVS namespace, and every retry is scheduled by `src/net/WifiManager`.
+
+## Web server and API
+
+ESPAsyncWebServer on port 80. Static files come from LittleFS (`data/`: `index.html`,
+`app.js`, `style.css`; plain files, no build step) with `Cache-Control: no-cache`. If the
+files were never flashed, `/` answers 503 with a hint to run `uploadfs`.
+
+| Method / path | Response |
+|---|---|
+| GET `/api/status` | `{fw, uptime_s, heap_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state:"not_available", ha_version, last_error}}` |
+| GET `/api/config` | Redacted config: secrets only as `wifi.password_set`, `ha.token_set`, `web.password_set` |
+| POST `/api/config` | Patch (see Configuration). `200 {ok:true, restart_wifi}`, `400 {error, field}` (validation), `500 {error:"nvs_write_failed", field}` (storage failed; the config may be partly written and is re-read) |
+| GET `/api/wifi/scan` | `{scanning, age_s, failed, networks:[{ssid, rssi, secure}]}`; starts a new scan when the last one is older than 10 s. Poll until `scanning` is false |
+| POST `/api/reboot` | `200 {ok:true}`, reboots about 0.75 s later |
+| POST `/api/factory-reset` | `200 {ok:true}`, then erases the config and secrets (not `ap_pw`) and reboots |
+
+Request guards (`lib/core/src/web/RequestGuard`, applied to every request in this order):
+
+| Check | Result |
+|---|---|
+| `Host` is not the station IP, `192.168.4.1`, `<hostname>` or `<hostname>.local` (any case, optional `:port` and trailing dot) | `403`; while the setup AP is up, a GET/HEAD of a non-`/api` path gets `302` to `http://192.168.4.1/` (captive portal) |
+| Method other than GET, HEAD, POST (e.g. `OPTIONS`) | `405` |
+| POST without `Content-Type: application/json` or without `X-HAKnob: 1` | `403` |
+| POST with a chunked body (no `Content-Length`) | `411` |
+| Body larger than 16 KB | `413` |
+| Web password set and no valid `Authorization: Basic` for user `admin` | `401` |
+
+No CORS headers are ever sent. Every response carries `X-Frame-Options: DENY`,
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and a
+`Content-Security-Policy` allowing scripts and styles only from the device. API responses
+are `Cache-Control: no-store`.
+
+Threading: request callbacks run in the `async_tcp` task. They never touch LVGL or Wi-Fi;
+they read a snapshot the main loop publishes (under a mutex), write the config only via
+`ConfigStore::applyPatch`, and hand Wi-Fi scans, config re-reads, reboot and factory reset
+to the main loop through atomic flags.
 
 ## Hardware notes
 
@@ -293,10 +389,12 @@ All versions are pinned exactly in `platformio.ini`.
 | `lvgl/lvgl` | 9.2.2 | Maintained v9 line; matches the vendor `lvgl_9` example |
 | `lewisxhe/SensorLib` | 0.3.4 | CST816 and CHSC5816 touch drivers; latest 0.3.x release, builds on core 2.0.17 |
 | `bblanchon/ArduinoJson` | 7.4.3 | Config JSON (both envs); current v7 release, custom allocator support for PSRAM |
+| `ESP32Async/AsyncTCP` | 3.5.0 | TCP layer of the web server; maintained fork, core 2.x compatible |
+| `ESP32Async/ESPAsyncWebServer` | 3.12.1 | Web server (middleware, static files); maintained fork, core 2.x compatible. PlatformIO prints "Ignored `Hash` dependency": that dependency is for ESP8266 only |
 | `throwtheswitch/Unity` | 2.6.1 | Host test framework (native env); pinned to the version PlatformIO resolved |
 
 Licences:
-- LVGL MIT, SensorLib MIT, ArduinoJson MIT.
+- LVGL MIT, SensorLib MIT, ArduinoJson MIT, AsyncTCP LGPL-3.0, ESPAsyncWebServer LGPL-3.0.
 - Fonts: the Montserrat and FontAwesome Free font files are SIL OFL 1.1; the FontAwesome
   Free icon designs are CC BY 4.0. The generated `src/ui/fonts/*.c` are derived fonts, so
   before any public release the OFL notices (and FontAwesome attribution) must ship with
@@ -315,12 +413,15 @@ include/          board_pins.h (GPIO map), lv_conf.h (LVGL config), version.h
 src/main.cpp      setup()/loop() wiring only
 src/hal/          Display, Touch, Encoder, Button, Buzzer, PsramAllocator (hardware glue)
 src/config/       ConfigStore (NVS persistence, mutex)
-src/ui/           Ui (screen manager), Widgets, screens/, fonts/ (generated)
+src/net/          WifiManager (STA, setup AP, captive DNS, mDNS), WebServer (REST API, static files)
+src/ui/           Ui (screen manager), Widgets, screens/ (Boot, Setup, Status), fonts/ (generated)
+data/             web UI (index.html, app.js, style.css), flashed with uploadfs
 lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the host
   src/config/     ConfigModel (schema, JSON, validation, redaction, patch merge)
   src/control/    DomainActions (per-domain actions, presses and step ranges)
   src/input/      QuadratureDecoder, ButtonFsm, Acceleration, SwipeClassifier
   src/ui/         Presenter (number formatting)
+  src/web/        RequestGuard (Host allow-list, CSRF, body limit, Basic auth check)
   src/util/       MathUtil
 test/native/      host unit tests (Unity), run with `pio test -e native`
 tools/            serial_check.py, gen_fonts.sh
@@ -329,9 +430,14 @@ tools/            serial_check.py, gen_fonts.sh
 ## Security
 
 - No secrets (Wi-Fi passwords, Home Assistant tokens) are ever committed. They live only
-  in the device's NVS, entered through the device web UI (from Step 4). `.gitignore`
+  in the device's NVS, entered through the device web UI. `.gitignore`
   excludes `*.local.ini`, `secrets*` and `.env*`.
 - Secrets are stored separately from the config JSON, are never returned by the API (only
   `*_set` flags) and are never logged (at most `token_set len=N`).
 - NVS is not encrypted: anyone with physical access can read the token. Use a dedicated
   non-admin Home Assistant user for the knob's token.
+- The web UI is plain HTTP on the LAN. The optional web password (Device tab, user `admin`)
+  is sent with HTTP Basic auth and can be sniffed on the network; there is no lockout
+  after wrong passwords. The setup AP is always WPA2-protected.
+- DNS rebinding and CSRF are blocked by the Host allow-list and the JSON + `X-HAKnob`
+  header requirement (see Web server and API). The UI sets text with `textContent` only.

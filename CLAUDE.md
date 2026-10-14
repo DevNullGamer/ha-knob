@@ -6,7 +6,7 @@ Guidance for AI assistants working in this repository.
 
 HA Knob: Home Assistant controller firmware for the LilyGo T-Encoder Pro (ESP32-S3R8,
 16 MB flash, 8 MB OPI PSRAM, 390x390 round AMOLED, touch, rotary encoder, buzzer).
-PlatformIO + Arduino framework. Current version 0.3.0 (Step 3: config model and persistent store).
+PlatformIO + Arduino framework. Current version 0.4.0 (Step 4: Wi-Fi provisioning and web setup UI).
 
 The approved specification and change log live outside the repo in
 `~/.claude/workspace/chgreq/LilyGo T-encoderPro - HA Controller/chg001/`.
@@ -17,7 +17,7 @@ Implement one specification step at a time.
 ```
 pio run -e t-encoder-pro                 # build
 pio run -e t-encoder-pro -t upload       # flash (COM14)
-pio run -e t-encoder-pro -t uploadfs     # flash LittleFS web assets (from Step 4)
+pio run -e t-encoder-pro -t uploadfs     # flash LittleFS web assets (data/)
 pio run -e t-encoder-pro -t erase        # wipe flash incl. NVS config + secrets + ap_pw; upload again after
 pio device monitor                       # serial monitor
 pio test -e native                       # host unit tests (needs MSYS2 ucrt64 gcc on PATH)
@@ -54,6 +54,20 @@ line, not only on `BOOT`.
   UI gets it from `/api/meta/actions` in Step 6).
 - `src/config/ConfigStore`: the only code that touches NVS namespace `haknob`. All public
   methods lock its mutex; never call LVGL or the HA socket while holding it.
+- `src/net/WifiManager` (`net::wifi`): STA / setup AP / captive DNS / mDNS state machine,
+  main loop only. `src/net/WebServer` (`net::web`): ESPAsyncWebServer routes.
+- **Web callbacks run in the `async_tcp` task**: never call LVGL, `WiFi.*` or main-loop state
+  from them. They read the snapshot published by `net::web::publishNetwork` (mutex), write
+  config **only via `ConfigStore::applyPatch()`** (never `save()`, which bypasses the token
+  and Wi-Fi guards), and request work (config re-read, scan, reboot, factory reset) with
+  atomic flags the main loop takes (`net::web::take*`).
+- `lib/core/src/web/RequestGuard`: Host allow-list, captive-portal redirect, method,
+  CSRF (`application/json` + `X-HAKnob: 1`), body limit (16 KB), Basic auth check. Every
+  request passes it in the server middleware. Never add CORS headers.
+- Web UI (`data/`): vanilla JS, no build step, DOM text via `textContent` only (no
+  `innerHTML`), no inline scripts or styles (the CSP forbids them). Clients always send
+  whole config sections (section replace is literal), `ssid` in every `wifi` section, `url`
+  in every `ha` section, and the Wi-Fi password together with the SSID (`null` = open).
 - `lib/core/src/input/QuadratureDecoder.h` is header-only and `always_inline` because the
   encoder ISR calls it; keep anything it uses free of out-of-line calls and flash tables.
 - All library versions are pinned exactly in `platformio.ini`; record any change and its
@@ -159,6 +173,26 @@ line, not only on `BOOT`.
   extreme cases (255-char entity ids) are rejected by `validate()` as `controls/too_large`.
 - `parseUrlEndpoint()` in ConfigModel is a minimal URL check; Step 5's `HaUrl` should take it
   over so URL parsing has one implementation.
+
+## Step 4 (2026-10-15)
+
+- Libraries: `ESP32Async/AsyncTCP@3.5.0`, `ESP32Async/ESPAsyncWebServer@3.12.1` (as
+  planned, no deviation). The "Ignored `Hash` dependency" warning is ESP8266-only.
+- `WiFi.persistent(false)` and `WiFi.setAutoReconnect(false)`: credentials exist only in
+  `haknob`; retries are scheduled by WifiManager (15 s before the AP fallback, 60 s with
+  the AP up). The setup-only state runs `WIFI_AP_STA` with an idle STA so scans work
+  without a mode change.
+- Wi-Fi restarts only when the SSID or password in use actually differ
+  (`net::wifi::applyConfig` compares them), 1 s after the HTTP response. `mergePatch` no
+  longer reports `restartWifi` for an SSID that was and stays `""`.
+- After `applyPatch` with `cfgWritten` (also on `nvs_write_failed`) the handler sets
+  `configDirty`; the main loop re-reads the config (brightness, Wi-Fi, hostname/mDNS).
+- `HB` gained `wifi=<off|ap|sta|ap_sta> ip=<ip>`.
+- AP SSID uses the last two bytes of the STA MAC (this unit: `HA-Knob-043C`).
+- App size 1.52 MB (was about 0.94 MB): Wi-Fi stack, web server, mDNS, LittleFS.
+- Upload timing: about 53 s with nothing to rebuild (30 s PlatformIO pre-upload checks,
+  16 s write at about 925 kbit/s with compression and the stub). Not a config problem;
+  slow uploads come from a full rebuild after any `platformio.ini` change (3-4 min).
 
 ## Upcoming requirements
 
