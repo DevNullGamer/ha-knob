@@ -31,6 +31,7 @@ public:
     bool loadedFromNvs() const { return loadStatus() == core::config::LoadStatus::Loaded; }
 
     core::config::Config config() const;  // copy
+    size_t controlCount() const;          // cheap, for status lines
     core::config::SecretsPresent secretsPresent() const;
 
     // Secret getters, for the modules that need the values (Wi-Fi, HA client, web auth).
@@ -39,9 +40,11 @@ public:
     std::string webPassword() const;
     std::string apPassword() const;
 
-    // Validates, then writes cfg and afterwards the changed secrets. On success the
-    // in-memory copy is updated. Returns the validation error or a failure with
-    // message "nvs_write_failed".
+    // Validates, then: removes the old ha_token / wifi_pw if they change (abort on
+    // failure), writes cfg, then writes the new secrets. A failed or interrupted save can
+    // leave "new cfg, secret missing" but never a new URL with the old token. The
+    // in-memory copy is updated once cfg is written (it always mirrors NVS). Returns the
+    // validation error or a failure with message "nvs_write_failed".
     core::config::ValidationResult save(const core::config::Config &config,
                                         const core::config::SecretChanges &secrets = {});
 
@@ -54,6 +57,7 @@ public:
 private:
     core::config::ValidationResult saveLocked(const core::config::Config &config,
                                               const core::config::SecretChanges &secrets);
+    bool removeIfChanging(const char *key, const core::config::SecretChange &change);
     bool writeSecret(const char *key, const core::config::SecretChange &change);
     void logSecrets() const;
 

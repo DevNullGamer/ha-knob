@@ -1,0 +1,11 @@
+# HA Knob partition table (16 MB flash). Based on Arduino-ESP32's default_16MB.csv with
+# NVS enlarged from 20 KB to 64 KB: rewriting the 8 KB "cfg" blob needs room for the old
+# and new copy (~16.5 KB) next to the secrets and the Wi-Fi/PHY data.
+# Changing this table requires `pio run -e t-encoder-pro -t erase` before the next upload.
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x10000,
+otadata,  data, ota,      0x19000,  0x2000,
+app0,     app,  ota_0,    0x20000,  0x630000,
+app1,     app,  ota_1,    0x650000, 0x630000,
+spiffs,   data, spiffs,   0xC80000, 0x370000,
+coredump, data, coredump, 0xFF0000, 0x10000,

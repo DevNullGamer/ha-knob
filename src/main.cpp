@@ -45,7 +45,7 @@ void printHeartbeat(uint32_t nowMs) {
                   static_cast<unsigned>(nowMs / 1000), static_cast<unsigned>(ESP.getPsramSize()),
                   static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
                   static_cast<int>(shownCount),
-                  static_cast<unsigned>(configStore.config().controls.size()), bootCfgSource);
+                  static_cast<unsigned>(configStore.controlCount()), bootCfgSource);
 }
 
 void handleEncoder() {

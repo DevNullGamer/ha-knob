@@ -87,6 +87,26 @@ got its config).
 The configuration is stored in NVS, namespace `haknob`. LittleFS only ever holds web
 assets, so `uploadfs` never touches the config.
 
+### Partition table
+
+`partitions.csv` (16 MB flash), based on Arduino-ESP32's `default_16MB.csv` with the NVS
+partition enlarged from 20 KB to 64 KB. Rewriting the 8 KB `cfg` blob needs space for the
+old and the new copy (about 16.5 KB) next to the secrets and the Wi-Fi/PHY calibration
+data, which does not fit reliably in 20 KB.
+
+| Name | Type | Offset | Size |
+|---|---|---|---|
+| nvs | data/nvs | 0x9000 | 0x10000 (64 KB) |
+| otadata | data/ota | 0x19000 | 0x2000 (8 KB) |
+| app0 | app/ota_0 | 0x20000 | 0x630000 (6.19 MB) |
+| app1 | app/ota_1 | 0x650000 | 0x630000 (6.19 MB) |
+| spiffs (LittleFS) | data/spiffs | 0xC80000 | 0x370000 (3.44 MB) |
+| coredump | data/coredump | 0xFF0000 | 0x10000 (64 KB) |
+
+The 20 KB between otadata and app0 is unused padding (app partitions must be 64 KB
+aligned). **Changing the partition table requires `pio run -e t-encoder-pro -t erase`
+followed by an upload**; this wipes the config, all secrets and `ap_pw`.
+
 | NVS key | Type | Content |
 |---|---|---|
 | `cfg` | blob | Non-secret config JSON (below), at most 8 KB |
@@ -152,10 +172,24 @@ Encoder actions per domain (default first) and step default / range:
 
 Patch semantics (`mergePatch`, used by `POST /api/config` from Step 4): a section present
 in the patch replaces that section; secrets (`wifi.password`, `ha.token`, `web.password`)
-are kept when absent or `""`, set when a string, cleared when `null`. Changing `ha.url` to a
-different host:port requires a new `ha.token` in the same request (`token_required`), and
-the stored token is cleared on any URL change. Secrets are never returned: the redacted
-JSON only carries `wifi.password_set`, `ha.token_set` and `web.password_set`.
+are kept when absent or `""`, set when a string, cleared when `null`.
+
+Token guard for `ha.url` changes:
+
+| URL change | Stored token |
+|---|---|
+| Different host:port (host lower-cased, default port 80/443) | New `ha.token` required in the same request, else `token_required` |
+| `https` to `http` on the same host:port (TLS downgrade) | New `ha.token` required, else `token_required` |
+| URL cleared (`""`) | Cleared |
+| Path-only change, or `http` to `https` (TLS upgrade) on the same host:port | Kept |
+
+Secrets are never returned: the redacted JSON only carries `wifi.password_set`,
+`ha.token_set` and `web.password_set`.
+
+Save order (`ConfigStore::save`): the old `ha_token` / `wifi_pw` are removed first when they
+change (the save aborts if that fails), then `cfg` is written, then the new secret values.
+An interrupted save can therefore leave "new URL, no token", never a new URL with the old
+token.
 
 ## Hardware notes
 
@@ -253,6 +287,7 @@ Licences:
 ## Project layout
 
 ```
+partitions.csv    flash layout (NVS 64 KB, OTA app0/app1, LittleFS, coredump)
 include/          board_pins.h (GPIO map), lv_conf.h (LVGL config), version.h
 src/main.cpp      setup()/loop() wiring only
 src/hal/          Display, Touch, Encoder, Button, Buzzer, PsramAllocator (hardware glue)

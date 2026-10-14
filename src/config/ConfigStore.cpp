@@ -1,6 +1,7 @@
 #include "config/ConfigStore.h"
 
 #include <Arduino.h>
+#include <bootloader_random.h>
 #include <esp_random.h>
 
 #include <memory>
@@ -32,23 +33,37 @@ bool ConfigStore::begin() {
     }
 
     if (!prefs_.isKey(kKeyApPw)) {
-        prefs_.putString(kKeyApPw, cfg::makeApPassword(esp_random).c_str());
+        // RF is not up yet, so esp_random() would only be pseudo-random; the bootloader
+        // entropy source (SAR ADC noise) makes it a true RNG for this one generation.
+        bootloader_random_enable();
+        const std::string apPw = cfg::makeApPassword(esp_random);
+        bootloader_random_disable();
+        prefs_.putString(kKeyApPw, apPw.c_str());
         Serial.println("CFG ap_pw generated");
     }
 
+    // A stored cfg that cannot be read (too large, read error, empty) is Corrupt, not
+    // Missing, so it is never overwritten with defaults automatically.
     std::unique_ptr<char[]> json;
     size_t length = 0;
+    bool unreadable = false;
     if (prefs_.isKey(kKeyConfig)) {
-        length = prefs_.getBytesLength(kKeyConfig);
-        if (length > 0 && length <= cfg::kMaxConfigJsonBytes) {
-            json.reset(new char[length]);
-            length = prefs_.getBytes(kKeyConfig, json.get(), length);
+        const size_t stored = prefs_.getBytesLength(kKeyConfig);
+        if (stored == 0 || stored > cfg::kMaxConfigJsonBytes) {
+            unreadable = true;
         } else {
-            length = 0;
+            json.reset(new char[stored]);
+            length = prefs_.getBytes(kKeyConfig, json.get(), stored);
+            unreadable = length != stored;
         }
     }
 
-    cfg::LoadResult result = cfg::fromJson(json.get(), length, PsramAllocator::instance());
+    cfg::LoadResult result;
+    if (unreadable) {
+        result.status = cfg::LoadStatus::Corrupt;
+    } else {
+        result = cfg::fromJson(json.get(), length, PsramAllocator::instance());
+    }
     config_ = std::move(result.config);
     loadStatus_ = result.status;
     if (loadStatus_ == cfg::LoadStatus::Loaded) {
@@ -79,6 +94,11 @@ cfg::LoadStatus ConfigStore::loadStatus() const {
 cfg::Config ConfigStore::config() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return config_;
+}
+
+size_t ConfigStore::controlCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return config_.controls.size();
 }
 
 cfg::SecretsPresent ConfigStore::secretsPresent() const {
@@ -141,17 +161,34 @@ cfg::ValidationResult ConfigStore::saveLocked(const cfg::Config &config,
         return writeFailed;
     }
 
-    // cfg first, then the secrets (plan.md Step 3).
+    // Write order, so that a failed or interrupted save can never pair the new cfg (e.g. a
+    // new HA URL) with an old secret; the worst case is "new cfg, secret missing":
+    //  (a) remove the old ha_token / wifi_pw if they are being replaced or cleared; abort
+    //      before touching cfg if that fails;
+    //  (b) write cfg;
+    //  (c) write the new secret values (and clear web_pw if requested). web_pw is
+    //      overwritten in place: if that write fails the old password stays, which fails
+    //      closed.
+    if (!removeIfChanging(kKeyHaToken, secrets.haToken) ||
+        !removeIfChanging(kKeyWifiPw, secrets.wifiPassword)) {
+        Serial.println("ERR CFG remove old secret failed, cfg not written");
+        logSecrets();
+        return writeFailed;
+    }
+
     const std::string json = cfg::toJson(config, PsramAllocator::instance());
     if (prefs_.putBytes(kKeyConfig, json.data(), json.size()) != json.size()) {
         Serial.println("ERR CFG write cfg failed");
+        logSecrets();
         return writeFailed;
     }
+    // The in-memory copy follows what NVS now holds (secrets are always read from NVS),
+    // so memory and NVS agree even if a secret write below fails.
     config_ = config;
     loadStatus_ = cfg::LoadStatus::Loaded;
 
-    const bool secretsOk = writeSecret(kKeyWifiPw, secrets.wifiPassword) &&
-                           writeSecret(kKeyHaToken, secrets.haToken) &&
+    const bool secretsOk = writeSecret(kKeyHaToken, secrets.haToken) &&
+                           writeSecret(kKeyWifiPw, secrets.wifiPassword) &&
                            writeSecret(kKeyWebPw, secrets.webPassword);
     Serial.printf("CFG saved controls=%u bytes=%u\n", static_cast<unsigned>(config.controls.size()),
                   static_cast<unsigned>(json.size()));
@@ -193,6 +230,14 @@ bool ConfigStore::factoryReset() {
     }
     Serial.printf("CFG factory reset ok=%d\n", ok ? 1 : 0);
     return ok;
+}
+
+// Caller holds the mutex. Removes key if change is Set or Clear; true if nothing to do.
+bool ConfigStore::removeIfChanging(const char *key, const cfg::SecretChange &change) {
+    if (change.kind == cfg::SecretChange::Kind::Keep || !prefs_.isKey(key)) {
+        return true;
+    }
+    return prefs_.remove(key);
 }
 
 // Caller holds the mutex.

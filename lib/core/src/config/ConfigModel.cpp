@@ -271,12 +271,15 @@ ValidationResult readSecret(JsonObjectConst obj, const char *key, const std::str
     return ValidationResult::success();
 }
 
-bool endpointChanged(const std::string &oldUrl, const std::string &newUrl) {
+// True if the stored token must not follow the URL change: a different host:port, or a
+// TLS downgrade (https -> http would send the token in cleartext). A path-only change or
+// a TLS upgrade on the same host:port keeps the token.
+bool tokenEndpointChanged(const std::string &oldUrl, const std::string &newUrl) {
     if (oldUrl.empty() || newUrl.empty()) return oldUrl.empty() != newUrl.empty();
     const UrlEndpoint a = parseUrlEndpoint(oldUrl);
     const UrlEndpoint b = parseUrlEndpoint(newUrl);
     if (!a.ok || !b.ok) return oldUrl != newUrl;
-    return a.host != b.host || a.port != b.port;
+    return a.host != b.host || a.port != b.port || (a.tls && !b.tls);
 }
 
 bool isLowerAlpha(char c) { return c >= 'a' && c <= 'z'; }
@@ -469,6 +472,12 @@ LoadResult fromJson(const char *json, size_t length, ArduinoJson::Allocator *all
         result.status = LoadStatus::Corrupt;
         return result;
     }
+    JsonVariantConst schema = doc["schema"];
+    if (!schema.isNull() && !schema.is<long long>()) {
+        result.status = LoadStatus::Invalid;
+        result.error = ValidationResult::failure("schema", "not_an_integer");
+        return result;
+    }
     if (!migrate(doc)) {
         result.status = LoadStatus::SchemaTooNew;
         return result;
@@ -526,6 +535,7 @@ ValidationResult validate(const Config &c) {
     }
 
     if (c.wifi.ssid.size() > kMaxSsidBytes) return VR::failure("wifi.ssid", "length");
+    if (hasControlChars(c.wifi.ssid)) return VR::failure("wifi.ssid", "invalid_chars");
 
     if (!c.ha.url.empty() && !parseUrlEndpoint(c.ha.url).ok) return VR::failure("ha.url", "invalid");
 
@@ -597,7 +607,7 @@ MergeResult mergePatch(const Config &current, const char *patchJson, size_t leng
         if (!r.ok) return fail(r);
         r = readSecret(root["ha"].as<JsonObjectConst>(), "token", "ha.token", checkHaToken, secrets.haToken);
         if (!r.ok) return fail(r);
-        if (endpointChanged(current.ha.url, merged.ha.url)) {
+        if (tokenEndpointChanged(current.ha.url, merged.ha.url)) {
             // Never send the stored token to a new endpoint (token exfiltration guard).
             if (!merged.ha.url.empty() && secrets.haToken.kind != SecretChange::Kind::Set) {
                 return fail(ValidationResult::failure("ha.token", "token_required"));

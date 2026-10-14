@@ -118,7 +118,7 @@ line, not only on `BOOT`.
 ## Step 3 (2026-10-14)
 
 - NVS namespace `haknob`: `cfg` (blob, JSON, <= 8 KB), `wifi_pw`, `ha_token`, `web_pw`,
-  `ap_pw` (10 chars, `esp_random`, generated on first boot, survives `factoryReset()`).
+  `ap_pw` (10 chars, generated on first boot, survives `factoryReset()`).
 - First boot (nothing stored) logs `CFG defaults reason=missing` and saves the defaults, so
   later boots log `CFG loaded controls=N`. Corrupt / invalid / newer-schema data gives
   defaults for that boot but is not overwritten until the next save.
@@ -127,9 +127,19 @@ line, not only on `BOOT`.
   `device.brightness` is applied at boot.
 - Duplicate `entity_id`s across controls are allowed (Q2). Domains are limited to light,
   climate, cover, fan, media_player, switch, input_boolean (Q5).
-- Secrets in a patch: absent or `""` = keep, string = set, `null` = clear. A changed
-  `ha.url` host:port needs a new token in the same patch (`token_required`); any URL change
-  clears the stored token.
+- Secrets in a patch: absent or `""` = keep, string = set, `null` = clear. Token guard: a
+  `ha.url` change to a different host:port, or an https -> http downgrade, needs a new token
+  in the same patch (`token_required`); clearing the URL clears the token; a path-only
+  change or an http -> https upgrade on the same host:port keeps it.
+- `ConfigStore::save` order: remove the old `ha_token`/`wifi_pw` if they change (abort on
+  failure), write `cfg`, write the new secrets. Worst case after a failure is "new cfg,
+  secret missing". The in-memory config mirrors NVS once `cfg` is written.
+- `ap_pw` is generated with `bootloader_random_enable()` around `esp_random()` (RF is not up
+  at that point). A stored `cfg` that is empty, > 8 KB or unreadable is `Corrupt` (never
+  overwritten automatically).
+- **Custom `partitions.csv`, NVS 64 KB** (was 20 KB in `default_16MB.csv`) so the 8 KB cfg
+  blob can be rewritten safely; app0/app1 0x630000 each, spiffs 0x370000. Changing the
+  table requires `pio run -e t-encoder-pro -t erase` + upload.
 - Size: 24 controls with 48-byte labels and typical entity ids serialise to about 3.8-4 KB;
   extreme cases (255-char entity ids) are rejected by `validate()` as `controls/too_large`.
 - `parseUrlEndpoint()` in ConfigModel is a minimal URL check; Step 5's `HaUrl` should take it

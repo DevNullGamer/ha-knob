@@ -125,7 +125,8 @@ LoadResult fromJson(const char *json, size_t length, ArduinoJson::Allocator *all
 
 // Upgrades an older stored document in place to kSchemaVersion. Returns false if the
 // schema is newer than supported or not a number. (Schema 1 is the first version, so
-// today this only stamps a missing/zero schema as 1.)
+// today this only stamps a missing/zero schema as 1.) fromJson reports a non-numeric
+// schema as Invalid and a newer one as SchemaTooNew.
 bool migrate(JsonDocument &doc);
 
 // ---- Saving and the API ----------------------------------------------------------------
@@ -171,9 +172,11 @@ struct MergeResult {
 //  - Secrets "wifi.password", "ha.token", "web.password": absent or "" = keep;
 //    a string = set (validated); null = clear (e.g. an open Wi-Fi network, or turning
 //    the web password off).
-//  - Changing ha.url (normalised host:port differ; default port 80/443) to a non-empty
-//    URL requires a new ha.token in the same patch, else error "ha.token"/"token_required".
-//    Any URL change clears the stored token unless a new one is set.
+//  - Token guard: if ha.url moves to a different host:port (lower-cased host, default
+//    port 80/443) or is downgraded from https to http, a non-empty new URL requires a new
+//    ha.token in the same patch (else "ha.token"/"token_required"), and a cleared URL
+//    clears the stored token. A path-only change or an http -> https upgrade on the same
+//    host:port keeps the stored token.
 //  - The merged config must pass validate().
 // Errors use the same {field, message} shape as validate(); malformed JSON gives
 // field "" / "invalid_json".
