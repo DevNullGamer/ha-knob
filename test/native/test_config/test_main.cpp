@@ -1156,6 +1156,61 @@ static void test_wifi_ssid_invalid_rejected_in_patch() {
     assertMergeFails(cur, "{\"wifi\":{\"ssid\":\"bad\\nssid\",\"password\":null}}", "wifi.ssid", nullptr);
 }
 
+// Round-4 rule: an empty merged URL / SSID never stores a token / password.
+static void test_empty_url_forces_token_clear_even_if_supplied() {
+    const cfg::Config cur = configWithUrl("http://192.168.1.10:8123");
+    cfg::MergeResult r = mergeOk(cur, "{\"ha\":{\"url\":\"\",\"token\":\"abc\"}}");
+    TEST_ASSERT_TRUE(r.config.ha.url.empty());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.haToken.kind));
+    TEST_ASSERT_TRUE(r.secrets.haToken.value.empty());
+    // URL was already empty: a supplied token is still not stored.
+    r = mergeOk(cfg::Config(), "{\"ha\":{\"url\":\"\",\"token\":\"abc\"}}");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.haToken.kind));
+    TEST_ASSERT_TRUE(r.secrets.haToken.value.empty());
+    // Section without url (literal replace -> "") plus a token.
+    r = mergeOk(cur, "{\"ha\":{\"token\":\"abc\"}}");
+    TEST_ASSERT_TRUE(r.config.ha.url.empty());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.haToken.kind));
+    // Empty URL, token "" or null: also Clear.
+    r = mergeOk(cfg::Config(), "{\"ha\":{\"url\":\"\",\"token\":\"\"}}");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.haToken.kind));
+    r = mergeOk(cfg::Config(), "{\"ha\":{\"url\":\"\",\"token\":null}}");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.haToken.kind));
+    // An invalid token format is still rejected, not silently dropped.
+    assertMergeFails(cur, "{\"ha\":{\"url\":\"\",\"token\":\"a b\"}}", "ha.token", nullptr);
+}
+
+static void test_empty_ssid_forces_password_clear_even_if_supplied() {
+    const cfg::Config cur = configWithSsid("Home");
+    cfg::MergeResult r = mergeOk(cur, "{\"wifi\":{\"ssid\":\"\",\"password\":\"newpass123\"}}");
+    TEST_ASSERT_TRUE(r.config.wifi.ssid.empty());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.wifiPassword.kind));
+    TEST_ASSERT_TRUE(r.secrets.wifiPassword.value.empty());
+    // SSID already empty: a supplied password is still not stored.
+    r = mergeOk(cfg::Config(), "{\"wifi\":{\"ssid\":\"\",\"password\":\"newpass123\"}}");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.wifiPassword.kind));
+    TEST_ASSERT_TRUE(r.secrets.wifiPassword.value.empty());
+    r = mergeOk(cfg::Config(), "{\"wifi\":{\"password\":\"newpass123\"}}");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.wifiPassword.kind));
+    r = mergeOk(cfg::Config(), "{\"wifi\":{\"ssid\":\"\"}}");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.wifiPassword.kind));
+    // Invalid password format is still rejected.
+    assertMergeFails(cur, "{\"wifi\":{\"ssid\":\"\",\"password\":\"short\"}}", "wifi.password", nullptr);
+}
+
+static void test_non_empty_url_and_ssid_not_forced_clear() {
+    // Guard against over-application: a configured URL/SSID keeps the normal rules.
+    cfg::MergeResult r = mergeOk(configWithUrl("http://ha.local:8123"),
+                                 "{\"ha\":{\"url\":\"http://ha.local:8123\"}}");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Keep), static_cast<int>(r.secrets.haToken.kind));
+    r = mergeOk(configWithSsid("Home"), "{\"wifi\":{\"ssid\":\"Home\"}}");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Keep), static_cast<int>(r.secrets.wifiPassword.kind));
+    // A patch without ha/wifi sections never touches those secrets.
+    r = mergeOk(cfg::Config(), "{\"device\":{}}");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Keep), static_cast<int>(r.secrets.haToken.kind));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Keep), static_cast<int>(r.secrets.wifiPassword.kind));
+}
+
 static void test_merge_failure_resets_secret_changes() {
     // A valid secret followed by an invalid section: nothing must be applied.
     const cfg::Config cur = configWithSsid("Home");
@@ -1374,6 +1429,9 @@ int main() {
     RUN_TEST(test_wifi_ssid_change_with_password_or_null_accepted);
     RUN_TEST(test_wifi_ssid_cleared_clears_password);
     RUN_TEST(test_wifi_ssid_invalid_rejected_in_patch);
+    RUN_TEST(test_empty_url_forces_token_clear_even_if_supplied);
+    RUN_TEST(test_empty_ssid_forces_password_clear_even_if_supplied);
+    RUN_TEST(test_non_empty_url_and_ssid_not_forced_clear);
     RUN_TEST(test_merge_failure_resets_secret_changes);
     // AP password
     RUN_TEST(test_ap_password);
