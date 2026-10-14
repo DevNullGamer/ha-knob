@@ -42,6 +42,14 @@ Python (it ships `pyserial`):
     --expect "touch=(CST816|CHSC5816)" --timeout 20
 ```
 
+`--expect` is required (at least one). Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | Every `--expect` regex matched a line |
+| 1 | Timeout: at least one expectation did not match |
+| 2 | Infrastructure failure: port could not be opened, usage error, invalid regex, or pyserial missing |
+
 The ESP32-S3 USB serial drops everything printed before the PC has re-enumerated the port,
 so the one-time `BOOT` line is often missed. The `HB` heartbeat line repeats the key facts
 every 5 seconds.
@@ -82,9 +90,11 @@ All versions are pinned exactly in `platformio.ini`.
 | `moononournation/GFX Library for Arduino` | 1.5.0 | Upstream `Arduino_CO5300` + `Arduino_ESP32QSPI`; same version as the vendor uses; builds on core 2.0.17 |
 | `lvgl/lvgl` | 9.2.2 | Maintained v9 line; matches the vendor `lvgl_9` example |
 | `lewisxhe/SensorLib` | 0.3.4 | CST816 and CHSC5816 touch drivers; latest 0.3.x release, builds on core 2.0.17 |
-| `throwtheswitch/Unity` | (PlatformIO default) | Host test framework, pulled in by `pio test` |
+| `throwtheswitch/Unity` | 2.6.1 | Host test framework (native env); pinned to the version PlatformIO resolved |
 
-Licences: LVGL MIT, SensorLib MIT. The LilyGo vendor repository is GPL-3.0; this project
+Licences: LVGL MIT, SensorLib MIT. Arduino_GFX: licence unconfirmed / mixed (the 1.5.0
+package ships no LICENSE file; much of it is derived from Adafruit-GFX, which is BSD);
+acceptable for this private project, to be rechecked before any public release. The LilyGo vendor repository is GPL-3.0; this project
 uses only hardware facts (pin numbers, panel quirks) from it and copies none of its files.
 
 ## Project layout

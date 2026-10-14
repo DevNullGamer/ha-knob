@@ -166,7 +166,8 @@ bool readTouch(int16_t &x, int16_t &y) {
 
 // Index: (previous AB << 2) | current AB. +1 / -1 for valid Gray-code steps, 0 otherwise
 // (no change, or an invalid double-bit jump caused by bounce).
-constexpr int8_t kQuadTable[16] = {0, -1, +1, 0, +1, 0, 0, -1, -1, 0, 0, +1, 0, +1, -1, 0};
+// DRAM_ATTR keeps it out of flash so the ISR path is IRAM-safe.
+DRAM_ATTR const int8_t kQuadTable[16] = {0, -1, +1, 0, +1, 0, 0, -1, -1, 0, 0, +1, 0, +1, -1, 0};
 
 struct RawTransition {
     uint8_t prev;
@@ -184,7 +185,7 @@ std::atomic<int32_t> detentCount{0};
 volatile uint8_t encPrevAb = 0;
 volatile int8_t encAcc = 0;
 
-uint8_t readEncoderAb() {
+uint8_t IRAM_ATTR readEncoderAb() {
     return static_cast<uint8_t>((digitalRead(pins::kEncA) << 1) | digitalRead(pins::kEncB));
 }
 

@@ -72,8 +72,18 @@ line, not only on `BOOT`.
 - moononournation/GFX Library for Arduino 1.5.0 (no fallback to 1.4.9 needed)
 - lvgl/lvgl 9.2.2
 - lewisxhe/SensorLib 0.3.4 (builds on core 2.0.17)
+- throwtheswitch/Unity 2.6.1 (native env test framework, pinned in `lib_deps`)
 - Deviation from spec §3.2: the `native` env has no `lib_deps` yet; ArduinoJson 7.4.3 is
   added in Step 3 when the core first uses it.
+
+## Step 2 notes (from the Step 1 audit)
+
+- The smoke-test decoder resets its accumulator at every detent, so its phase can drift
+  after a missed/invalid transition. The real `QuadratureDecoder` must count detents at the
+  **rest states 00/11** (absolute position), not by accumulating N transitions.
+- The `ENCRAW` ISR ring buffer (no overflow-safe handoff, entries may be overwritten while
+  read) is debug-only. **Do not reuse that pattern for real data**; the encoder path should
+  expose only an atomic detent counter.
 
 ## Upcoming requirements
 
