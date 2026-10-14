@@ -151,7 +151,11 @@ cfg::ValidationResult ConfigStore::save(const cfg::Config &config,
 
 // Caller holds the mutex.
 cfg::ValidationResult ConfigStore::saveLocked(const cfg::Config &config,
-                                              const cfg::SecretChanges &secrets) {
+                                              const cfg::SecretChanges &secrets,
+                                              bool *cfgWritten) {
+    if (cfgWritten != nullptr) {
+        *cfgWritten = false;
+    }
     cfg::ValidationResult valid = cfg::validate(config);
     if (!valid.ok) {
         return valid;
@@ -186,6 +190,9 @@ cfg::ValidationResult ConfigStore::saveLocked(const cfg::Config &config,
     // so memory and NVS agree even if a secret write below fails.
     config_ = config;
     loadStatus_ = cfg::LoadStatus::Loaded;
+    if (cfgWritten != nullptr) {
+        *cfgWritten = true;
+    }
 
     const bool secretsOk = writeSecret(kKeyHaToken, secrets.haToken) &&
                            writeSecret(kKeyWifiPw, secrets.wifiPassword) &&
@@ -207,7 +214,7 @@ cfg::MergeResult ConfigStore::applyPatch(const char *json, size_t length) {
     if (!merged.ok) {
         return merged;
     }
-    cfg::ValidationResult saved = saveLocked(merged.config, merged.secrets);
+    cfg::ValidationResult saved = saveLocked(merged.config, merged.secrets, &merged.cfgWritten);
     if (!saved.ok) {
         merged.ok = false;
         merged.error = saved;

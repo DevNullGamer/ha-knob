@@ -598,8 +598,19 @@ MergeResult mergePatch(const Config &current, const char *patchJson, size_t leng
         r = readSecret(root["wifi"].as<JsonObjectConst>(), "password", "wifi.password", checkWifiPassword,
                        secrets.wifiPassword);
         if (!r.ok) return fail(r);
-        restartWifi = merged.wifi.ssid != current.wifi.ssid ||
-                      secrets.wifiPassword.kind != SecretChange::Kind::Keep;
+        const bool ssidChanged = merged.wifi.ssid != current.wifi.ssid;  // byte for byte
+        if (ssidChanged) {
+            if (merged.wifi.ssid.empty()) {
+                // Unconfigured: a password without an SSID is meaningless.
+                secrets.wifiPassword = SecretChange();
+                secrets.wifiPassword.kind = SecretChange::Kind::Clear;
+            } else if (secrets.wifiPassword.kind == SecretChange::Kind::Keep) {
+                // Never pair the stored password with a new SSID (rogue AP guard): the
+                // patch must give a new password or an explicit null (open network).
+                return fail(ValidationResult::failure("wifi.password", "password_required"));
+            }
+        }
+        restartWifi = ssidChanged || secrets.wifiPassword.kind != SecretChange::Kind::Keep;
     }
 
     if (!root["ha"].isNull()) {

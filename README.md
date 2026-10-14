@@ -174,6 +174,15 @@ Patch semantics (`mergePatch`, used by `POST /api/config` from Step 4): a sectio
 in the patch replaces that section; secrets (`wifi.password`, `ha.token`, `web.password`)
 are kept when absent or `""`, set when a string, cleared when `null`.
 
+Wi-Fi guard for `wifi.ssid` changes (compared byte for byte), so a stored WPA2 password is
+never handed to a different (possibly rogue) access point:
+
+| SSID change | Stored Wi-Fi password |
+|---|---|
+| To a different non-empty SSID | The same request must carry `wifi.password`: a string (new password, 8 to 63 characters) or `null` (open network), else `password_required` |
+| To `""` (unconfigure) | Cleared |
+| Unchanged | Normal secret rules (keep / set / clear) |
+
 Token guard for `ha.url` changes:
 
 | URL change | Stored token |

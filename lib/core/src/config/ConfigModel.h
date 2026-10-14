@@ -164,6 +164,9 @@ struct MergeResult {
     Config config;           // merged config when ok (unchanged copy of current otherwise)
     SecretChanges secrets;   // what to do with the stored secrets
     bool restartWifi = false;  // wifi.ssid or wifi.password changed
+    // Set by ConfigStore::applyPatch (never by mergePatch): the cfg blob was written,
+    // so the stored config may have changed even if a later secret write failed.
+    bool cfgWritten = false;
 };
 
 // Applies a JSON patch to the current config:
@@ -172,6 +175,10 @@ struct MergeResult {
 //  - Secrets "wifi.password", "ha.token", "web.password": absent or "" = keep;
 //    a string = set (validated); null = clear (e.g. an open Wi-Fi network, or turning
 //    the web password off).
+//  - Wi-Fi guard: if wifi.ssid changes (byte for byte) to a non-empty value, the same
+//    patch must carry wifi.password as a string (new password) or null (open network),
+//    else "wifi.password"/"password_required". Changing the SSID to "" (unconfigure)
+//    clears the stored password. An unchanged SSID keeps the normal secret rules.
 //  - Token guard: if ha.url moves to a different host:port (lower-cased host, default
 //    port 80/443) or is downgraded from https to http, a non-empty new URL requires a new
 //    ha.token in the same patch (else "ha.token"/"token_required"), and a cleared URL

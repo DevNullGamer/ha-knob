@@ -131,6 +131,12 @@ line, not only on `BOOT`.
   `ha.url` change to a different host:port, or an https -> http downgrade, needs a new token
   in the same patch (`token_required`); clearing the URL clears the token; a path-only
   change or an http -> https upgrade on the same host:port keeps it.
+- Wi-Fi guard (mirrors the token guard, against rogue APs): a `wifi.ssid` change (byte for
+  byte) to a non-empty value needs `wifi.password` in the same patch, as a string or `null`
+  (open network), else `wifi.password`/`password_required`; changing the SSID to `""`
+  clears `wifi_pw`.
+- `ConfigStore::applyPatch` sets `MergeResult::cfgWritten` when the cfg blob was written,
+  even if a later secret write failed (`ok=false`, `nvs_write_failed`).
 - `ConfigStore::save` order: remove the old `ha_token`/`wifi_pw` if they change (abort on
   failure), write `cfg`, write the new secrets. Worst case after a failure is "new cfg,
   secret missing". The in-memory config mirrors NVS once `cfg` is written.

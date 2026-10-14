@@ -48,7 +48,9 @@ public:
     core::config::ValidationResult save(const core::config::Config &config,
                                         const core::config::SecretChanges &secrets = {});
 
-    // mergePatch() against the current config, then save() on success.
+    // mergePatch() against the current config, then save() on success. The result's
+    // cfgWritten tells whether the cfg blob was written (true even when a later secret
+    // write failed and ok is false, so the caller knows the stored config may have changed).
     core::config::MergeResult applyPatch(const char *json, size_t length);
 
     // Removes cfg and all secrets except ap_pw; the in-memory config becomes defaults.
@@ -56,7 +58,8 @@ public:
 
 private:
     core::config::ValidationResult saveLocked(const core::config::Config &config,
-                                              const core::config::SecretChanges &secrets);
+                                              const core::config::SecretChanges &secrets,
+                                              bool *cfgWritten = nullptr);
     bool removeIfChanging(const char *key, const core::config::SecretChange &change);
     bool writeSecret(const char *key, const core::config::SecretChange &change);
     void logSecrets() const;
