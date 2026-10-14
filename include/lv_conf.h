@@ -9,7 +9,8 @@
  * Project changes from the template are marked "HA Knob" or listed here:
  *  - content enabled (#if 1)
  *  - LV_USE_STDLIB_MALLOC = LV_STDLIB_CLIB
- *  - Montserrat 20 and 28 enabled, default font Montserrat 20
+ *  - built-in Montserrat fonts disabled (ASCII only); the project fonts ui_font_20/28/56
+ *    (Latin-1 + Latin Extended-A, src/ui/fonts) are declared here, default ui_font_20
  *  - LV_BUILD_EXAMPLES 0
  */
 
@@ -486,14 +487,14 @@
 #define LV_FONT_MONTSERRAT_8  0
 #define LV_FONT_MONTSERRAT_10 0
 #define LV_FONT_MONTSERRAT_12 0
-#define LV_FONT_MONTSERRAT_14 1
+#define LV_FONT_MONTSERRAT_14 0
 #define LV_FONT_MONTSERRAT_16 0
 #define LV_FONT_MONTSERRAT_18 0
-#define LV_FONT_MONTSERRAT_20 1
+#define LV_FONT_MONTSERRAT_20 0
 #define LV_FONT_MONTSERRAT_22 0
 #define LV_FONT_MONTSERRAT_24 0
 #define LV_FONT_MONTSERRAT_26 0
-#define LV_FONT_MONTSERRAT_28 1
+#define LV_FONT_MONTSERRAT_28 0
 #define LV_FONT_MONTSERRAT_30 0
 #define LV_FONT_MONTSERRAT_32 0
 #define LV_FONT_MONTSERRAT_34 0
@@ -518,10 +519,10 @@
 /*Optionally declare custom fonts here.
  *You can use these fonts as default font too and they will be available globally.
  *E.g. #define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(my_font_1) LV_FONT_DECLARE(my_font_2)*/
-#define LV_FONT_CUSTOM_DECLARE
+#define LV_FONT_CUSTOM_DECLARE LV_FONT_DECLARE(ui_font_20) LV_FONT_DECLARE(ui_font_28) LV_FONT_DECLARE(ui_font_56)
 
 /*Always set a default font*/
-#define LV_FONT_DEFAULT &lv_font_montserrat_20
+#define LV_FONT_DEFAULT &ui_font_20
 
 /*Enable handling large font and/or fonts with a lot of characters.
  *The limit depends on the font size, font face and bpp.
