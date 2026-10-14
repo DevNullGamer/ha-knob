@@ -1,0 +1,7 @@
+{
+  "name": "core",
+  "version": "0.1.0",
+  "description": "Pure C++17 logic of HA Knob (no Arduino/ESP headers), unit-tested on the host",
+  "frameworks": "*",
+  "platforms": "*"
+}

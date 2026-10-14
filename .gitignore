@@ -1,0 +1,15 @@
+# PlatformIO build output and downloaded libraries
+.pio/
+
+# Editor settings (keep the recommended-extensions list)
+.vscode/*
+!.vscode/extensions.json
+
+# Local overrides and anything secret: never commit
+*.local.ini
+secrets*
+.env
+.env.*
+
+# Python
+/tools/__pycache__/
