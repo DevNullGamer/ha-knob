@@ -1211,6 +1211,43 @@ static void test_non_empty_url_and_ssid_not_forced_clear() {
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Keep), static_cast<int>(r.secrets.wifiPassword.kind));
 }
 
+// Step 4: restartWifi = ssidChanged || (!staysUnconfigured && password kind != Keep).
+static void test_restart_wifi_flag() {
+    // "" -> "" (stays unconfigured): no restart, although the password is forced to Clear.
+    cfg::MergeResult r = mergeOk(cfg::Config(), "{\"wifi\":{\"ssid\":\"\"}}");
+    TEST_ASSERT_FALSE(r.restartWifi);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.wifiPassword.kind));
+    r = mergeOk(cfg::Config(), "{\"wifi\":{\"ssid\":\"\",\"password\":\"newpass123\"}}");
+    TEST_ASSERT_FALSE(r.restartWifi);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Kind::Clear), static_cast<int>(r.secrets.wifiPassword.kind));
+    r = mergeOk(cfg::Config(), "{\"wifi\":{\"password\":null}}");
+    TEST_ASSERT_FALSE(r.restartWifi);
+    r = mergeOk(cfg::Config(), "{\"wifi\":{}}");
+    TEST_ASSERT_FALSE(r.restartWifi);
+    // SSID change: restart (new SSID, first SSID, and unconfigure).
+    r = mergeOk(configWithSsid("Home"), "{\"wifi\":{\"ssid\":\"Office\",\"password\":\"office-pass\"}}");
+    TEST_ASSERT_TRUE(r.restartWifi);
+    r = mergeOk(cfg::Config(), "{\"wifi\":{\"ssid\":\"Home\",\"password\":null}}");
+    TEST_ASSERT_TRUE(r.restartWifi);
+    r = mergeOk(configWithSsid("Home"), "{\"wifi\":{\"ssid\":\"\"}}");
+    TEST_ASSERT_TRUE(r.restartWifi);
+    // Same SSID + new password / cleared password: restart.
+    r = mergeOk(configWithSsid("Home"), "{\"wifi\":{\"ssid\":\"Home\",\"password\":\"newpass123\"}}");
+    TEST_ASSERT_TRUE(r.restartWifi);
+    r = mergeOk(configWithSsid("Home"), "{\"wifi\":{\"ssid\":\"Home\",\"password\":null}}");
+    TEST_ASSERT_TRUE(r.restartWifi);
+    // Same SSID, password kept (absent or ""): no restart.
+    r = mergeOk(configWithSsid("Home"), "{\"wifi\":{\"ssid\":\"Home\"}}");
+    TEST_ASSERT_FALSE(r.restartWifi);
+    r = mergeOk(configWithSsid("Home"), "{\"wifi\":{\"ssid\":\"Home\",\"password\":\"\"}}");
+    TEST_ASSERT_FALSE(r.restartWifi);
+    // No wifi section at all: no restart.
+    r = mergeOk(configWithSsid("Home"), "{\"device\":{\"brightness\":50}}");
+    TEST_ASSERT_FALSE(r.restartWifi);
+    r = mergeOk(configWithSsid("Home"), "{\"web\":{\"password\":\"x\"},\"ha\":{}}");
+    TEST_ASSERT_FALSE(r.restartWifi);
+}
+
 static void test_merge_failure_resets_secret_changes() {
     // A valid secret followed by an invalid section: nothing must be applied.
     const cfg::Config cur = configWithSsid("Home");
@@ -1432,6 +1469,7 @@ int main() {
     RUN_TEST(test_empty_url_forces_token_clear_even_if_supplied);
     RUN_TEST(test_empty_ssid_forces_password_clear_even_if_supplied);
     RUN_TEST(test_non_empty_url_and_ssid_not_forced_clear);
+    RUN_TEST(test_restart_wifi_flag);
     RUN_TEST(test_merge_failure_resets_secret_changes);
     // AP password
     RUN_TEST(test_ap_password);
