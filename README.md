@@ -87,7 +87,8 @@ BOOT fw=<version> psram=<bytes> flash=<bytes> touch=<CST816|CHSC5816|none> heap=
 CFG loaded controls=<n>                  config read from NVS
 CFG defaults reason=<missing|corrupt|schema|invalid>[ field=.. error=..]
 CFG ap_pw generated                      first boot only
-CFG saved controls=<n> bytes=<n>
+CFG saved controls=<n> bytes=<n> cfg_written=<0|1>   cfg_written=0: only secrets changed
+CFG unchanged                            accepted patch that changes nothing (nothing written)
 CFG secrets wifi_pw_set=<0|1> ha_token_set=<0|1> web_pw_set=<0|1> ap_pw_set=<0|1>[ token_set len=<n>]
 CFG factory reset ok=<0|1>
 ENC d=<+1|-1> count=<n>                  one line per detent, clockwise = +1
@@ -106,7 +107,9 @@ WIFI sta lost
 WIFI fallback ap_sta                     not connected within 30 s: setup AP up as well
 WIFI restart reason=config               Wi-Fi credentials changed
 WIFI mdns host=<hostname>.local ok=<0|1>
-WEB started port=80 fs=<0|1>             fs=0: LittleFS not mounted (run uploadfs)
+WIFI scan start | WIFI scan done networks=<n> failed=<0|1> | WIFI scan timeout | WIFI scan start failed err=<hex>
+WEB started port=80 fs=<0|1> files=<n>   fs=0: LittleFS not mounted (run uploadfs); files = web UI files found
+LOG dropped=<n>                          n lines were dropped while nothing read the serial port
 WEB config saved restart_wifi=<0|1>
 WEB config rejected field=<field> error=<error>
 WEB reboot requested | WEB factory reset requested
@@ -115,6 +118,11 @@ SYS reboot | SYS factory reset           performed by the main loop just after t
 
 In `HB`, `ip` is the station IP when connected, else `192.168.4.1` while the setup AP is up,
 else `0.0.0.0`. SSIDs are logged, passwords never.
+
+Serial output never blocks the firmware: when the board is plugged into a PC but no program
+reads the port, the 4 KB transmit buffer fills up and further lines are dropped (counted in
+`LOG dropped=`) until a monitor is opened. (Arduino-ESP32 2.0.17's USB serial would
+otherwise hang the writing task in that situation.)
 
 The CFG lines are printed at boot, usually before the PC has attached, so `BOOT ... cfg=`
 and `HB ... ctl= cfg=` are the reliable way to see the load state (`cfg` = how this boot
@@ -222,6 +230,10 @@ Encoder actions per domain (default first) and step default / range:
 | media_player | `volume` 2 (1-20), `none` | `play_pause`, `toggle`, `mute`, `none` |
 | switch, input_boolean | `none` | `toggle`, `none` |
 
+Writes are skipped when nothing changes (flash wear): the `cfg` blob is not rewritten
+when the serialised config equals the stored one, and a secret set to its stored value
+is not rewritten, so e.g. `POST /api/config {}` writes nothing (`CFG unchanged`).
+
 Patch semantics (`mergePatch`, used by `POST /api/config`): a section present in the patch
 replaces that section **literally** (keys missing inside it take their defaults, so a
 `wifi` section without `ssid` unconfigures Wi-Fi); secrets (`wifi.password`, `ha.token`,
@@ -285,7 +297,7 @@ files were never flashed, `/` answers 503 with a hint to run `uploadfs`.
 | GET `/api/status` | `{fw, uptime_s, heap_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state:"not_available", ha_version, last_error}}` |
 | GET `/api/config` | Redacted config: secrets only as `wifi.password_set`, `ha.token_set`, `web.password_set` |
 | POST `/api/config` | Patch (see Configuration). `200 {ok:true, restart_wifi}`, `400 {error, field}` (validation), `500 {error:"nvs_write_failed", field}` (storage failed; the config may be partly written and is re-read) |
-| GET `/api/wifi/scan` | `{scanning, age_s, failed, networks:[{ssid, rssi, secure}]}`; starts a new scan when the last one is older than 10 s. Poll until `scanning` is false |
+| GET `/api/wifi/scan` | `{scanning, age_s, failed, networks:[{ssid, rssi, secure}]}`; starts a new scan when there is none yet, the last one failed or it is older than 10 s. Poll until `scanning` is false (a scan takes about 2-5 s; requests during a scan can take up to about 3 s because the radio briefly leaves its channel) |
 | POST `/api/reboot` | `200 {ok:true}`, reboots about 0.75 s later |
 | POST `/api/factory-reset` | `200 {ok:true}`, then erases the config and secrets (not `ap_pw`) and reboots |
 
@@ -413,6 +425,7 @@ include/          board_pins.h (GPIO map), lv_conf.h (LVGL config), version.h
 src/main.cpp      setup()/loop() wiring only
 src/hal/          Display, Touch, Encoder, Button, Buzzer, PsramAllocator (hardware glue)
 src/config/       ConfigStore (NVS persistence, mutex)
+src/util/         Log.h (non-blocking serial logging)
 src/net/          WifiManager (STA, setup AP, captive DNS, mDNS), WebServer (REST API, static files)
 src/ui/           Ui (screen manager), Widgets, screens/ (Boot, Setup, Status), fonts/ (generated)
 data/             web UI (index.html, app.js, style.css), flashed with uploadfs

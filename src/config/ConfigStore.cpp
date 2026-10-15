@@ -4,9 +4,11 @@
 #include <bootloader_random.h>
 #include <esp_random.h>
 
+#include <cstring>
 #include <memory>
 
 #include "hal/PsramAllocator.h"
+#include "../util/Log.h"  // relative: the embedded test compiles this file outside src/
 
 namespace cfg = core::config;
 
@@ -28,7 +30,7 @@ bool ConfigStore::begin() {
     if (!open_) {
         config_ = cfg::Config();
         loadStatus_ = cfg::LoadStatus::Missing;
-        Serial.println("ERR CFG nvs open failed, using defaults");
+        util::logPrintf("ERR CFG nvs open failed, using defaults\n");
         return false;
     }
 
@@ -39,7 +41,7 @@ bool ConfigStore::begin() {
         const std::string apPw = cfg::makeApPassword(esp_random);
         bootloader_random_disable();
         prefs_.putString(kKeyApPw, apPw.c_str());
-        Serial.println("CFG ap_pw generated");
+        util::logPrintf("CFG ap_pw generated\n");
     }
 
     // A stored cfg that cannot be read (too large, read error, empty) is Corrupt, not
@@ -67,12 +69,12 @@ bool ConfigStore::begin() {
     config_ = std::move(result.config);
     loadStatus_ = result.status;
     if (loadStatus_ == cfg::LoadStatus::Loaded) {
-        Serial.printf("CFG loaded controls=%u\n", static_cast<unsigned>(config_.controls.size()));
+        util::logPrintf("CFG loaded controls=%u\n", static_cast<unsigned>(config_.controls.size()));
     } else if (loadStatus_ == cfg::LoadStatus::Invalid) {
-        Serial.printf("CFG defaults reason=%s field=%s error=%s\n", cfg::loadStatusName(loadStatus_),
-                      result.error.field.c_str(), result.error.message.c_str());
+        util::logPrintf("CFG defaults reason=%s field=%s error=%s\n", cfg::loadStatusName(loadStatus_),
+                        result.error.field.c_str(), result.error.message.c_str());
     } else {
-        Serial.printf("CFG defaults reason=%s\n", cfg::loadStatusName(loadStatus_));
+        util::logPrintf("CFG defaults reason=%s\n", cfg::loadStatusName(loadStatus_));
     }
 
     // First boot: store the defaults so later boots load them. Unusable stored data
@@ -151,11 +153,15 @@ cfg::ValidationResult ConfigStore::save(const cfg::Config &config,
 
 // Caller holds the mutex.
 cfg::ValidationResult ConfigStore::saveLocked(const cfg::Config &config,
-                                              const cfg::SecretChanges &secrets,
-                                              bool *cfgWritten) {
-    if (cfgWritten != nullptr) {
-        *cfgWritten = false;
-    }
+                                              const cfg::SecretChanges &requested,
+                                              bool *cfgWritten, bool *secretsWritten) {
+    bool wroteCfg = false;
+    bool wroteSecret = false;
+    auto report = [&]() {
+        if (cfgWritten != nullptr) *cfgWritten = wroteCfg;
+        if (secretsWritten != nullptr) *secretsWritten = wroteSecret;
+    };
+    report();
     cfg::ValidationResult valid = cfg::validate(config);
     if (!valid.ok) {
         return valid;
@@ -165,6 +171,12 @@ cfg::ValidationResult ConfigStore::saveLocked(const cfg::Config &config,
         return writeFailed;
     }
 
+    // Unchanged secrets are not rewritten (flash wear).
+    cfg::SecretChanges secrets = requested;
+    dropNoOp(kKeyHaToken, secrets.haToken);
+    dropNoOp(kKeyWifiPw, secrets.wifiPassword);
+    dropNoOp(kKeyWebPw, secrets.webPassword);
+
     // Write order, so that a failed or interrupted save can never pair the new cfg (e.g. a
     // new HA URL) with an old secret; the worst case is "new cfg, secret missing":
     //  (a) remove the old ha_token / wifi_pw if they are being replaced or cleared; abort
@@ -173,35 +185,46 @@ cfg::ValidationResult ConfigStore::saveLocked(const cfg::Config &config,
     //  (c) write the new secret values (and clear web_pw if requested). web_pw is
     //      overwritten in place: if that write fails the old password stays, which fails
     //      closed.
-    if (!removeIfChanging(kKeyHaToken, secrets.haToken) ||
-        !removeIfChanging(kKeyWifiPw, secrets.wifiPassword)) {
-        Serial.println("ERR CFG remove old secret failed, cfg not written");
+    if (!removeIfChanging(kKeyHaToken, secrets.haToken, &wroteSecret) ||
+        !removeIfChanging(kKeyWifiPw, secrets.wifiPassword, &wroteSecret)) {
+        util::logPrintf("ERR CFG remove old secret failed, cfg not written\n");
         logSecrets();
+        report();
         return writeFailed;
     }
 
     const std::string json = cfg::toJson(config, PsramAllocator::instance());
-    if (prefs_.putBytes(kKeyConfig, json.data(), json.size()) != json.size()) {
-        Serial.println("ERR CFG write cfg failed");
-        logSecrets();
-        return writeFailed;
+    if (!storedConfigEquals(json)) {
+        if (prefs_.putBytes(kKeyConfig, json.data(), json.size()) != json.size()) {
+            util::logPrintf("ERR CFG write cfg failed\n");
+            logSecrets();
+            report();  // NVS keeps the old entry when a write fails
+            return writeFailed;
+        }
+        wroteCfg = true;
     }
     // The in-memory copy follows what NVS now holds (secrets are always read from NVS),
     // so memory and NVS agree even if a secret write below fails.
     config_ = config;
     loadStatus_ = cfg::LoadStatus::Loaded;
-    if (cfgWritten != nullptr) {
-        *cfgWritten = true;
-    }
 
+    using Kind = cfg::SecretChange::Kind;
+    wroteSecret = wroteSecret || secrets.haToken.kind != Kind::Keep ||
+                  secrets.wifiPassword.kind != Kind::Keep || secrets.webPassword.kind != Kind::Keep;
     const bool secretsOk = writeSecret(kKeyHaToken, secrets.haToken) &&
                            writeSecret(kKeyWifiPw, secrets.wifiPassword) &&
                            writeSecret(kKeyWebPw, secrets.webPassword);
-    Serial.printf("CFG saved controls=%u bytes=%u\n", static_cast<unsigned>(config.controls.size()),
-                  static_cast<unsigned>(json.size()));
+    report();
+    if (!wroteCfg && !wroteSecret) {
+        util::logPrintf("CFG unchanged\n");
+        return cfg::ValidationResult::success();
+    }
+    util::logPrintf("CFG saved controls=%u bytes=%u cfg_written=%d\n",
+                    static_cast<unsigned>(config.controls.size()), static_cast<unsigned>(json.size()),
+                    wroteCfg ? 1 : 0);
     logSecrets();
     if (!secretsOk) {
-        Serial.println("ERR CFG write secret failed");
+        util::logPrintf("ERR CFG write secret failed\n");
         return writeFailed;
     }
     return cfg::ValidationResult::success();
@@ -214,7 +237,8 @@ cfg::MergeResult ConfigStore::applyPatch(const char *json, size_t length) {
     if (!merged.ok) {
         return merged;
     }
-    cfg::ValidationResult saved = saveLocked(merged.config, merged.secrets, &merged.cfgWritten);
+    cfg::ValidationResult saved =
+        saveLocked(merged.config, merged.secrets, &merged.cfgWritten, &merged.secretsWritten);
     if (!saved.ok) {
         merged.ok = false;
         merged.error = saved;
@@ -235,15 +259,39 @@ bool ConfigStore::factoryReset() {
             ok = false;
         }
     }
-    Serial.printf("CFG factory reset ok=%d\n", ok ? 1 : 0);
+    util::logPrintf("CFG factory reset ok=%d\n", ok ? 1 : 0);
     return ok;
 }
 
+// Caller holds the mutex. Turns a change that would not alter NVS into Keep: a Set to
+// the stored value, or a Clear of a key that does not exist.
+void ConfigStore::dropNoOp(const char *key, cfg::SecretChange &change) const {
+    using Kind = cfg::SecretChange::Kind;
+    if (change.kind == Kind::Clear && !prefs_.isKey(key)) {
+        change = cfg::SecretChange();
+    } else if (change.kind == Kind::Set && prefs_.isKey(key) &&
+               change.value == prefs_.getString(key).c_str()) {
+        change = cfg::SecretChange();
+    }
+}
+
+// Caller holds the mutex. True if the stored cfg blob is byte for byte json.
+bool ConfigStore::storedConfigEquals(const std::string &json) const {
+    if (!prefs_.isKey(kKeyConfig) || prefs_.getBytesLength(kKeyConfig) != json.size()) {
+        return false;
+    }
+    std::unique_ptr<char[]> stored(new char[json.size()]);
+    return prefs_.getBytes(kKeyConfig, stored.get(), json.size()) == json.size() &&
+           memcmp(stored.get(), json.data(), json.size()) == 0;
+}
+
 // Caller holds the mutex. Removes key if change is Set or Clear; true if nothing to do.
-bool ConfigStore::removeIfChanging(const char *key, const cfg::SecretChange &change) {
+// Sets *removed when a removal was attempted (it may have changed NVS even if it failed).
+bool ConfigStore::removeIfChanging(const char *key, const cfg::SecretChange &change, bool *removed) {
     if (change.kind == cfg::SecretChange::Kind::Keep || !prefs_.isKey(key)) {
         return true;
     }
+    *removed = true;
     return prefs_.remove(key);
 }
 
@@ -268,11 +316,11 @@ void ConfigStore::logSecrets() const {
     const int wifi = len(kKeyWifiPw);
     const int token = len(kKeyHaToken);
     const int web = len(kKeyWebPw);
-    Serial.printf("CFG secrets wifi_pw_set=%d ha_token_set=%d web_pw_set=%d ap_pw_set=%d",
-                  wifi >= 0 ? 1 : 0, token >= 0 ? 1 : 0, web >= 0 ? 1 : 0,
-                  prefs_.isKey(kKeyApPw) ? 1 : 0);
+    char tokenLen[24] = "";
     if (token >= 0) {
-        Serial.printf(" token_set len=%d", token);
+        snprintf(tokenLen, sizeof(tokenLen), " token_set len=%d", token);
     }
-    Serial.println();
+    util::logPrintf("CFG secrets wifi_pw_set=%d ha_token_set=%d web_pw_set=%d ap_pw_set=%d%s\n",
+                    wifi >= 0 ? 1 : 0, token >= 0 ? 1 : 0, web >= 0 ? 1 : 0,
+                    prefs_.isKey(kKeyApPw) ? 1 : 0, tokenLen);
 }

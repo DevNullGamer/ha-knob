@@ -5,15 +5,18 @@
 #include <LittleFS.h>
 #include <esp_heap_caps.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "config/ConfigStore.h"
 #include "hal/PsramAllocator.h"
 #include "version.h"
 #include "web/RequestGuard.h"
+#include "util/Log.h"
 
 namespace net {
 namespace web {
@@ -31,6 +34,10 @@ AsyncWebServer server(kPort);
 ConfigStore *store = nullptr;
 const char *touchName = "none";
 bool fsOk = false;
+// Files in the LittleFS root, listed once in begin() (read-only afterwards). The static
+// handler only takes requests for these, so misses never reach LittleFS (whose failed
+// open() logs "[E][vfs_api.cpp] ... does not exist" several times per request).
+std::vector<std::string> staticFiles;
 
 // State shared between the main loop and the async_tcp task; guarded by snapshotMutex.
 std::mutex snapshotMutex;
@@ -217,21 +224,22 @@ void handleConfigPost(AsyncWebServerRequest *request) {
     const core::config::MergeResult result = store->applyPatch(buffer->data(), buffer->length);
 
     bool restartWifi = false;
-    if (result.cfgWritten) {
+    if (result.cfgWritten || result.secretsWritten) {
         // Also after nvs_write_failed: the stored config may have changed, so the main
-        // loop re-reads it (and restarts Wi-Fi if the credentials differ).
+        // loop re-reads it (and restarts Wi-Fi if the credentials differ). A patch that
+        // changes nothing writes nothing and needs no re-read.
         restartWifi = store->config().wifi.ssid != ssidBefore || store->wifiPassword() != passwordBefore;
         refreshWebPassword();
         configDirty = true;
     }
     if (!result.ok) {
         const bool writeFailed = result.error.message == "nvs_write_failed";
-        Serial.printf("WEB config rejected field=%s error=%s\n", result.error.field.c_str(),
-                      result.error.message.c_str());
+        util::logPrintf("WEB config rejected field=%s error=%s\n", result.error.field.c_str(),
+                        result.error.message.c_str());
         sendError(request, writeFailed ? 500 : 400, result.error.message, result.error.field);
         return;
     }
-    Serial.printf("WEB config saved restart_wifi=%d\n", restartWifi ? 1 : 0);
+    util::logPrintf("WEB config saved restart_wifi=%d\n", restartWifi ? 1 : 0);
     JsonDocument doc = makeDoc();
     doc["ok"] = true;
     doc["restart_wifi"] = restartWifi;
@@ -243,7 +251,8 @@ void handleScan(AsyncWebServerRequest *request) {
     {
         std::lock_guard<std::mutex> lock(snapshotMutex);
         const uint32_t now = millis();
-        if (!scanPending && (!scanHaveResults || now - scanAtMs >= kScanFreshMs)) {
+        // A failed scan is never reused: the next request starts a new one.
+        if (!scanPending && (!scanHaveResults || scanFailed || now - scanAtMs >= kScanFreshMs)) {
             scanPending = true;
             scanRequested = true;
         }
@@ -268,7 +277,7 @@ void handleScan(AsyncWebServerRequest *request) {
 
 void requestSystem(AsyncWebServerRequest *request, SystemRequest what) {
     systemRequest = static_cast<uint8_t>(what);
-    Serial.println(what == SystemRequest::Reboot ? "WEB reboot requested" : "WEB factory reset requested");
+    util::logPrintf("%s\n", what == SystemRequest::Reboot ? "WEB reboot requested" : "WEB factory reset requested");
     JsonDocument doc = makeDoc();
     doc["ok"] = true;
     sendJson(request, 200, doc);
@@ -278,12 +287,34 @@ void handleNotFound(AsyncWebServerRequest *request) {
     const std::string path = request->url().c_str();
     if (guard::isApiPath(path)) {
         sendError(request, 404, "not_found");
-    } else if (!fsOk && (path == "/" || path == "/index.html")) {
+    } else if (path == "/" || path == "/index.html") {
         request->send(503, "text/plain",
                       "HA Knob: the web UI files are missing. Flash them with "
                       "pio run -e t-encoder-pro -t uploadfs");
     } else {
         request->send(404, "text/plain", "Not found");
+    }
+}
+
+// "/" -> "/index.html"; true if the path names a file listed in staticFiles.
+bool isStaticFile(AsyncWebServerRequest *request) {
+    std::string path = request->url().c_str();
+    if (path == "/") {
+        path = "/index.html";
+    }
+    return std::find(staticFiles.begin(), staticFiles.end(), path) != staticFiles.end();
+}
+
+void listStaticFiles() {
+    File root = LittleFS.open("/");
+    if (!root || !root.isDirectory()) {
+        return;
+    }
+    for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+        if (!f.isDirectory()) {
+            std::string name = f.name();
+            staticFiles.push_back(name.empty() || name[0] != '/' ? "/" + name : name);
+        }
     }
 }
 
@@ -296,6 +327,9 @@ void begin(ConfigStore &configStore, const char *touchVariant) {
 
     // LittleFS holds only web assets; never format it automatically (uploadfs does that).
     fsOk = LittleFS.begin(false);
+    if (fsOk) {
+        listStaticFiles();
+    }
 
     // Defence in depth on every response: no framing (clickjacking), no MIME sniffing,
     // scripts and styles only from the device itself. No CORS headers, ever.
@@ -321,11 +355,13 @@ void begin(ConfigStore &configStore, const char *touchVariant) {
         server.serveStatic("/", LittleFS, "/")
             .setDefaultFile("index.html")
             .setCacheControl("no-cache")
-            .setTryGzipFirst(false);
+            .setTryGzipFirst(false)
+            .setFilter(isStaticFile);
     }
     server.onNotFound(handleNotFound);
     server.begin();
-    Serial.printf("WEB started port=%u fs=%d\n", static_cast<unsigned>(kPort), fsOk ? 1 : 0);
+    util::logPrintf("WEB started port=%u fs=%d files=%u\n", static_cast<unsigned>(kPort), fsOk ? 1 : 0,
+                    static_cast<unsigned>(staticFiles.size()));
 }
 
 void publishNetwork(const wifi::Status &status) {

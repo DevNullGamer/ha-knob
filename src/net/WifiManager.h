@@ -16,7 +16,9 @@
 //    A lost connection is retried at once, with the same 30 s fallback.
 //  - mDNS "<hostname>.local" with an _http._tcp service, in every mode.
 // The driver's own auto-reconnect and NVS credential storage are disabled: the
-// credentials live only in the ConfigStore and every retry is scheduled here.
+// credentials live only in the ConfigStore and every retry is scheduled here. The link
+// state comes from ESP-IDF (association + STA netif address, polled every 100 ms), not
+// from WiFi.status(). Retries never interrupt an association waiting for DHCP or a scan.
 //
 // Serial lines:
 //   WIFI ap ssid=<ap ssid> ip=192.168.4.1     setup AP up
@@ -27,6 +29,7 @@
 //   WIFI fallback ap_sta                      STA did not connect within 30 s
 //   WIFI restart reason=config                credentials changed
 //   WIFI mdns host=<hostname>.local ok=<0|1>
+//   WIFI scan done networks=<n> failed=<0|1>  |  WIFI scan timeout  |  WIFI scan start failed err=..
 namespace net {
 namespace wifi {
 
@@ -74,11 +77,12 @@ void loop(uint32_t nowMs);
 // Current state (refreshed by loop() about once a second and on every change).
 const Status &status();
 
-// Starts an asynchronous scan. False if the driver refused (e.g. while STA is
-// connecting); true if a scan was started or is already running.
-bool startScan();
+// Requests an asynchronous scan (no-op while one is pending or running). The start is
+// retried for up to 6 s while the driver is busy (e.g. the STA is connecting); a scan
+// that cannot start or does not finish within 15 s ends as failed.
+void requestScan(uint32_t nowMs);
 
-// After a scan started by startScan() ended: fills networks (de-duplicated by SSID,
+// After a requested scan ended: fills networks (de-duplicated by SSID,
 // strongest first, hidden networks skipped), sets failed and returns true, once.
 bool takeScanResults(std::vector<ScanNetwork> &networks, bool &failed);
 

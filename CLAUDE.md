@@ -81,7 +81,13 @@ line, not only on `BOOT`.
   (done in an `LV_EVENT_INVALIDATE_AREA` handler).
 - **IO0 is the encoder push button and the BOOT strapping pin**: holding the knob during
   reset enters download mode. Never use a hold-at-boot gesture for features.
-- Serial: `Serial.setTxTimeoutMs(0)` so writes never block without a USB host.
+- **Serial: always log with `util::logPrintf()` (`src/util/Log.h`), never `Serial.print*`.**
+  Core 2.0.17's `HWCDC::write()` busy-loops forever when the USB host is attached but the
+  port is not being read and the TX buffer is full (`setTxTimeoutMs(0)` does not help).
+  That froze the main loop after a replug (stale Wi-Fi snapshot -> `Host: <ip>` got 403,
+  Wi-Fi scans never finished) until a monitor was opened. `logPrintf` only writes a line
+  that fits into the free buffer (4 KB, set in `setup()` before `Serial.begin`) and counts
+  the rest (`LOG dropped=N`). It is header-only and not ISR-safe.
 - **The screen is the knob cap**: pressing it also clicks the button (touch ~120 ms before
   `BTN down`). User decision: all press actions come from the button; touch gives swipes
   only (`core::SwipeClassifier`); taps must never trigger an action.
@@ -188,6 +194,20 @@ line, not only on `BOOT`.
 - After `applyPatch` with `cfgWritten` (also on `nvs_write_failed`) the handler sets
   `configDirty`; the main loop re-reads the config (brightness, Wi-Fi, hostname/mDNS).
 - `HB` gained `wifi=<off|ap|sta|ap_sta> ip=<ip>`.
+- Round 2 (2026-10-15):
+  - STA link state is read from ESP-IDF every 100 ms (`esp_wifi_sta_get_ap_info` + STA
+    netif address), not `WiFi.status()`. Retries never disconnect an association that is
+    still waiting for DHCP, or a running scan.
+  - Scans use `esp_wifi_scan_start` directly (active, 120 ms max dwell, own 15 s timeout,
+    start retried for 6 s while the driver is busy). `WiFi.scanNetworks(true)` +
+    `scanComplete()` report a scan as failed after `max_ms_per_chan * 20` (6 s) while the
+    driver is still scanning, and the next start then fails too.
+  - `ConfigStore` skips unchanged writes: cfg blob compared byte for byte with the stored
+    one, a secret Set to its stored value or a Clear of an absent key becomes Keep.
+    `MergeResult::secretsWritten` joins `cfgWritten`; the web handler re-reads the config
+    if either is set.
+  - The static handler only serves files listed from the LittleFS root at boot, so misses
+    (`/api/x`, `/favicon.ico`) never reach LittleFS and its `vfs_api` error logging.
 - AP SSID uses the last two bytes of the STA MAC (this unit: `HA-Knob-043C`).
 - App size 1.52 MB (was about 0.94 MB): Wi-Fi stack, web server, mDNS, LittleFS.
 - Upload timing: about 53 s with nothing to rebuild (30 s PlatformIO pre-upload checks,

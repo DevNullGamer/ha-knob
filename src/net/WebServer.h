@@ -17,7 +17,7 @@ class ConfigStore;
 //   GET  /api/config         redacted config (secrets only as *_set flags)
 //   POST /api/config         patch (ConfigStore::applyPatch): 200 {ok,restart_wifi},
 //                            400 {error,field}, 500 {error:"nvs_write_failed",field}
-//   GET  /api/wifi/scan      cached scan results; starts a new scan if none is fresh
+//   GET  /api/wifi/scan      cached scan results; starts a new scan if none is fresh (or it failed)
 //   POST /api/reboot         200 {ok:true}, the main loop reboots shortly after
 //   POST /api/factory-reset  200 {ok:true}, the main loop resets the config and reboots
 //   GET  /*                  static files from LittleFS (index.html by default)
@@ -28,7 +28,7 @@ class ConfigStore;
 // atomic flags (take* functions below, main loop only).
 //
 // Serial lines:
-//   WEB started port=80 fs=<0|1>
+//   WEB started port=80 fs=<0|1> files=<n>
 //   WEB config saved restart_wifi=<0|1>   |   WEB config rejected field=.. error=..
 //   WEB reboot requested  |  WEB factory reset requested
 namespace net {

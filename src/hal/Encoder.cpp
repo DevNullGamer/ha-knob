@@ -8,6 +8,7 @@
 
 #include "board_pins.h"
 #include "input/QuadratureDecoder.h"
+#include "util/Log.h"
 
 namespace hal {
 namespace encoder {
@@ -57,12 +58,12 @@ void begin(bool reverse) {
     // ESP_ERR_INVALID_STATE and the handler still works, just not with the cache disabled.
     const esp_err_t err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     if (err != ESP_OK) {
-        Serial.printf("ERR encoder isr service err=%d\n", static_cast<int>(err));
+        util::logPrintf("ERR encoder isr service err=%d\n", static_cast<int>(err));
     }
     for (const int pin : {pins::kEncA, pins::kEncB}) {
         const esp_err_t addErr = gpio_isr_handler_add(static_cast<gpio_num_t>(pin), encoderIsr, nullptr);
         if (addErr != ESP_OK) {
-            Serial.printf("ERR encoder isr handler pin=%d err=%d\n", pin, static_cast<int>(addErr));
+            util::logPrintf("ERR encoder isr handler pin=%d err=%d\n", pin, static_cast<int>(addErr));
         }
     }
 }

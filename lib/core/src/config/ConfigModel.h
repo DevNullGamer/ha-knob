@@ -169,8 +169,12 @@ struct MergeResult {
     // cannot see stored secrets, so the device compares the actual credentials.
     bool restartWifi = false;
     // Set by ConfigStore::applyPatch (never by mergePatch): the cfg blob was written,
-    // so the stored config may have changed even if a later secret write failed.
+    // so the stored config may have changed even if a later secret write failed. False
+    // when the serialised config equals the stored blob (nothing is rewritten then).
     bool cfgWritten = false;
+    // Set by ConfigStore::applyPatch (never by mergePatch): a secret was written or
+    // removed (an unchanged secret is not rewritten), even if a later write failed.
+    bool secretsWritten = false;
 };
 
 // Applies a JSON patch to the current config:

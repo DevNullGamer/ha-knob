@@ -29,6 +29,7 @@
 #include "net/WebServer.h"
 #include "net/WifiManager.h"
 #include "ui/Ui.h"
+#include "util/Log.h"
 #include "version.h"
 
 namespace {
@@ -49,11 +50,11 @@ net::web::SystemRequest pendingSystem = net::web::SystemRequest::None;
 uint32_t pendingSystemAtMs = 0;
 
 void printBootLine() {
-    Serial.printf("BOOT fw=%s psram=%u flash=%u touch=%s heap=%u cfg=%s\n", FW_VERSION,
-                  static_cast<unsigned>(ESP.getPsramSize()),
-                  static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
-                  static_cast<unsigned>(ESP.getFreeHeap()),
-                  bootCfgSource);
+    util::logPrintf("BOOT fw=%s psram=%u flash=%u touch=%s heap=%u cfg=%s\n", FW_VERSION,
+                    static_cast<unsigned>(ESP.getPsramSize()),
+                    static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
+                    static_cast<unsigned>(ESP.getFreeHeap()),
+                    bootCfgSource);
 }
 
 void printHeartbeat(uint32_t nowMs) {
@@ -61,12 +62,12 @@ void printHeartbeat(uint32_t nowMs) {
     const char *ip = wifi.staConnected ? wifi.staIp.c_str()
                      : wifi.apActive   ? net::wifi::kApIp
                                        : "0.0.0.0";
-    Serial.printf("HB up=%u psram=%u flash=%u touch=%s count=%d ctl=%u cfg=%s wifi=%s ip=%s\n",
-                  static_cast<unsigned>(nowMs / 1000), static_cast<unsigned>(ESP.getPsramSize()),
-                  static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
-                  static_cast<int>(shownCount),
-                  static_cast<unsigned>(configStore.controlCount()), bootCfgSource,
-                  net::wifi::modeName(wifi.mode), ip);
+    util::logPrintf("HB up=%u psram=%u flash=%u touch=%s count=%d ctl=%u cfg=%s wifi=%s ip=%s\n",
+                    static_cast<unsigned>(nowMs / 1000), static_cast<unsigned>(ESP.getPsramSize()),
+                    static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
+                    static_cast<int>(shownCount),
+                    static_cast<unsigned>(configStore.controlCount()), bootCfgSource,
+                    net::wifi::modeName(wifi.mode), ip);
 }
 
 // Publishes Wi-Fi state changes to the web server snapshot and the screens.
@@ -103,8 +104,8 @@ void handleWebRequests(uint32_t nowMs) {
                                nowMs);
     }
 
-    if (net::web::takeScanRequest() && !net::wifi::startScan()) {
-        net::web::publishScan({}, true, nowMs);
+    if (net::web::takeScanRequest()) {
+        net::wifi::requestScan(nowMs);
     }
     std::vector<net::wifi::ScanNetwork> networks;
     bool scanFailed = false;
@@ -120,10 +121,10 @@ void handleWebRequests(uint32_t nowMs) {
     if (pendingSystem != net::web::SystemRequest::None &&
         static_cast<int32_t>(nowMs - pendingSystemAtMs) >= 0) {
         if (pendingSystem == net::web::SystemRequest::FactoryReset) {
-            Serial.println("SYS factory reset");
+            util::logPrintf("SYS factory reset\n");
             configStore.factoryReset();
         } else {
-            Serial.println("SYS reboot");
+            util::logPrintf("SYS reboot\n");
         }
         Serial.flush();
         delay(50);
@@ -139,7 +140,7 @@ void handleEncoder() {
     const int d = delta > 0 ? 1 : -1;
     for (int32_t i = 0; i != delta; i += d) {
         shownCount += d;
-        Serial.printf("ENC d=%+d count=%d\n", d, static_cast<int>(shownCount));
+        util::logPrintf("ENC d=%+d count=%d\n", d, static_cast<int>(shownCount));
     }
     if (displayOk) {
         ui::showEncoderCount(shownCount);
@@ -156,9 +157,9 @@ void handleButton(uint32_t nowMs) {
         hal::buzzer::beep(nowMs);
     }
     if (event == Event::ShortPress) {
-        Serial.println("BTN up");  // a short press is also a release
+        util::logPrintf("BTN up\n");  // a short press is also a release
     }
-    Serial.printf("BTN %s\n", core::buttonEventName(event));
+    util::logPrintf("BTN %s\n", core::buttonEventName(event));
 
     if (!displayOk) {
         return;
@@ -176,7 +177,7 @@ void handleTouch(uint32_t nowMs) {
     if (swipe == core::Swipe::None) {
         return;
     }
-    Serial.printf("TOUCH swipe=%s\n", core::swipeName(swipe));
+    util::logPrintf("TOUCH swipe=%s\n", core::swipeName(swipe));
     if (displayOk) {
         ui::showLastInput(swipe == core::Swipe::Left ? "swipe left" : "swipe right");
     }
@@ -185,8 +186,11 @@ void handleTouch(uint32_t nowMs) {
 }  // namespace
 
 void setup() {
+    // All output goes through util::logPrintf (src/util/Log.h), which never lets
+    // HWCDC::write() block. The larger TX buffer keeps bursts (boot, CFG saves) intact.
+    Serial.setTxBufferSize(4096);  // before begin(), which would create a 256-byte buffer
     Serial.begin(115200);
-    Serial.setTxTimeoutMs(0);  // never block when no USB host is attached
+    Serial.setTxTimeoutMs(0);
 
     configStore.begin();
     bootCfgSource = configStore.loadedFromNvs() ? "loaded" : "defaults";
@@ -203,7 +207,7 @@ void setup() {
     if (displayOk) {
         ui::begin(millis());
     } else {
-        Serial.println("ERR display init failed");
+        util::logPrintf("ERR display init failed\n");
     }
 
     apPassword = configStore.apPassword();

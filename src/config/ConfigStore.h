@@ -43,14 +43,18 @@ public:
     // Validates, then: removes the old ha_token / wifi_pw if they change (abort on
     // failure), writes cfg, then writes the new secrets. A failed or interrupted save can
     // leave "new cfg, secret missing" but never a new URL with the old token. The
-    // in-memory copy is updated once cfg is written (it always mirrors NVS). Returns the
-    // validation error or a failure with message "nvs_write_failed".
+    // in-memory copy is updated once cfg is written (it always mirrors NVS). Nothing is
+    // rewritten that would not change (flash wear): cfg is skipped when the serialised
+    // config equals the stored blob, a secret Set to its stored value or a Clear of an
+    // absent secret is skipped. Returns the validation error or a failure with message
+    // "nvs_write_failed".
     core::config::ValidationResult save(const core::config::Config &config,
                                         const core::config::SecretChanges &secrets = {});
 
     // mergePatch() against the current config, then save() on success. The result's
-    // cfgWritten tells whether the cfg blob was written (true even when a later secret
-    // write failed and ok is false, so the caller knows the stored config may have changed).
+    // cfgWritten / secretsWritten tell whether the cfg blob / a secret was written or
+    // removed (true even when a later write failed and ok is false, so the caller knows
+    // the stored state may have changed; both false when the patch changed nothing).
     core::config::MergeResult applyPatch(const char *json, size_t length);
 
     // Removes cfg and all secrets except ap_pw; the in-memory config becomes defaults.
@@ -59,8 +63,11 @@ public:
 private:
     core::config::ValidationResult saveLocked(const core::config::Config &config,
                                               const core::config::SecretChanges &secrets,
-                                              bool *cfgWritten = nullptr);
-    bool removeIfChanging(const char *key, const core::config::SecretChange &change);
+                                              bool *cfgWritten = nullptr,
+                                              bool *secretsWritten = nullptr);
+    void dropNoOp(const char *key, core::config::SecretChange &change) const;
+    bool storedConfigEquals(const std::string &json) const;
+    bool removeIfChanging(const char *key, const core::config::SecretChange &change, bool *removed);
     bool writeSecret(const char *key, const core::config::SecretChange &change);
     void logSecrets() const;
 
