@@ -4,11 +4,24 @@
 Usage:
     python tools/http_check.py --ip 192.168.1.143 [--hostname ha-knob] [--reboot]
                                [--web-password-test]
+                               [--ha-test --mock-python PY --mock-host PC_IP
+                                [--mock-port 8765] [--serial-log FILE]]
 
 Only uses the Python standard library. Every request uses the device IP as the Host
 header unless stated otherwise, like a browser opening http://<ip>/.
 
-Safety: never touches the wifi or ha sections. The only state-changing requests are
+Step 5 (always): the status "ha" block, POST /api/ha/retry (200 / 403 without the CSRF
+header / 404 on GET).
+
+--ha-test (Step 5; changes the ha section and always restores it to url "" / token null):
+runs tools/mockha.py with --mock-python (a Python the Windows firewall lets accept LAN
+connections) and checks https -> no_config/tls_not_supported, ready + ha_version, wrong
+token -> auth_failed with exactly one connect attempt, no pong -> reconnect, mock killed ->
+backoff -> recovery, and that no token value reaches /api/config, /api/status or the
+serial log. --serial-log FILE is a file a background serial logger appends to (lines of
+"<epoch> <text>"); it is used to count "HA connect attempt" lines and to grep for tokens.
+
+Safety: without --ha-test never touches the wifi or ha sections. The only state-changing requests are
  - a device patch with an invalid hostname (must be rejected with 400),
  - with --web-password-test: setting a random web password and clearing it again
    (always cleared in a finally block),
@@ -20,12 +33,17 @@ import argparse
 import base64
 import http.client
 import json
+import os
 import secrets
 import socket
+import subprocess
 import sys
+import tempfile
 import time
 
 TIMEOUT = 8
+HA_STATES = ("no_config", "connecting", "authenticating", "subscribing", "ready", "auth_failed",
+             "backoff")
 
 
 class Checker:
@@ -136,6 +154,213 @@ def basic(password):
     return "Basic " + base64.b64encode(f"admin:{password}".encode()).decode()
 
 
+class SerialLog:
+    """Read access to the file a background serial logger appends to."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def mark(self):
+        try:
+            return os.path.getsize(self.path)
+        except OSError:
+            return 0
+
+    def since(self, mark):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(mark)
+                return f.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            return []
+
+
+def ha_status(c):
+    st, _, raw = c.request("GET", "/api/status")
+    return (c.json_of(raw) or {}).get("ha", {}) if st == 200 else {}
+
+
+def wait_ha(c, want_state, timeout, error_contains=None):
+    """Polls /api/status until ha.state == want_state (and last_error contains the text)."""
+    t0 = time.time()
+    h = {}
+    while time.time() - t0 < timeout:
+        try:
+            h = ha_status(c)
+        except (OSError, http.client.HTTPException):
+            h = {}
+        if h.get("state") == want_state and (error_contains is None
+                                             or error_contains in h.get("last_error", "")):
+            return h, time.time() - t0
+        time.sleep(0.5)
+    return h, None
+
+
+def set_ha(c, url, token):
+    body = json.dumps({"ha": {"url": url, "token": token}})
+    return c.request("POST", "/api/config", body=body, headers=post_headers())
+
+
+def run_ha_test(c, args):
+    print("\n--- Step 5 on-device HA tests (ha section is restored at the end) ---")
+    slog = SerialLog(args.serial_log) if args.serial_log else None
+    root = os.path.dirname(os.path.abspath(__file__))
+    mock_path = os.path.join(root, "mockha.py")
+    good = "mock-good-token-" + secrets.token_hex(4)
+    wrong = "wrong-token-" + secrets.token_hex(4)
+    fake_https = "fake-https-token-" + secrets.token_hex(4)
+    mock_url = f"http://{args.mock_host}:{args.mock_port}"
+    mock = {"proc": None, "log": None}
+
+    def stop_mock():
+        if mock["proc"] is not None:
+            mock["proc"].kill()
+            mock["proc"].wait()
+            mock["proc"] = None
+            time.sleep(0.3)
+
+    def start_mock(extra=()):
+        stop_mock()
+        mock["log"] = tempfile.NamedTemporaryFile("w+", suffix=".log", delete=False)
+        mock["proc"] = subprocess.Popen(
+            [args.mock_python, mock_path, "--port", str(args.mock_port), "--token", good,
+             "--seconds", "600", *extra], stdout=mock["log"], stderr=subprocess.STDOUT)
+        time.sleep(1.5)
+
+    def mock_lines():
+        if mock["log"] is None:
+            return []
+        mock["log"].flush()
+        with open(mock["log"].name, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+
+    def attempts(mark):
+        if slog is None:
+            return None
+        return sum(1 for l in slog.since(mark) if "HA connect attempt" in l)
+
+    secrets_seen = [good, wrong, fake_https]
+    try:
+        # A. https: refused, no connection attempt
+        mark = slog.mark() if slog else 0
+        st, _, raw = set_ha(c, "https://ha.example.com", fake_https)
+        c.expect_status("A: set https url + fake token 200", st, 200, raw)
+        h, _ = wait_ha(c, "no_config", 10, "tls_not_supported")
+        c.check(h.get("state") == "no_config" and "tls_not_supported" in h.get("last_error", ""),
+                "A: https -> no_config + tls_not_supported", h)
+        time.sleep(5)
+        h = ha_status(c)
+        c.check(h.get("state") == "no_config", "A: still no_config after 5 s", h)
+        n = attempts(mark)
+        if n is not None:
+            c.check(n == 0, "A: no 'HA connect attempt' on serial for https", n)
+        st, _, raw = c.request("GET", "/api/config")
+        cfgj = c.json_of(raw) or {}
+        c.check(fake_https not in raw.decode("utf-8", "replace"),
+                "A: /api/config does not contain the token")
+        c.check(cfgj.get("ha", {}).get("token_set") is True
+                and cfgj.get("ha", {}).get("url") == "https://ha.example.com",
+                "A: config ha.token_set true, url kept", cfgj.get("ha"))
+        st, _, raw = c.request("GET", "/api/status")
+        c.check(fake_https not in raw.decode("utf-8", "replace"),
+                "A: /api/status does not contain the token")
+        st, _, raw = c.request("POST", "/api/ha/retry", body="{}", headers=post_headers())
+        c.expect_status("A: retry in no_config still 200", st, 200, raw)
+        time.sleep(2)
+        c.check(ha_status(c).get("state") == "no_config", "A: retry does not leave no_config")
+        if slog:
+            c.check(attempts(mark) == 0, "A: still no attempts after retry")
+
+        # B. mock HA: ready + version
+        start_mock()
+        mark = slog.mark() if slog else 0
+        st, _, raw = set_ha(c, mock_url, good)
+        c.expect_status("B: set mock url + good token 200", st, 200, raw)
+        h, took = wait_ha(c, "ready", 25)
+        c.check(h.get("state") == "ready", "B: ready", h)
+        c.check(h.get("ha_version") == "2099.1.0-mock", "B: ha_version from auth_ok", h)
+        c.check(h.get("last_error") == "", "B: last_error empty when ready", h)
+        if took is not None:
+            print(f"      ready after {took:.1f} s")
+        if slog:
+            c.check(attempts(mark) == 1, "B: exactly one connect attempt", attempts(mark))
+        st, _, raw = c.request("GET", "/api/config")
+        c.check(good not in raw.decode("utf-8", "replace"), "B: /api/config does not contain the token")
+
+        # C. wrong token -> auth_failed, exactly one attempt
+        mark = slog.mark() if slog else 0
+        st, _, raw = set_ha(c, mock_url, wrong)
+        c.expect_status("C: set wrong token 200", st, 200, raw)
+        h, _ = wait_ha(c, "auth_failed", 25)
+        c.check(h.get("state") == "auth_failed", "C: auth_failed", h)
+        c.check("auth_invalid" in h.get("last_error", ""), "C: last_error mentions auth_invalid", h)
+        time.sleep(40)  # longer than any backoff step: must not reconnect
+        h = ha_status(c)
+        c.check(h.get("state") == "auth_failed", "C: still auth_failed after 40 s", h)
+        n = attempts(mark)
+        if n is not None:
+            c.check(n == 1, "C: exactly one 'HA connect attempt' line", n)
+        c.check(any("REQ GET" in l for l in mock_lines()), "C: mock saw the connection")
+        # retry leaves auth_failed (wrong token again -> back to auth_failed)
+        mark = slog.mark() if slog else 0
+        st, _, raw = c.request("POST", "/api/ha/retry", body="{}", headers=post_headers())
+        c.expect_status("C: retry 200", st, 200, raw)
+        time.sleep(4)
+        n = attempts(mark)
+        if n is not None:
+            c.check(n == 1, "C: retry makes exactly one new attempt", n)
+        c.check(ha_status(c).get("state") == "auth_failed", "C: auth_failed again after retry")
+
+        # D. good token again
+        st, _, raw = set_ha(c, mock_url, good)
+        c.expect_status("D: set good token 200", st, 200, raw)
+        h, _ = wait_ha(c, "ready", 25)
+        c.check(h.get("state") == "ready", "D: ready with the new token", h)
+
+        # E. mock killed -> backoff -> recovery
+        stop_mock()
+        h, _ = wait_ha(c, "backoff", 20)
+        c.check(h.get("state") == "backoff", "E: backoff after the mock is killed", h)
+        time.sleep(8)
+        h = ha_status(c)
+        c.check(h.get("state") in ("backoff", "connecting"), "E: still retrying while mock is down", h)
+        start_mock()
+        h, took = wait_ha(c, "ready", 60)
+        c.check(h.get("state") == "ready", "E: recovered to ready after the mock restarted", h)
+        if took is not None:
+            print(f"      recovered {took:.1f} s after restart")
+
+        # F. mock stops answering pings -> reconnect
+        mark = slog.mark() if slog else 0
+        start_mock(("--no-pong",))  # replaces the running mock: the connection drops
+        h, _ = wait_ha(c, "ready", 60)
+        c.check(h.get("state") == "ready", "F: ready against the no-pong mock", h)
+        h, took = wait_ha(c, "backoff", 60, "pong_timeout")
+        c.check(h.get("state") == "backoff" and "pong_timeout" in h.get("last_error", ""),
+                "F: missing pong -> backoff with pong_timeout (within 60 s)", h)
+        if took is not None:
+            print(f"      pong_timeout after {took:.1f} s")
+        h, _ = wait_ha(c, "ready", 30)
+        c.check(h.get("state") == "ready", "F: reconnected after pong_timeout", h)
+        if slog:
+            c.check(any("pong_timeout" in l for l in slog.since(mark)), "F: pong_timeout in serial log")
+    finally:
+        stop_mock()
+        st, _, raw = set_ha(c, "", None)
+        c.expect_status("restore: ha url '' + token null 200", st, 200, raw)
+        h, _ = wait_ha(c, "no_config", 15)
+        c.check(h.get("state") == "no_config", "restore: ha.state no_config", h)
+        st, _, raw = c.request("GET", "/api/config")
+        hc = (c.json_of(raw) or {}).get("ha", {})
+        c.check(hc.get("url") == "" and hc.get("token_set") is False,
+                "restore: ha url '' and token_set false", hc)
+        if slog:
+            text = "\n".join(slog.since(0))
+            for sec in secrets_seen:
+                c.check(sec not in text, f"serial log never contains the token value ({sec[:12]}...)")
+            c.check("access_token" not in text, "serial log never contains access_token")
+
+
 def run(args):
     c = Checker(args.ip)
     hostname = args.hostname
@@ -153,6 +378,16 @@ def run(args):
     c.check(wifi.get("ip") == args.ip, "wifi.ip is the device IP", wifi.get("ip"))
     for key in ("fw", "uptime_s", "heap_free", "psram_free", "touch_variant", "ha"):
         c.check(key in status, f"status has {key}", list(status.keys()))
+    ha_block = status.get("ha")
+    if c.check(isinstance(ha_block, dict), "status.ha is an object", ha_block):
+        c.check(set(ha_block.keys()) >= {"state", "ha_version", "last_error"},
+                "status.ha has state, ha_version, last_error", ha_block)
+        c.check(ha_block.get("state") in HA_STATES, "status.ha.state is a known state",
+                ha_block.get("state"))
+        c.check(isinstance(ha_block.get("ha_version"), str) and isinstance(ha_block.get("last_error"), str),
+                "status.ha.ha_version / last_error are strings", ha_block)
+        c.check("token" not in json.dumps(ha_block).lower(), "status.ha has no token", ha_block)
+        print(f"      ha={ha_block}")
     for host in (f"{hostname}.local", hostname, f"{hostname.upper()}.LOCAL:80", f"{args.ip}:80"):
         st, _, raw = c.request("GET", "/api/status", host=host)
         c.expect_status(f"GET /api/status Host={host} 200", st, 200, raw)
@@ -226,6 +461,19 @@ def run(args):
     c.expect_status("PUT 405", st, 405, raw)
     st, h, raw = c.request("GET", "/api/status", headers={"Origin": "http://evil.example"})
     c.expect_status("GET with Origin 200", st, 200, raw)
+
+    # Step 5: POST /api/ha/retry
+    st, _, raw = c.request("POST", "/api/ha/retry", body="{}", headers=post_headers())
+    c.expect_status("POST /api/ha/retry 200", st, 200, raw)
+    c.check((c.json_of(raw) or {}).get("ok") is True, "retry body ok:true", raw[:100])
+    st, _, raw = c.request("POST", "/api/ha/retry", body="{}",
+                           headers={"Content-Type": "application/json"})
+    c.expect_status("POST /api/ha/retry without X-HAKnob 403", st, 403, raw)
+    st, _, raw = c.request("POST", "/api/ha/retry", body="{}", headers=post_headers(),
+                           host="evil.example")
+    c.expect_status("POST /api/ha/retry Host=evil.example 403", st, 403, raw)
+    st, _, raw = c.request("GET", "/api/ha/retry")
+    c.expect_status("GET /api/ha/retry 404", st, 404, raw)
 
     # 8. Static files
     static = {"/": ("text/html",), "/index.html": ("text/html",),
@@ -370,6 +618,9 @@ def run(args):
             if first_ip_ok:
                 print(f"      Host=ip accepted {first_ip_ok:.1f} s after the reboot request")
 
+    if args.ha_test:
+        run_ha_test(c, args)
+
     print(f"\n{c.passes} passed, {len(c.failures)} failed")
     for f in c.failures:
         print(f"  FAILED: {f}")
@@ -385,7 +636,15 @@ def main():
                    help="number of complete Wi-Fi scan cycles to require (default 1)")
     p.add_argument("--web-password-test", action="store_true",
                    help="set a random web password, test 401/200, then clear it")
+    p.add_argument("--ha-test", action="store_true",
+                   help="Step 5 on-device tests against tools/mockha.py (restores the ha section)")
+    p.add_argument("--mock-python", help="Python executable that may accept LAN connections")
+    p.add_argument("--mock-host", help="LAN IP of this PC as seen from the device")
+    p.add_argument("--mock-port", type=int, default=8765)
+    p.add_argument("--serial-log", help="file appended to by a background serial logger")
     args = p.parse_args()
+    if args.ha_test and not (args.mock_python and args.mock_host):
+        p.error("--ha-test needs --mock-python and --mock-host")
     socket.setdefaulttimeout(TIMEOUT)
     sys.exit(run(args))
 
