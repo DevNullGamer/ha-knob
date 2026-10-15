@@ -75,6 +75,11 @@ line, not only on `BOOT`.
   `innerHTML`), no inline scripts or styles (the CSP forbids them). Clients always send
   whole config sections (section replace is literal), `ssid` in every `wifi` section, `url`
   in every `ha` section, and the Wi-Fi password together with the SSID (`null` = open).
+- `lib/core/src/util/{Sha1,Base64}` and `lib/core/src/ws/` (Step 5b.1, pure, not yet used by
+  the device): WebSocket codec for the own client that replaces links2004 in Step 5b.2.
+  `WsHandshake` (upgrade request/response), `WsFrame` (masked client frames), `WsReceiver`
+  (incremental, one event per `feed()`, message memory via a `BufferProvider`, 4 MB limit,
+  oversize/binary/no-memory messages become `Dropped` events). Spec: `plan-step5b.md`.
 - `lib/core/src/input/QuadratureDecoder.h` is header-only and `always_inline` because the
   encoder ISR calls it; keep anything it uses free of out-of-line calls and flash tables.
 - All library versions are pinned exactly in `platformio.ini`; record any change and its
