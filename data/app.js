@@ -7,7 +7,7 @@
 const $ = (id) => document.getElementById(id);
 
 let config = null;          // last GET /api/config
-let statusTimer = null;
+let statusTimer = null;     // polls /api/status while the Status or Home Assistant tab is open
 let followTimer = null;
 
 // ---- API ---------------------------------------------------------------------------
@@ -80,9 +80,9 @@ function selectTab(name) {
     clearInterval(statusTimer);
     statusTimer = null;
   }
-  if (name === 'status') {
+  if (name === 'status' || name === 'ha') {
     loadStatus();
-    statusTimer = setInterval(loadStatus, 5000);
+    statusTimer = setInterval(loadStatus, name === 'ha' ? 3000 : 5000);
   }
 }
 
@@ -103,6 +103,37 @@ const MODE_TEXT = {
   ap_sta: 'setup access point + network',
 };
 
+const HA_STATE_TEXT = {
+  no_config: 'not configured',
+  connecting: 'connecting...',
+  authenticating: 'logging in...',
+  subscribing: 'subscribing...',
+  ready: 'connected',
+  auth_failed: 'token rejected: enter a new token and save, or press Retry',
+  backoff: 'not connected, retrying automatically',
+};
+
+const HA_CONFIG_ERROR_TEXT = {
+  tls_not_supported: 'not connecting: https is not supported, use the http:// address',
+  invalid_url: 'not connecting: the stored address cannot be used',
+};
+
+function haSummary(ha) {
+  if (!ha) return '-';
+  if (ha.state === 'no_config' && HA_CONFIG_ERROR_TEXT[ha.last_error]) {
+    return HA_CONFIG_ERROR_TEXT[ha.last_error];
+  }
+  const text = HA_STATE_TEXT[ha.state] || ha.state;
+  return ha.state === 'ready' && ha.ha_version ? text + ' (' + ha.ha_version + ')' : text;
+}
+
+function renderHa(ha) {
+  $('ha-state').textContent = haSummary(ha);
+  $('ha-version').textContent = (ha && ha.ha_version) || '-';
+  $('ha-error').textContent = (ha && ha.last_error) || '-';
+  $('ha-retry').disabled = !ha || (ha.state !== 'auth_failed' && ha.state !== 'backoff');
+}
+
 function renderStatus(s) {
   const rows = [
     ['Firmware', s.fw],
@@ -114,7 +145,7 @@ function renderStatus(s) {
     ['Signal', s.wifi.connected ? s.wifi.rssi + ' dBm' : '-'],
     ['Hostname', s.wifi.hostname + '.local'],
     ['Setup AP', s.wifi.ap_active ? s.wifi.ap_ssid + ' (' + s.wifi.ap_ip + ')' : 'off'],
-    ['Home Assistant', 'available in a later version'],
+    ['Home Assistant', haSummary(s.ha)],
     ['Touch', s.touch_variant],
     ['Free heap', Math.round(s.heap_free / 1024) + ' KB'],
     ['Free PSRAM', Math.round(s.psram_free / 1024) + ' KB'],
@@ -128,6 +159,7 @@ function renderStatus(s) {
     dd.textContent = String(value);
     list.append(dt, dd);
   }
+  renderHa(s.ha);
 }
 
 async function loadStatus() {
@@ -173,6 +205,11 @@ async function loadConfig() {
   $('dev-accel').checked = !!d.accel;
 
   $('web-password-set').textContent = (config.web && config.web.password_set) ? 'set' : 'not set';
+
+  const ha = config.ha || {};
+  $('ha-current').textContent = ha.url || 'none';
+  $('ha-token-set').textContent = ha.token_set ? 'stored' : 'not stored';
+  if (!$('ha-url').value) $('ha-url').value = ha.url || '';
 }
 
 // Sends a patch. Sections are replaced as a whole, so callers always send complete ones.
@@ -309,6 +346,54 @@ async function forgetWifi() {
   $('wifi-ssid').value = '';
 }
 
+// ---- Home Assistant ----------------------------------------------------------------
+
+async function saveHa(event) {
+  event.preventDefault();
+  if (!config) return;
+  const url = $('ha-url').value.trim();
+  const token = $('ha-token').value.trim();
+  if (!url) {
+    showMessage('Enter the Home Assistant address, or use "Remove Home Assistant".', 'error');
+    return;
+  }
+  if (/^https:/i.test(url)) {
+    showMessage('https is not supported: the device would not connect. Use the http:// address ' +
+      '(Home Assistant on the local network).', 'error');
+    return;
+  }
+  if (!token && !(config.ha && config.ha.token_set)) {
+    showMessage('Enter the long-lived access token.', 'error');
+    return;
+  }
+  // The URL goes with every ha section; an empty token keeps the stored one.
+  const result = await savePatch({ ha: { url: url, token: token } }, 'Home Assistant saved. Connecting...');
+  if (!result) return;
+  $('ha-token').value = '';
+  loadStatus();
+}
+
+async function forgetHa() {
+  if (!confirm('Remove the Home Assistant address and token from the device?')) return;
+  const result = await savePatch({ ha: { url: '', token: null } }, 'Home Assistant removed.');
+  if (result) {
+    $('ha-url').value = '';
+    $('ha-token').value = '';
+    loadStatus();
+  }
+}
+
+async function retryHa() {
+  try {
+    const result = await api('POST', '/api/ha/retry', {});
+    showMessage(result.ok ? 'Reconnecting to Home Assistant...' : describeError(result),
+      result.ok ? 'success' : 'error');
+    loadStatus();
+  } catch (e) {
+    showMessage('The device is not reachable.', 'error');
+  }
+}
+
 // ---- Device ------------------------------------------------------------------------
 
 function intValue(id) {
@@ -372,6 +457,9 @@ document.addEventListener('DOMContentLoaded', () => {
   $('wifi-open').addEventListener('change', () => {
     $('wifi-password').disabled = $('wifi-open').checked;
   });
+  $('ha-form').addEventListener('submit', saveHa);
+  $('ha-forget').addEventListener('click', forgetHa);
+  $('ha-retry').addEventListener('click', retryHa);
   $('device-form').addEventListener('submit', saveDevice);
   $('web-form').addEventListener('submit', setWebPassword);
   $('web-remove').addEventListener('click', removeWebPassword);

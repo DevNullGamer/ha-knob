@@ -14,7 +14,8 @@
 //    well (mode "ap_sta") and STA retries every 60 s. Once STA connects, the AP stays up
 //    for 60 s more (so the setup page can show the new IP), then shuts down (mode "sta").
 //    A lost connection is retried at once, with the same 30 s fallback.
-//  - mDNS "<hostname>.local" with an _http._tcp service, in every mode.
+//  - mDNS "<hostname>.local" with an _http._tcp service, in every mode (retried every
+//    30 s while MDNS.begin() fails).
 // The driver's own auto-reconnect and NVS credential storage are disabled: the
 // credentials live only in the ConfigStore and every retry is scheduled here. The link
 // state comes from ESP-IDF (association + STA netif address, polled every 100 ms), not
@@ -30,6 +31,7 @@
 //   WIFI restart reason=config                credentials changed
 //   WIFI mdns host=<hostname>.local ok=<0|1>
 //   WIFI scan done networks=<n> failed=<0|1>  |  WIFI scan timeout  |  WIFI scan start failed err=..
+//   WIFI scan stop grace expired (no SCAN_DONE)   a stopped scan never reported SCAN_DONE
 namespace net {
 namespace wifi {
 

@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 
+#include "ha/HaSession.h"
+
 // Screen manager. All calls must come from the main loop (LVGL is not thread-safe).
 namespace ui {
 
@@ -20,6 +22,15 @@ struct NetworkView {
     bool operator!=(const NetworkView &o) const { return !(*this == o); }
 };
 
+// What the screens show about the Home Assistant connection (filled by main.cpp from
+// ha::Status).
+struct HaView {
+    core::ha::State state = core::ha::State::NoConfig;
+    std::string haVersion;
+    std::string lastError;
+    bool networkUp = false;  // Wi-Fi station connected
+};
+
 // Creates the screens and shows the boot screen. Requires hal::display::begin().
 void begin(uint32_t nowMs);
 
@@ -28,6 +39,7 @@ void begin(uint32_t nowMs);
 void tick(uint32_t nowMs);
 
 void showNetwork(const NetworkView &view);
+void showHa(const HaView &view);
 void showEncoderCount(int32_t count);
 void showLastInput(const char *text);
 

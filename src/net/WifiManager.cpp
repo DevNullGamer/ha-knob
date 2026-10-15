@@ -32,6 +32,8 @@ constexpr uint32_t kScanDwellMaxMs = 120;
 constexpr uint32_t kScanTimeoutMs = 15000;
 constexpr uint32_t kScanStartRetryMs = 1000;
 constexpr uint32_t kScanStartGiveUpMs = 6000;
+constexpr uint32_t kScanStopGraceMs = 3000;    // wait for the SCAN_DONE of a stopped scan
+constexpr uint32_t kMdnsRetryMs = 30000;       // MDNS.begin() retried while it fails
 
 DNSServer dns;
 
@@ -46,6 +48,7 @@ bool started = false;
 bool apUp = false;
 bool staConnected = false;
 bool mdnsUp = false;
+uint32_t mdnsTriedAtMs = 0;
 uint32_t attemptStartMs = 0;  // start of the current connect series (begin, restart, loss)
 uint32_t lastBeginMs = 0;
 uint32_t connectedAtMs = 0;
@@ -59,6 +62,8 @@ uint32_t scanRequestedAtMs = 0;
 uint32_t scanLastTryMs = 0;
 bool scanning = false;
 uint32_t scanStartedAtMs = 0;
+bool scanStopping = false;  // a stopped scan's late SCAN_DONE is still expected
+uint32_t scanStopAtMs = 0;
 bool scanDone = false;
 bool scanFailed = false;
 std::vector<ScanNetwork> scanResults;
@@ -89,6 +94,7 @@ void startMdns() {
         MDNS.end();
         mdnsUp = false;
     }
+    mdnsTriedAtMs = millis();
     mdnsUp = MDNS.begin(hostname_.c_str());
     if (mdnsUp) {
         MDNS.addService("http", "tcp", 80);
@@ -255,13 +261,40 @@ void finishScan(bool failed) {
                     static_cast<unsigned>(scanResults.size()), failed ? 1 : 0);
 }
 
+// Stops the running scan. The driver still reports SCAN_DONE for it, and the Arduino event
+// handler then allocates a result array and sets WIFI_SCAN_DONE_BIT. Arriving after the
+// next scan has started, that would end the new scan early (with stale results) and leak
+// one array (the handler does not free the previous one). So no scan starts until that
+// event has arrived or kScanStopGraceMs have passed, and its results are freed then.
+void stopScan(uint32_t nowMs) {
+    esp_wifi_scan_stop();
+    scanStopping = true;
+    scanStopAtMs = nowMs;
+}
+
+void pollScanStop(uint32_t nowMs) {
+    if (!scanStopping) {
+        return;
+    }
+    const bool doneArrived = (WiFi.getStatusBits() & WIFI_SCAN_DONE_BIT) != 0;
+    if (!doneArrived && nowMs - scanStopAtMs < kScanStopGraceMs) {
+        return;
+    }
+    if (!doneArrived) {
+        util::logPrintf("WIFI scan stop grace expired (no SCAN_DONE)\n");
+    }
+    scanStopping = false;
+    WiFi.scanDelete();  // frees the late results and clears WIFI_SCAN_DONE_BIT
+}
+
 // Scans are started with esp_wifi_scan_start() directly rather than WiFi.scanNetworks():
 // core 2.0.17 reports an async scan as failed once max_ms_per_chan * 20 ms have passed
 // (6 s by default; a scan with a connected STA often takes longer) and then lets the next
 // scanNetworks() start while the driver is still scanning, which fails too. The Arduino
 // event handler still collects the results (WIFI_SCAN_DONE_BIT, WiFi.SSID(i) ...).
 void pollScan(uint32_t nowMs) {
-    if (scanRequested && !scanning && nowMs - scanLastTryMs >= kScanStartRetryMs) {
+    pollScanStop(nowMs);
+    if (scanRequested && !scanning && !scanStopping && nowMs - scanLastTryMs >= kScanStartRetryMs) {
         scanLastTryMs = nowMs;
         WiFi.scanDelete();  // also clears WIFI_SCAN_DONE_BIT
         wifi_scan_config_t config = {};
@@ -286,7 +319,7 @@ void pollScan(uint32_t nowMs) {
     if (WiFi.getStatusBits() & WIFI_SCAN_DONE_BIT) {
         finishScan(false);
     } else if (nowMs - scanStartedAtMs >= kScanTimeoutMs) {
-        esp_wifi_scan_stop();
+        stopScan(nowMs);
         util::logPrintf("WIFI scan timeout\n");
         finishScan(true);
     }
@@ -350,7 +383,7 @@ void loop(uint32_t nowMs) {
     if (restartPending && static_cast<int32_t>(nowMs - restartAtMs) >= 0) {
         restartPending = false;
         if (scanning) {
-            esp_wifi_scan_stop();
+            stopScan(nowMs);
             finishScan(true);
         }
         util::logPrintf("WIFI restart reason=config\n");
@@ -359,6 +392,9 @@ void loop(uint32_t nowMs) {
     }
     if (apUp) {
         dns.processNextRequest();
+    }
+    if (!mdnsUp && nowMs - mdnsTriedAtMs >= kMdnsRetryMs) {
+        startMdns();
     }
     pollScan(nowMs);
 

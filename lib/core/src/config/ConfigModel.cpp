@@ -368,60 +368,6 @@ bool isValidLabelText(const std::string &text) {
     return true;
 }
 
-UrlEndpoint parseUrlEndpoint(const std::string &url) {
-    UrlEndpoint ep;
-    size_t pos = 0;
-    auto startsWithNoCase = [&](const char *prefix) {
-        const size_t len = std::strlen(prefix);
-        if (url.size() < len) return false;
-        for (size_t i = 0; i < len; ++i) {
-            char c = url[i];
-            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-            if (c != prefix[i]) return false;
-        }
-        return true;
-    };
-    if (startsWithNoCase("https://")) {
-        ep.tls = true;
-        pos = 8;
-    } else if (startsWithNoCase("http://")) {
-        pos = 7;
-    } else {
-        return ep;
-    }
-
-    const size_t hostStart = pos;
-    while (pos < url.size() && url[pos] != ':' && url[pos] != '/') {
-        char c = url[pos];
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-        if (!isLowerAlpha(c) && !isDigit(c) && c != '-' && c != '.') return ep;
-        ep.host.push_back(c);
-        ++pos;
-    }
-    if (pos == hostStart || ep.host.size() > kMaxHostLen) return ep;
-
-    ep.port = ep.tls ? 443 : 80;
-    if (pos < url.size() && url[pos] == ':') {
-        ++pos;
-        uint32_t port = 0;
-        size_t digits = 0;
-        while (pos < url.size() && isDigit(url[pos])) {
-            port = port * 10 + static_cast<uint32_t>(url[pos] - '0');
-            ++pos;
-            if (++digits > 5) return ep;
-        }
-        if (digits == 0 || port < 1 || port > 65535) return ep;
-        ep.port = port;
-    }
-    if (pos < url.size() && url[pos] != '/') return ep;
-    for (; pos < url.size(); ++pos) {
-        const unsigned char c = static_cast<unsigned char>(url[pos]);
-        if (c <= 0x20 || c >= 0x7F) return ep;
-    }
-    ep.ok = true;
-    return ep;
-}
-
 std::string makeApPassword(uint32_t (*random32)(), size_t length) {
     static constexpr char kAlphabet[] = "abcdefghijkmnpqrstuvwxyz23456789";
     static_assert(sizeof(kAlphabet) - 1 == 32, "5 bits per character");

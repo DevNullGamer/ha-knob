@@ -4,10 +4,11 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.4.0, Step 4 (Wi-Fi provisioning and web setup UI).** The firmware drives the
-hardware (display, touch swipes, encoder, button, buzzer), loads its configuration from NVS,
-joins Wi-Fi (or opens a setup access point) and serves a setup web UI for Wi-Fi and device
-settings. The Home Assistant connection and the controls come in later steps.
+**Status: v0.5.0, Step 5 (Home Assistant connection).** The firmware drives the hardware
+(display, touch swipes, encoder, button, buzzer), loads its configuration from NVS, joins
+Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home Assistant and
+device settings, and keeps an authenticated, self-healing WebSocket connection to Home
+Assistant. Entity selection and control come in later steps.
 
 ## First-time setup
 
@@ -21,6 +22,11 @@ settings. The Home Assistant connection and the controls come in later steps.
    Once connected, the page shows the new address, and the access point shuts down 60 s later.
 5. From then on the setup page is at `http://<device IP>/` or `http://ha-knob.local/` (the
    status screen shows both).
+6. In the **Home Assistant** tab, enter the Home Assistant address (e.g.
+   `http://homeassistant.local:8123` or `http://192.168.1.10:8123`) and a long-lived access
+   token (Home Assistant: your user profile, Security, "Long-lived access tokens"; best for a
+   dedicated non-admin user) and save. The tab and the status screen show the connection
+   state ("connected" plus the Home Assistant version once it works).
 
 If the device cannot join the configured network within 30 s, it opens the setup access
 point again (and keeps retrying the network every 60 s).
@@ -98,7 +104,7 @@ BTN long                                 held 600 ms (fired while held; no "shor
 BTN verylong                             held 10 s
 BTN up                                   release after long / verylong
 TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
-HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip>   every 5 s
+HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes>   every 5 s
 WIFI ap ssid=<HA-Knob-XXXX> ip=192.168.4.1   setup access point up
 WIFI ap off                              setup access point shut down
 WIFI sta connecting ssid=<ssid>
@@ -108,16 +114,27 @@ WIFI fallback ap_sta                     not connected within 30 s: setup AP up 
 WIFI restart reason=config               Wi-Fi credentials changed
 WIFI mdns host=<hostname>.local ok=<0|1>
 WIFI scan start | WIFI scan done networks=<n> failed=<0|1> | WIFI scan timeout | WIFI scan start failed err=<hex>
+WIFI scan stop grace expired (no SCAN_DONE)   a stopped scan never reported SCAN_DONE within 3 s
 WEB started port=80 fs=<0|1> files=<n>   fs=0: LittleFS not mounted (run uploadfs); files = web UI files found
 LOG dropped=<n>                          n lines were dropped while nothing read the serial port
 WEB config saved restart_wifi=<0|1>
 WEB config rejected field=<field> error=<error>
-WEB reboot requested | WEB factory reset requested
+WEB reboot requested | WEB factory reset requested | WEB ha retry requested
+HA config url=<url> token_set len=<n>    HA settings applied (the token itself is never logged)
+HA config none url_set=<0|1> token_set=<0|1>   Home Assistant not configured
+HA connect attempt=<n> url=ws://<host>:<port><path>   one line per connection attempt
+HA dns host=<host> ok=<0|1>[ ip=<ip>]    name resolution of the attempt
+HA socket open                           WebSocket handshake done
+HA socket closed open=<0|1> reason=<library reason>
+HA state=<state>[ ha_version=<v>][ error=<error>][ retry_in_ms=<ms>]   every state change
+HA retry                                 web UI Retry accepted
+HA frame ignored type=<n> len=<n> | HA socket error len=<n>
 SYS reboot | SYS factory reset           performed by the main loop just after the response
 ```
 
 In `HB`, `ip` is the station IP when connected, else `192.168.4.1` while the setup AP is up,
-else `0.0.0.0`. SSIDs are logged, passwords never.
+else `0.0.0.0`; `ha` is the Home Assistant connection state and `heap` the free internal
+heap. SSIDs are logged, passwords and tokens never.
 
 Serial output never blocks the firmware: when the board is plugged into a PC but no program
 reads the port, the 4 KB transmit buffer fills up and further lines are dropped (counted in
@@ -207,7 +224,7 @@ Validation (`lib/core/src/config/ConfigModel.cpp`, first failure is reported as
 | `device.send_interval_ms` | 100 to 2000 |
 | `wifi.ssid` | empty (not configured) or at most 32 bytes |
 | `wifi.password` | 8 to 63 printable ASCII characters (none stored = open network) |
-| `ha.url` | empty (not configured) or `http(s)://host[:port][/prefix]`, host up to 253 characters, port 1 to 65535 |
+| `ha.url` | empty (not configured) or `http(s)://host[:port][/prefix]`, host up to 253 characters, port 1 to 65535, prefix of printable ASCII without spaces (the device only connects to `http` URLs without `?`/`#`, see Home Assistant) |
 | `ha.token` | up to 512 printable ASCII characters, no spaces |
 | `web.password` | up to 64 characters, no control characters |
 | `controls` | at most 24; the serialised config must fit in 8 KB |
@@ -294,10 +311,11 @@ files were never flashed, `/` answers 503 with a hint to run `uploadfs`.
 
 | Method / path | Response |
 |---|---|
-| GET `/api/status` | `{fw, uptime_s, heap_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state:"not_available", ha_version, last_error}}` |
+| GET `/api/status` | `{fw, uptime_s, heap_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state, ha_version, last_error}}` (see Home Assistant) |
 | GET `/api/config` | Redacted config: secrets only as `wifi.password_set`, `ha.token_set`, `web.password_set` |
 | POST `/api/config` | Patch (see Configuration). `200 {ok:true, restart_wifi}`, `400 {error, field}` (validation), `500 {error:"nvs_write_failed", field}` (storage failed; the config may be partly written and is re-read) |
 | GET `/api/wifi/scan` | `{scanning, age_s, failed, networks:[{ssid, rssi, secure}]}`; starts a new scan when there is none yet, the last one failed or it is older than 10 s. Poll until `scanning` is false (a scan takes about 2-5 s; requests during a scan can take up to about 3 s because the radio briefly leaves its channel) |
+| POST `/api/ha/retry` | `200 {ok:true}`; leaves `auth_failed` (or ends a backoff wait) and reconnects. A no-op in other states |
 | POST `/api/reboot` | `200 {ok:true}`, reboots about 0.75 s later |
 | POST `/api/factory-reset` | `200 {ok:true}`, then erases the config and secrets (not `ap_pw`) and reboots |
 
@@ -312,6 +330,10 @@ Request guards (`lib/core/src/web/RequestGuard`, applied to every request in thi
 | Body larger than 16 KB | `413` |
 | Web password set and no valid `Authorization: Basic` for user `admin` | `401` |
 
+Only GET reaches the handlers and static files; HEAD is answered with 404. URL paths are
+compared with all their bytes, so a decoded `%00` (e.g. `/index.html%00`) is 404. With a web
+password set, a POST body is not even buffered without valid credentials.
+
 No CORS headers are ever sent. Every response carries `X-Frame-Options: DENY`,
 `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and a
 `Content-Security-Policy` allowing scripts and styles only from the device. API responses
@@ -321,6 +343,35 @@ Threading: request callbacks run in the `async_tcp` task. They never touch LVGL 
 they read a snapshot the main loop publishes (under a mutex), write the config only via
 `ConfigStore::applyPatch`, and hand Wi-Fi scans, config re-reads, reboot and factory reset
 to the main loop through atomic flags.
+
+## Home Assistant
+
+The device keeps one WebSocket connection to `<HA URL>/api/websocket` (`ws://`) and
+authenticates with the long-lived token. REST is not used. **`https` URLs are refused**:
+they can be stored, but the device never connects to them (`no_config` with `last_error`
+`tls_not_supported`), so the token is never sent unencrypted to a TLS port. Use the
+`http://` address of Home Assistant on the local network.
+
+| `ha.state` | Meaning |
+|---|---|
+| `no_config` | No address or no token stored; or the stored address is not used: `last_error` `tls_not_supported` (https) or `invalid_url` (e.g. a `?` or `#` in the address) |
+| `connecting` | Resolving the name, connecting, waiting for Home Assistant's `auth_required` |
+| `authenticating` | Token sent, waiting for the answer |
+| `subscribing` | Subscribing to the selected entities (from Step 6; Step 5 subscribes to nothing) |
+| `ready` | Connected and authenticated; `ha_version` is the Home Assistant version |
+| `auth_failed` | Home Assistant rejected the token (`last_error` `auth_invalid: <message>`). **No automatic retry** (Home Assistant would ban the IP after repeated failures): save a new token, or press Retry |
+| `backoff` | Not connected; the next attempt follows after 1, 2, 4, 8, 16, then every 30 s. `last_error` says why (`connect_failed`, `connection_lost`, `dns_failed`, `connect_timeout`, `auth_timeout`, `pong_timeout`, `send_failed`, `network_down`, `network_lost`) |
+
+- Without Wi-Fi the client waits in `backoff` and connects as soon as the station is up.
+- Liveness: an HA `ping` every 30 s; no `pong` within 10 s closes the connection and
+  reconnects. No `auth_required` within 20 s of connecting, or no answer to the token
+  within 10 s, also counts as a failed attempt.
+- Message ids start at 1 on every connection.
+- Name resolution (also `.local` names via mDNS) runs in the background. The TCP connect
+  itself blocks the main loop for up to 2 s (`WEBSOCKETS_TCP_TIMEOUT=2000`) when the host
+  does not answer at all.
+- Changing only the path of the address, or `http` to `https` on the same host and port,
+  keeps the token; any other address change needs the token again (see Configuration).
 
 ## Hardware notes
 
@@ -403,10 +454,12 @@ All versions are pinned exactly in `platformio.ini`.
 | `bblanchon/ArduinoJson` | 7.4.3 | Config JSON (both envs); current v7 release, custom allocator support for PSRAM |
 | `ESP32Async/AsyncTCP` | 3.5.0 | TCP layer of the web server; maintained fork, core 2.x compatible |
 | `ESP32Async/ESPAsyncWebServer` | 3.12.1 | Web server (middleware, static files); maintained fork, core 2.x compatible. PlatformIO prints "Ignored `Hash` dependency": that dependency is for ESP8266 only |
+| `links2004/WebSockets` | 2.7.3 (`-DWEBSOCKETS_TCP_TIMEOUT=2000`: connect, handshake and read timeouts 2 s instead of 5 s; on the LAN that is ample and shortens the main-loop block when the host is down) | Home Assistant WebSocket client. The plan named 2.7.2, but 2.7.2 passes milliseconds to core 2.x's `WiFiClient::setTimeout()`, which takes seconds (5000 s socket timeouts); 2.7.3 fixes that for core < 3. Its `WEBSOCKETS_MAX_DATA_SIZE` (15 KB) is a plain `#define` and cannot be raised with `-D` |
 | `throwtheswitch/Unity` | 2.6.1 | Host test framework (native env); pinned to the version PlatformIO resolved |
 
 Licences:
-- LVGL MIT, SensorLib MIT, ArduinoJson MIT, AsyncTCP LGPL-3.0, ESPAsyncWebServer LGPL-3.0.
+- LVGL MIT, SensorLib MIT, ArduinoJson MIT, AsyncTCP LGPL-3.0, ESPAsyncWebServer LGPL-3.0,
+  WebSockets (links2004) LGPL-2.1.
 - Fonts: the Montserrat and FontAwesome Free font files are SIL OFL 1.1; the FontAwesome
   Free icon designs are CC BY 4.0. The generated `src/ui/fonts/*.c` are derived fonts, so
   before any public release the OFL notices (and FontAwesome attribution) must ship with
@@ -427,11 +480,13 @@ src/hal/          Display, Touch, Encoder, Button, Buzzer, PsramAllocator (hardw
 src/config/       ConfigStore (NVS persistence, mutex)
 src/util/         Log.h (non-blocking serial logging)
 src/net/          WifiManager (STA, setup AP, captive DNS, mDNS), WebServer (REST API, static files)
+src/ha/           HaClient (WebSocket transport for HaSession, logging)
 src/ui/           Ui (screen manager), Widgets, screens/ (Boot, Setup, Status), fonts/ (generated)
 data/             web UI (index.html, app.js, style.css), flashed with uploadfs
 lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the host
   src/config/     ConfigModel (schema, JSON, validation, redaction, patch merge)
   src/control/    DomainActions (per-domain actions, presses and step ranges)
+  src/ha/         HaUrl (URL -> WebSocket endpoint), HaProtocol (messages), HaSession (state machine)
   src/input/      QuadratureDecoder, ButtonFsm, Acceleration, SwipeClassifier
   src/ui/         Presenter (number formatting)
   src/web/        RequestGuard (Host allow-list, CSRF, body limit, Basic auth check)
@@ -449,6 +504,9 @@ tools/            serial_check.py, gen_fonts.sh
   `*_set` flags) and are never logged (at most `token_set len=N`).
 - NVS is not encrypted: anyone with physical access can read the token. Use a dedicated
   non-admin Home Assistant user for the knob's token.
+- The connection to Home Assistant is plain `ws://` on the LAN, so the token can be sniffed
+  there (TLS is not planned). The token is only ever sent to the stored address; changing
+  the host or port requires entering it again.
 - The web UI is plain HTTP on the LAN. The optional web password (Device tab, user `admin`)
   is sent with HTTP Basic auth and can be sniffed on the network; there is no lockout
   after wrong passwords. The setup AP is always WPA2-protected.

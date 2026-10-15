@@ -82,6 +82,36 @@ void showNetwork(const NetworkView &view) {
     statusScreen::setNetwork(wifiLine.c_str(), ipLine.c_str(), hostLine.c_str());
 }
 
+void showHa(const HaView &view) {
+    using core::ha::State;
+    std::string line;
+    switch (view.state) {
+        case State::NoConfig:
+            if (view.lastError == "tls_not_supported") {
+                line = "HA: https not supported";
+            } else {
+                line = view.lastError.empty() ? "HA: not configured" : "HA: invalid address";
+            }
+            break;
+        case State::Connecting:
+        case State::Authenticating:
+        case State::Subscribing:
+            line = "HA: connecting...";
+            break;
+        case State::Ready:
+            line = view.haVersion.empty() ? "HA: connected" : "HA: connected (" + view.haVersion + ")";
+            break;
+        case State::AuthFailed:
+            line = "HA: token rejected";
+            break;
+        case State::Backoff:
+        default:
+            line = view.networkUp ? "HA: offline, retrying" : "HA: waiting for Wi-Fi";
+            break;
+    }
+    statusScreen::setHa(line.c_str());
+}
+
 void showEncoderCount(int32_t count) {
     statusScreen::setEncoderCount(count);
 }

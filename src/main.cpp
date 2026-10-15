@@ -7,11 +7,12 @@
 //   BTN down | up | short | long | verylong
 //   TOUCH swipe=<left|right>
 //   HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<..>
-//      wifi=<off|ap|sta|ap_sta> ip=<ip>   (every 5 s; ip = STA IP, else 192.168.4.1 with the
-//      setup AP up, else 0.0.0.0)
+//      wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes>   (every 5 s; ip = STA IP,
+//      else 192.168.4.1 with the setup AP up, else 0.0.0.0; ha = HA connection state)
 //   CFG ...   config store events (see src/config/ConfigStore.h)
 //   WIFI ...  Wi-Fi events (see src/net/WifiManager.h)
 //   WEB ...   web server events (see src/net/WebServer.h)
+//   HA ...    Home Assistant connection events (see src/ha/HaClient.h)
 //   SYS reboot | SYS factory reset
 
 #include <Arduino.h>
@@ -21,6 +22,7 @@
 #include <vector>
 
 #include "config/ConfigStore.h"
+#include "ha/HaClient.h"
 #include "hal/Button.h"
 #include "hal/Buzzer.h"
 #include "hal/Display.h"
@@ -46,6 +48,9 @@ uint32_t lastHeartbeatMs = 0;
 std::string apPassword;  // shown on the setup screen
 net::wifi::Status shownWifi;
 ui::NetworkView shownView;
+ha::Status shownHa;
+bool shownHaNetworkUp = false;
+bool haPublished = false;
 net::web::SystemRequest pendingSystem = net::web::SystemRequest::None;
 uint32_t pendingSystemAtMs = 0;
 
@@ -62,12 +67,14 @@ void printHeartbeat(uint32_t nowMs) {
     const char *ip = wifi.staConnected ? wifi.staIp.c_str()
                      : wifi.apActive   ? net::wifi::kApIp
                                        : "0.0.0.0";
-    util::logPrintf("HB up=%u psram=%u flash=%u touch=%s count=%d ctl=%u cfg=%s wifi=%s ip=%s\n",
+    util::logPrintf("HB up=%u psram=%u flash=%u touch=%s count=%d ctl=%u cfg=%s wifi=%s ip=%s ha=%s "
+                    "heap=%u\n",
                     static_cast<unsigned>(nowMs / 1000), static_cast<unsigned>(ESP.getPsramSize()),
                     static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
                     static_cast<int>(shownCount),
                     static_cast<unsigned>(configStore.controlCount()), bootCfgSource,
-                    net::wifi::modeName(wifi.mode), ip);
+                    net::wifi::modeName(wifi.mode), ip, core::ha::stateName(ha::status().state),
+                    static_cast<unsigned>(ESP.getFreeHeap()));
 }
 
 // Publishes Wi-Fi state changes to the web server snapshot and the screens.
@@ -93,6 +100,29 @@ void publishNetwork() {
     shownView = view;
 }
 
+// Publishes Home Assistant connection changes to the web server snapshot and the screens.
+void publishHa() {
+    const ha::Status &status = ha::status();
+    const bool networkUp = net::wifi::status().staConnected;
+    if (haPublished && status == shownHa && networkUp == shownHaNetworkUp) {
+        return;
+    }
+    if (!haPublished || status != shownHa) {
+        net::web::publishHa(status);
+    }
+    haPublished = true;
+    shownHa = status;
+    shownHaNetworkUp = networkUp;
+    if (displayOk) {
+        ui::HaView view;
+        view.state = status.state;
+        view.haVersion = status.haVersion;
+        view.lastError = status.lastError;
+        view.networkUp = networkUp;
+        ui::showHa(view);
+    }
+}
+
 // Work requested by the web server (whose callbacks run in the async_tcp task).
 void handleWebRequests(uint32_t nowMs) {
     if (net::web::takeConfigDirty()) {
@@ -102,6 +132,11 @@ void handleWebRequests(uint32_t nowMs) {
         }
         net::wifi::applyConfig(config.wifi.ssid, configStore.wifiPassword(), config.device.hostname,
                                nowMs);
+        ha::configure(config.ha.url, configStore.haToken(), nowMs);
+    }
+
+    if (net::web::takeHaRetry()) {
+        ha::retry(nowMs);
     }
 
     if (net::web::takeScanRequest()) {
@@ -190,7 +225,10 @@ void setup() {
     // HWCDC::write() block. The larger TX buffer keeps bursts (boot, CFG saves) intact.
     Serial.setTxBufferSize(4096);  // before begin(), which would create a 256-byte buffer
     Serial.begin(115200);
-    Serial.setTxTimeoutMs(0);
+    // 1 ms, not 0: core 2.0.17 counts its "no progress" retries down from this value and
+    // only gives up when the count reaches 0, so 0 wraps around (a ~49-day busy loop in
+    // write()) and makes flush() discard the buffer instead of draining it.
+    Serial.setTxTimeoutMs(1);
 
     configStore.begin();
     bootCfgSource = configStore.loadedFromNvs() ? "loaded" : "defaults";
@@ -214,6 +252,9 @@ void setup() {
     net::wifi::begin(config.wifi.ssid, configStore.wifiPassword(), config.device.hostname, apPassword,
                      millis());
     publishNetwork();  // the web server guards need the network state from the start
+    ha::begin();
+    ha::configure(config.ha.url, configStore.haToken(), millis());
+    publishHa();
     net::web::begin(configStore, hal::touch::variantName());
     printBootLine();
 }
@@ -228,6 +269,9 @@ void loop() {
     net::wifi::loop(nowMs);
     handleWebRequests(nowMs);
     publishNetwork();
+    ha::setNetworkUp(net::wifi::status().staConnected, nowMs);
+    ha::loop();
+    publishHa();
 
     if (nowMs - lastHeartbeatMs >= kHeartbeatMs) {
         lastHeartbeatMs = nowMs;

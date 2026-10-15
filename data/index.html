@@ -55,7 +55,33 @@
 
   <section id="tab-ha" class="tab" hidden>
     <h2>Home Assistant</h2>
-    <p class="hint">Available in a later version.</p>
+    <dl class="kv">
+      <dt>Connection</dt><dd id="ha-state">-</dd>
+      <dt>Home Assistant version</dt><dd id="ha-version">-</dd>
+      <dt>Last error</dt><dd id="ha-error">-</dd>
+      <dt>Stored address</dt><dd id="ha-current">-</dd>
+      <dt>Token</dt><dd id="ha-token-set">-</dd>
+    </dl>
+    <div class="row">
+      <button type="button" id="ha-retry">Retry now</button>
+    </div>
+    <form id="ha-form" autocomplete="off">
+      <label>Home Assistant address
+        <input id="ha-url" maxlength="300" spellcheck="false" autocapitalize="off"
+               placeholder="http://homeassistant.local:8123">
+      </label>
+      <label>Long-lived access token
+        <input id="ha-token" type="password" maxlength="512" autocomplete="new-password"
+               placeholder="leave empty to keep the stored token">
+      </label>
+      <p class="hint">Create the token in Home Assistant under your user profile, Security,
+        "Long-lived access tokens". Use a dedicated non-admin user for the knob. A new
+        address (another host or port) always needs the token again.</p>
+      <div class="row">
+        <button type="submit">Save Home Assistant</button>
+        <button type="button" id="ha-forget" class="danger">Remove Home Assistant</button>
+      </div>
+    </form>
   </section>
 
   <section id="tab-controls" class="tab" hidden>

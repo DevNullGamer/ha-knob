@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "ha/HaUrl.h"
+
 // The device configuration: data model, JSON (de)serialisation, validation, redaction and
 // patch merging (plan.md §3.4). Pure: persistence lives in src/config/ConfigStore.
 //
@@ -35,7 +37,6 @@ constexpr size_t kMaxHaTokenLen = 512;
 constexpr size_t kMaxWebPasswordLen = 64;
 constexpr size_t kMaxEntityIdLen = 255;
 constexpr size_t kMaxLabelBytes = 48;
-constexpr size_t kMaxHostLen = 253;
 
 struct DeviceConfig {
     std::string hostname = "ha-knob";
@@ -212,14 +213,10 @@ bool isValidEntityId(const std::string &entityId);
 // Well-formed UTF-8 without control characters.
 bool isValidLabelText(const std::string &text);
 
-// Parses http(s)://host[:port][/path] enough to validate it and compare endpoints.
-struct UrlEndpoint {
-    bool ok = false;
-    bool tls = false;
-    std::string host;  // lower-cased
-    uint32_t port = 0;  // explicit, or 80 / 443
-};
-UrlEndpoint parseUrlEndpoint(const std::string &url);
+// The ha.url parser is core::ha::parseHaUrl (ha/HaUrl.h), the only URL parser; these
+// names remain for existing callers.
+using UrlEndpoint = core::ha::HaUrl;
+inline UrlEndpoint parseUrlEndpoint(const std::string &url) { return core::ha::parseHaUrl(url); }
 
 }  // namespace config
 }  // namespace core

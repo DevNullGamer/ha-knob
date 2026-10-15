@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "config/ConfigStore.h"
+#include "ha/HaSession.h"
 #include "hal/PsramAllocator.h"
 #include "version.h"
 #include "web/RequestGuard.h"
@@ -48,9 +49,11 @@ bool scanHaveResults = false;
 bool scanFailed = false;
 bool scanPending = false;  // requested or running
 uint32_t scanAtMs = 0;
+ha::Status haStatus;
 
 std::atomic<bool> configDirty{false};
 std::atomic<bool> scanRequested{false};
+std::atomic<bool> haRetryRequested{false};
 std::atomic<uint8_t> systemRequest{static_cast<uint8_t>(SystemRequest::None)};
 
 // POST body collected by the body callback; freed by the library (free()) with the request.
@@ -96,11 +99,18 @@ guard::GuardContext guardContext() {
     return context;
 }
 
+// The decoded URL path with all its bytes: c_str() would end it at a decoded "%00"
+// (so "/index.html%00" must not be taken for "/index.html").
+std::string urlPath(AsyncWebServerRequest *request) {
+    const String &url = request->url();
+    return std::string(url.c_str(), url.length());
+}
+
 guard::RequestInfo requestInfo(AsyncWebServerRequest *request) {
     guard::RequestInfo info;
     info.method = guard::methodFromString(asyncsrv::methodToString(request->method()));
     info.host = request->host().c_str();
-    info.path = request->url().c_str();
+    info.path = urlPath(request);
     info.contentType = request->header("Content-Type").c_str();
     info.hasCsrfHeader = request->hasHeader(guard::kCsrfHeaderName);
     info.csrfHeader = request->header(guard::kCsrfHeaderName).c_str();
@@ -122,6 +132,13 @@ void refreshWebPassword() {
     webPassword = std::move(pw);
 }
 
+// True if no web password is set or the request carries the right Basic credentials.
+bool authorized(AsyncWebServerRequest *request) {
+    const std::string password = cachedWebPassword();
+    return password.empty() ||
+           guard::basicAuthMatches(request->header("Authorization").c_str(), guard::kAuthUser, password);
+}
+
 // Server-wide middleware: guards, then optional Basic auth, then the handler.
 void guardMiddleware(AsyncWebServerRequest *request, ArMiddlewareNext next) {
     const guard::Decision decision = guard::checkRequest(requestInfo(request), guardContext());
@@ -133,9 +150,7 @@ void guardMiddleware(AsyncWebServerRequest *request, ArMiddlewareNext next) {
         sendError(request, decision.status, decision.reason);
         return;
     }
-    const std::string password = cachedWebPassword();
-    if (!password.empty() &&
-        !guard::basicAuthMatches(request->header("Authorization").c_str(), guard::kAuthUser, password)) {
+    if (!authorized(request)) {
         request->requestAuthentication(AsyncAuthType::AUTH_BASIC, kRealm);
         return;
     }
@@ -143,12 +158,13 @@ void guardMiddleware(AsyncWebServerRequest *request, ArMiddlewareNext next) {
 }
 
 // Body callback for POST /api/config: buffers at most kMaxBodyBytes, and nothing for a
-// request the guards will reject anyway.
+// request the guards or the web password will reject anyway (the body arrives before
+// the middleware runs).
 void onConfigBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index,
                   size_t total) {
     if (index == 0 && request->_tempObject == nullptr) {
         if (total == 0 || total > guard::kMaxBodyBytes ||
-            !guard::checkRequest(requestInfo(request), guardContext()).allowed()) {
+            !guard::checkRequest(requestInfo(request), guardContext()).allowed() || !authorized(request)) {
             return;
         }
         void *mem = heap_caps_malloc(sizeof(BodyBuffer) + total + 1,
@@ -176,9 +192,11 @@ void onConfigBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, siz
 
 void handleStatus(AsyncWebServerRequest *request) {
     wifi::Status net;
+    ha::Status haNow;
     {
         std::lock_guard<std::mutex> lock(snapshotMutex);
         net = netStatus;
+        haNow = haStatus;
     }
     JsonDocument doc = makeDoc();
     doc["fw"] = FW_VERSION;
@@ -196,10 +214,10 @@ void handleStatus(AsyncWebServerRequest *request) {
     w["ap_ssid"] = net.apSsid;
     w["ap_ip"] = net.apActive ? wifi::kApIp : "";
     w["hostname"] = net.hostname;
-    JsonObject ha = doc["ha"].to<JsonObject>();
-    ha["state"] = "not_available";  // the HA connection comes in a later version
-    ha["ha_version"] = "";
-    ha["last_error"] = "";
+    JsonObject h = doc["ha"].to<JsonObject>();
+    h["state"] = core::ha::stateName(haNow.state);
+    h["ha_version"] = haNow.haVersion;
+    h["last_error"] = haNow.lastError;
     sendJson(request, 200, doc);
 }
 
@@ -275,6 +293,14 @@ void handleScan(AsyncWebServerRequest *request) {
     sendJson(request, 200, doc);
 }
 
+void handleHaRetry(AsyncWebServerRequest *request) {
+    haRetryRequested = true;
+    util::logPrintf("WEB ha retry requested\n");
+    JsonDocument doc = makeDoc();
+    doc["ok"] = true;
+    sendJson(request, 200, doc);
+}
+
 void requestSystem(AsyncWebServerRequest *request, SystemRequest what) {
     systemRequest = static_cast<uint8_t>(what);
     util::logPrintf("%s\n", what == SystemRequest::Reboot ? "WEB reboot requested" : "WEB factory reset requested");
@@ -283,11 +309,15 @@ void requestSystem(AsyncWebServerRequest *request, SystemRequest what) {
     sendJson(request, 200, doc);
 }
 
+bool isListed(const std::string &path) {
+    return std::find(staticFiles.begin(), staticFiles.end(), path) != staticFiles.end();
+}
+
 void handleNotFound(AsyncWebServerRequest *request) {
-    const std::string path = request->url().c_str();
+    const std::string path = urlPath(request);
     if (guard::isApiPath(path)) {
         sendError(request, 404, "not_found");
-    } else if (path == "/" || path == "/index.html") {
+    } else if ((path == "/" || path == "/index.html") && !isListed("/index.html")) {
         request->send(503, "text/plain",
                       "HA Knob: the web UI files are missing. Flash them with "
                       "pio run -e t-encoder-pro -t uploadfs");
@@ -296,13 +326,14 @@ void handleNotFound(AsyncWebServerRequest *request) {
     }
 }
 
-// "/" -> "/index.html"; true if the path names a file listed in staticFiles.
+// "/" -> "/index.html"; true if the path names a file listed in staticFiles. (Only GET
+// reaches the static handler; a HEAD request ends in handleNotFound as 404.)
 bool isStaticFile(AsyncWebServerRequest *request) {
-    std::string path = request->url().c_str();
+    std::string path = urlPath(request);
     if (path == "/") {
         path = "/index.html";
     }
-    return std::find(staticFiles.begin(), staticFiles.end(), path) != staticFiles.end();
+    return isListed(path);
 }
 
 void listStaticFiles() {
@@ -347,6 +378,7 @@ void begin(ConfigStore &configStore, const char *touchVariant) {
     server.on("/api/config", HTTP_GET, handleConfigGet);
     server.on("/api/config", HTTP_POST, handleConfigPost, nullptr, onConfigBody);
     server.on("/api/wifi/scan", HTTP_GET, handleScan);
+    server.on("/api/ha/retry", HTTP_POST, handleHaRetry);
     server.on("/api/reboot", HTTP_POST,
               [](AsyncWebServerRequest *request) { requestSystem(request, SystemRequest::Reboot); });
     server.on("/api/factory-reset", HTTP_POST,
@@ -381,6 +413,13 @@ void publishScan(const std::vector<wifi::ScanNetwork> &networks, bool failed, ui
 bool takeConfigDirty() { return configDirty.exchange(false); }
 
 bool takeScanRequest() { return scanRequested.exchange(false); }
+
+void publishHa(const ha::Status &status) {
+    std::lock_guard<std::mutex> lock(snapshotMutex);
+    haStatus = status;
+}
+
+bool takeHaRetry() { return haRetryRequested.exchange(false); }
 
 SystemRequest takeSystemRequest() {
     return static_cast<SystemRequest>(systemRequest.exchange(static_cast<uint8_t>(SystemRequest::None)));

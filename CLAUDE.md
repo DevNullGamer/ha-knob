@@ -6,7 +6,7 @@ Guidance for AI assistants working in this repository.
 
 HA Knob: Home Assistant controller firmware for the LilyGo T-Encoder Pro (ESP32-S3R8,
 16 MB flash, 8 MB OPI PSRAM, 390x390 round AMOLED, touch, rotary encoder, buzzer).
-PlatformIO + Arduino framework. Current version 0.4.0 (Step 4: Wi-Fi provisioning and web setup UI).
+PlatformIO + Arduino framework. Current version 0.5.0 (Step 5: Home Assistant connection).
 
 The approved specification and change log live outside the repo in
 `~/.claude/workspace/chgreq/LilyGo T-encoderPro - HA Controller/chg001/`.
@@ -56,6 +56,13 @@ line, not only on `BOOT`.
   methods lock its mutex; never call LVGL or the HA socket while holding it.
 - `src/net/WifiManager` (`net::wifi`): STA / setup AP / captive DNS / mDNS state machine,
   main loop only. `src/net/WebServer` (`net::web`): ESPAsyncWebServer routes.
+- `lib/core/src/ha/`: `HaUrl` (the only URL parser; ConfigModel's `parseUrlEndpoint` is an
+  alias of it), `HaProtocol` (message builders + classifier), `HaSession` (connection
+  state machine, clock-injected, talks to a `Transport` interface; native tests use a fake
+  transport). `src/ha/HaClient` (`ha::`) is only the transport adapter (links2004
+  `WebSocketsClient`) plus logging; main loop only, like all HA socket I/O. Never enable
+  `coalesce_messages`. The token lives only in `ConfigStore` and the session; log
+  `token_set len=N`, never the value.
 - **Web callbacks run in the `async_tcp` task**: never call LVGL, `WiFi.*` or main-loop state
   from them. They read the snapshot published by `net::web::publishNetwork` (mutex), write
   config **only via `ConfigStore::applyPatch()`** (never `save()`, which bypasses the token
@@ -81,9 +88,14 @@ line, not only on `BOOT`.
   (done in an `LV_EVENT_INVALIDATE_AREA` handler).
 - **IO0 is the encoder push button and the BOOT strapping pin**: holding the knob during
   reset enters download mode. Never use a hold-at-boot gesture for features.
+- **Never call `Serial.setDebugOutput(true)`, and never define `CONFIG_ASYNC_TCP_DEBUG` or
+  `ASYNCWEBSERVER_LOG_DEBUG`**: they route library/ESP-IDF output into the USB serial
+  without the `logPrintf` protection below (and blocking writes from the `async_tcp` task).
 - **Serial: always log with `util::logPrintf()` (`src/util/Log.h`), never `Serial.print*`.**
-  Core 2.0.17's `HWCDC::write()` busy-loops forever when the USB host is attached but the
-  port is not being read and the TX buffer is full (`setTxTimeoutMs(0)` does not help).
+  Core 2.0.17's `HWCDC::write()` busy-loops when the USB host is attached but the port is
+  not being read and the TX buffer is full; it counts retries down from the TX timeout, so
+  `setTxTimeoutMs(0)` wraps around (~49 days). `setup()` uses `setTxTimeoutMs(1)` (0 also
+  made `Serial.flush()` discard the buffer).
   That froze the main loop after a replug (stale Wi-Fi snapshot -> `Host: <ip>` got 403,
   Wi-Fi scans never finished) until a monitor was opened. `logPrintf` only writes a line
   that fits into the free buffer (4 KB, set in `setup()` before `Serial.begin`) and counts
@@ -121,6 +133,7 @@ line, not only on `BOOT`.
 - lv_font_conv 1.5.3 (font generation only, via `npx`); source fonts from LVGL 9.2.2's
   `scripts/built_in_font/` (Montserrat Medium and FontAwesome 5 Free, font files OFL 1.1)
 - bblanchon/ArduinoJson 7.4.3 (both envs, from Step 3)
+- links2004/WebSockets 2.7.3 (Step 5; the plan said 2.7.2, see Step 5 below)
 
 ## Step 2 (2026-10-14)
 
@@ -213,6 +226,52 @@ line, not only on `BOOT`.
 - Upload timing: about 53 s with nothing to rebuild (30 s PlatformIO pre-upload checks,
   16 s write at about 925 kbit/s with compression and the stub). Not a config problem;
   slow uploads come from a full rebuild after any `platformio.ini` change (3-4 min).
+
+## Step 5 (2026-10-15)
+
+- **links2004/WebSockets 2.7.3, not 2.7.2**: 2.7.2 calls `WiFiClient::setTimeout(5000)`,
+  which core 2.x takes as seconds (5000 s socket/stream timeouts: a stalled peer could block
+  the main loop for over an hour). 2.7.3 converts it for core < 3.
+- **`WEBSOCKETS_MAX_DATA_SIZE` cannot be overridden in 2.7.x**: `WebSockets.h` defines it
+  (15 KB) without `#ifndef`, so `-D` only produces "redefined" warnings and the library
+  keeps 15 KB; a larger frame closes the connection (1009). The flag is not set. Step 6
+  (`get_states`, up to MBs) needs another way (open question).
+- `HaSession` states: `no_config`, `connecting`, `authenticating`, `subscribing`, `ready`,
+  `auth_failed`, `backoff`. Backoff 1, 2, 4, 8, 16, 30 s (consecutive failures; reset at
+  Ready, new URL/token, Retry). `auth_failed` never reconnects by itself (not even after a
+  Wi-Fi change); only a new URL/token or `POST /api/ha/retry` leave it. Retry also ends a
+  backoff wait. `HaSession::send()` fails the connection only once even when the transport
+  reports the close from inside `sendText()`. Timeouts: 20 s open -> auth_required, 10 s auth answer, ping every 30 s
+  after auth_ok, 10 s pong, 15 s pending requests. Ids restart at 1 per connection.
+- Step 5 passes no entity ids (no subscription; Ready right after auth_ok). The session
+  already implements Subscribing for a non-empty list; Step 6 wires the controls' ids and
+  live resubscription.
+- `lastError` explains why the session is not Ready (`connect_failed`, `connection_lost`,
+  `dns_failed`, `connect_timeout`, `auth_timeout`, `pong_timeout`, `send_failed`,
+  `network_down`/`network_lost`, `auth_invalid: <HA message>`, `invalid_url`); cleared on
+  Ready. `ha_version` is cleared by every new attempt.
+- `ha.url` validation and the token guard accept exactly what v0.4.0 accepted. `HaUrl`
+  flags a `?`/`#` (`hasQueryOrFragment`); the session refuses such a URL (`no_config`,
+  `invalid_url`). **https URLs are refused by the session** (`no_config`,
+  `tls_not_supported`, `Transport::open` never called; the adapter also refuses a TLS
+  endpoint): TLS is out of scope (Q3) and the token must never go to a TLS port in
+  plaintext. `validate()` still accepts https so no stored config becomes invalid.
+- Transport: the host is resolved first with lwIP `dns_gethostbyname` run in the tcpip task
+  (`tcpip_callback`), so an unresolvable name never blocks the main loop; the library's own
+  blocking lookup then hits lwIP's DNS cache. The TCP connect itself is synchronous: a host
+  that does not answer blocks the main loop up to 2 s per attempt
+  (`-DWEBSOCKETS_TCP_TIMEOUT=2000`, `#ifndef`-guarded in the library, unlike
+  `WEBSOCKETS_MAX_DATA_SIZE`; also the handshake and read-progress timeout).
+  The library's reconnect is disabled (interval 0 for the first `loop()` after `begin()`,
+  then `ULONG_MAX`), its heartbeat is off, no `Origin`/`Sec-WebSocket-Protocol` header.
+  `close()` from inside a library event is deferred until `loop()` returns.
+- `HB` gained `ha=<state> heap=<bytes>`. Free heap: 167 KB at boot (Step 4: ~169 KB),
+  ~165 KB while connected. App 1.69 MB (26.0 %).
+- Web: HA tab (URL, write-only token, state, Retry, Remove). `/index.html%00` and other
+  decoded NULs in a path are 404 (paths are compared with their full length). HEAD is 404
+  everywhere (only GET reaches the handlers). Basic auth is checked before a POST body is
+  buffered. WifiManager waits for a stopped scan's late `SCAN_DONE` (and frees it) before
+  the next scan; mDNS is retried every 30 s while `MDNS.begin()` fails.
 
 ## Upcoming requirements
 
