@@ -92,6 +92,40 @@ class Checker:
         return self.check(got == want, name, f"status {got}, want {want}, body {raw[:200]!r}")
 
 
+def scan_cycle(c, n):
+    """Waits for a fresh scan (one started after the previous result) to finish."""
+    t0 = time.time()
+    first_age = None
+    scan = None
+    st, raw = 0, b""
+    started_new = False
+    while time.time() - t0 < 40:
+        try:
+            st, _, raw = c.request("GET", "/api/wifi/scan", label=f"scan {n}")
+        except (OSError, http.client.HTTPException) as e:
+            c.check(False, f"scan {n} request", repr(e))
+            return
+        scan = c.json_of(raw)
+        if st != 200 or not isinstance(scan, dict):
+            break
+        if first_age is None:
+            first_age = scan.get("age_s")
+        if scan.get("scanning"):
+            started_new = True
+        elif started_new:
+            break
+        time.sleep(1)
+    c.expect_status(f"scan {n}: 200", st, 200, raw)
+    ok = isinstance(scan, dict) and started_new and not scan.get("scanning")
+    c.check(ok, f"scan {n}: a new scan ran and finished within 40 s", str(scan)[:200])
+    if isinstance(scan, dict):
+        nets = scan.get("networks") or []
+        c.check(scan.get("failed") is False, f"scan {n}: failed false", str(scan)[:200])
+        c.check(len(nets) > 0, f"scan {n}: networks > 0", len(nets))
+        print(f"      scan {n}: {time.time() - t0:.1f} s, failed={scan.get('failed')} "
+              f"networks={len(nets)} age_s={scan.get('age_s')}")
+
+
 def post_headers(extra=None):
     h = {"Content-Type": "application/json", "X-HAKnob": "1"}
     h.update(extra or {})
@@ -233,19 +267,17 @@ def run(args):
     st, h, raw = c.request("GET", "/api/x")
     c.expect_status("GET /api/x 404", st, 404, raw)
     c.check(c.json_of(raw) is not None, "404 body is JSON", raw[:100])
-    scan = None
-    for _ in range(10):
-        st, h, raw = c.request("GET", "/api/wifi/scan")
-        scan = c.json_of(raw)
-        if st != 200 or not isinstance(scan, dict) or not scan.get("scanning"):
-            break
-        time.sleep(2)
-    c.expect_status("GET /api/wifi/scan 200", st, 200, raw)
-    c.check(isinstance(scan, dict) and isinstance(scan.get("networks"), list),
-            "scan JSON has networks[]", str(scan)[:200])
-    if isinstance(scan, dict):
-        print(f"      scan: scanning={scan.get('scanning')} failed={scan.get('failed')} "
-              f"networks={len(scan.get('networks') or [])}")
+    for path in ("/nope", "/api/nope/x", "/INDEX.HTML", "/App.js", "/../index.html",
+                 "/%2e%2e/index.html", "/%2E%2E/index.html", "//index.html", "/./index.html",
+                 "/index.html/", "/data/index.html", "/.git/config"):
+        st, h, raw = c.request("GET", path)
+        c.expect_status(f"GET {path} 404", st, 404, raw)
+    # Informational: a %00 suffix is decoded and truncated by the server to the listed file
+    # (same file, no traversal). Reported, not asserted.
+    st, _, _ = c.request("GET", "/index.html%00")
+    print(f"      info: GET /index.html%00 -> {st}")
+    for i in range(args.scan_cycles):
+        scan_cycle(c, i + 1)
 
     # 10. Web password
     if args.web_password_test:
@@ -349,6 +381,8 @@ def main():
     p.add_argument("--ip", required=True)
     p.add_argument("--hostname", default="ha-knob")
     p.add_argument("--reboot", action="store_true", help="also test POST /api/reboot")
+    p.add_argument("--scan-cycles", type=int, default=1,
+                   help="number of complete Wi-Fi scan cycles to require (default 1)")
     p.add_argument("--web-password-test", action="store_true",
                    help="set a random web password, test 401/200, then clear it")
     args = p.parse_args()

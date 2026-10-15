@@ -193,6 +193,123 @@ static void test_factory_reset_keeps_ap_password() {
     TEST_ASSERT_TRUE(reloaded.wifiPassword().empty());
 }
 
+// Step 4 round 2: no-op patches must not write NVS; cfgWritten / secretsWritten report it.
+namespace {
+cfg::MergeResult patch(ConfigStore &store, const char *json) {
+    return store.applyPatch(json, strlen(json));
+}
+
+void resetToSample(ConfigStore &store) {
+    TEST_ASSERT_TRUE(store.factoryReset());
+    TEST_ASSERT_TRUE(store.save(sampleConfig(), allSecrets()).ok);
+}
+}  // namespace
+
+static void test_noop_empty_patch_writes_nothing() {
+    ConfigStore store(kNs);
+    TEST_ASSERT_TRUE(store.begin());
+    resetToSample(store);
+    cfg::MergeResult r = patch(store, "{}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_FALSE(r.cfgWritten);
+    TEST_ASSERT_FALSE(r.secretsWritten);
+    TEST_ASSERT_FALSE(r.restartWifi);
+    // An identical full section is also a no-op.
+    r = patch(store, "{\"device\":{\"hostname\":\"test-knob\",\"brightness\":42,\"buzzer\":false}}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_FALSE(r.cfgWritten);
+    TEST_ASSERT_FALSE(r.secretsWritten);
+    // save() of the identical config + identical secrets: stored state unchanged.
+    TEST_ASSERT_TRUE(store.save(sampleConfig(), allSecrets()).ok);
+    ConfigStore reloaded(kNs);
+    TEST_ASSERT_TRUE(reloaded.begin());
+    TEST_ASSERT_TRUE(reloaded.config() == sampleConfig());
+    TEST_ASSERT_EQUAL_STRING("token.abc.def", reloaded.haToken().c_str());
+    TEST_ASSERT_EQUAL_STRING("wifi-pass-123", reloaded.wifiPassword().c_str());
+    TEST_ASSERT_EQUAL_STRING("web pass", reloaded.webPassword().c_str());
+}
+
+static void test_noop_same_value_secret_set() {
+    ConfigStore store(kNs);
+    TEST_ASSERT_TRUE(store.begin());
+    resetToSample(store);
+    cfg::MergeResult r = patch(store, "{\"web\":{\"password\":\"web pass\"}}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_FALSE(r.cfgWritten);
+    TEST_ASSERT_FALSE(r.secretsWritten);
+    r = patch(store, "{\"wifi\":{\"ssid\":\"TestNet\",\"password\":\"wifi-pass-123\"}}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_FALSE(r.cfgWritten);
+    TEST_ASSERT_FALSE(r.secretsWritten);
+    r = patch(store, "{\"ha\":{\"url\":\"http://192.168.1.10:8123\",\"token\":\"token.abc.def\"}}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_FALSE(r.cfgWritten);
+    TEST_ASSERT_FALSE(r.secretsWritten);
+    TEST_ASSERT_EQUAL_STRING("token.abc.def", store.haToken().c_str());
+    TEST_ASSERT_EQUAL_STRING("wifi-pass-123", store.wifiPassword().c_str());
+}
+
+static void test_noop_clear_of_absent_secret() {
+    ConfigStore store(kNs);
+    TEST_ASSERT_TRUE(store.begin());
+    resetToSample(store);
+    cfg::MergeResult r = patch(store, "{\"web\":{\"password\":null}}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_TRUE(r.secretsWritten);  // removed the stored web_pw
+    TEST_ASSERT_FALSE(r.cfgWritten);
+    TEST_ASSERT_FALSE(store.secretsPresent().webPassword);
+    r = patch(store, "{\"web\":{\"password\":null}}");  // again: nothing to remove
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_FALSE(r.secretsWritten);
+    TEST_ASSERT_FALSE(r.cfgWritten);
+    TEST_ASSERT_FALSE(store.secretsPresent().webPassword);
+}
+
+static void test_changed_values_write() {
+    ConfigStore store(kNs);
+    TEST_ASSERT_TRUE(store.begin());
+    resetToSample(store);
+    cfg::MergeResult r = patch(store, "{\"web\":{\"password\":\"other pass\"}}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_TRUE(r.secretsWritten);
+    TEST_ASSERT_FALSE(r.cfgWritten);
+    r = patch(store, "{\"device\":{\"hostname\":\"test-knob\",\"brightness\":43,\"buzzer\":false}}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_TRUE(r.cfgWritten);
+    TEST_ASSERT_FALSE(r.secretsWritten);
+    r = patch(store, "{\"ha\":{\"url\":\"http://192.168.1.10:8123\",\"token\":\"token.changed\"}}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_TRUE(r.secretsWritten);
+    TEST_ASSERT_FALSE(r.cfgWritten);
+    ConfigStore reloaded(kNs);
+    TEST_ASSERT_TRUE(reloaded.begin());
+    TEST_ASSERT_EQUAL_STRING("other pass", reloaded.webPassword().c_str());
+    TEST_ASSERT_EQUAL_STRING("token.changed", reloaded.haToken().c_str());
+    TEST_ASSERT_EQUAL_INT32(43, reloaded.config().device.brightness);
+}
+
+static void test_url_cleared_still_removes_stored_token() {
+    ConfigStore store(kNs);
+    TEST_ASSERT_TRUE(store.begin());
+    resetToSample(store);
+    cfg::MergeResult r = patch(store, "{\"ha\":{\"url\":\"\"}}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_TRUE(r.cfgWritten);
+    TEST_ASSERT_TRUE(r.secretsWritten);
+    ConfigStore reloaded(kNs);
+    TEST_ASSERT_TRUE(reloaded.begin());
+    TEST_ASSERT_FALSE(reloaded.secretsPresent().haToken);
+    TEST_ASSERT_TRUE(reloaded.haToken().empty());
+    TEST_ASSERT_TRUE(reloaded.config().ha.url.empty());
+    // Again with a supplied token while the URL stays empty: forced Clear of an absent
+    // token is a no-op, and the token is not stored.
+    r = patch(store, "{\"ha\":{\"url\":\"\",\"token\":\"abc\"}}");
+    TEST_ASSERT_TRUE(r.ok);
+    TEST_ASSERT_FALSE(r.cfgWritten);
+    TEST_ASSERT_FALSE(r.secretsWritten);
+    TEST_ASSERT_FALSE(store.secretsPresent().haToken);
+}
+
 static void test_corrupt_stored_cfg_gives_defaults_and_is_kept() {
     {
         Preferences p;
@@ -223,6 +340,11 @@ void setup() {
     RUN_TEST(test_apply_patch_new_url_with_token_replaces_token);
     RUN_TEST(test_apply_patch_url_cleared_removes_token_and_ssid_cleared_removes_password);
     RUN_TEST(test_factory_reset_keeps_ap_password);
+    RUN_TEST(test_noop_empty_patch_writes_nothing);
+    RUN_TEST(test_noop_same_value_secret_set);
+    RUN_TEST(test_noop_clear_of_absent_secret);
+    RUN_TEST(test_changed_values_write);
+    RUN_TEST(test_url_cleared_still_removes_stored_token);
     RUN_TEST(test_corrupt_stored_cfg_gives_defaults_and_is_kept);
     wipeNamespace();
     UNITY_END();
