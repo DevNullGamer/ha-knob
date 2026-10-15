@@ -11,8 +11,9 @@
 
 // Connection state machine for the Home Assistant WebSocket API (plan.md §3.7). Pure and
 // clock-injected: it talks to the socket through the Transport interface and is driven by
-// the configure / network / transport calls below plus tick(). src/ha/HaClient adapts it
-// to the WebSocket library; native tests use a fake transport.
+// the configure / network / transport calls below plus tick(). src/ha/WsTransport (the
+// project's own WebSocket client) implements Transport on the device; native tests use a
+// fake transport.
 //
 //  NoConfig ---- URL and token configured ----------------------------> Connecting
 //  Connecting -- auth_required received, auth sent --------------------> Authenticating
@@ -45,6 +46,20 @@ enum class State : uint8_t { NoConfig, Connecting, Authenticating, Subscribing, 
 // "backoff" (as in /api/status and the serial log).
 const char *stateName(State state);
 
+// How an https (wss) endpoint is to be verified; passed to Transport::open(). Not used for
+// http endpoints. Defaults: verify against the built-in public CA bundle.
+//  - insecure: no certificate verification at all
+//  - caPem:    verify against this CA certificate (PEM) instead of the bundle
+// TLS is not connected yet (HaSession refuses https with "tls_not_supported"); the settings
+// are only plumbed through.
+struct TlsSettings {
+    bool insecure = false;
+    std::string caPem;
+
+    bool operator==(const TlsSettings &o) const { return insecure == o.insecure && caPem == o.caPem; }
+    bool operator!=(const TlsSettings &o) const { return !(*this == o); }
+};
+
 // The WebSocket as the session sees it. All calls are made from within the session's
 // methods.
 class Transport {
@@ -52,8 +67,8 @@ public:
     virtual ~Transport() = default;
     // Starts connecting (name resolution, TCP, WebSocket handshake). Once the socket is up
     // HA sends auth_required (HaSession::onText); a failure is reported through
-    // HaSession::onClosed().
-    virtual void open(const HaUrl &endpoint) = 0;
+    // HaSession::onClosed(). tls applies to https endpoints only.
+    virtual void open(const HaUrl &endpoint, const TlsSettings &tls) = 0;
     // Closes the connection or abandons the attempt. Nothing is reported for it afterwards.
     virtual void close() = 0;
     // Sends one text frame. False if it could not be sent. May report the close through
@@ -80,16 +95,16 @@ public:
 
     explicit HaSession(Transport &transport, ArduinoJson::Allocator *allocator = nullptr);
 
-    // Applies the configuration. A different URL or token (or the first call) restarts:
+    // Applies the configuration. A different URL, token or TLS setting (or the first call)
+    // restarts:
     // the connection is closed and, with both set and a usable URL, a new one is started
     // (Connecting, or Backoff while the network is down). Empty URL or token: NoConfig.
     // An invalid URL (or one with a query/fragment): NoConfig with lastError
     // "invalid_url". An https URL: NoConfig with lastError "tls_not_supported" (TLS is not
     // implemented; the token is never sent unencrypted to it). Transport::open() is never
-    // called in NoConfig. Unchanged URL and token keep
-    // the connection (also AuthFailed); entity ids are de-duplicated and used from the
-    // next subscribe on.
-    void configure(const std::string &url, const std::string &token,
+    // called in NoConfig. Unchanged URL, token and TLS settings keep the connection (also
+    // AuthFailed); entity ids are de-duplicated and used from the next subscribe on.
+    void configure(const std::string &url, const std::string &token, const TlsSettings &tls,
                    const std::vector<std::string> &entityIds, uint32_t nowMs);
 
     // Station link state. Losing it closes an active connection (Backoff).
@@ -105,6 +120,11 @@ public:
     // Transport events (ignored unless the session has a connection open).
     void onClosed(const std::string &reason, uint32_t nowMs);
     void onText(const char *data, size_t length, uint32_t nowMs);
+    // The transport discarded a received message (too large, no memory, binary): length =
+    // payload bytes seen, reason e.g. "too_large". Counted only while a connection is open;
+    // the connection stays up. A request whose result was dropped expires from the pending
+    // map as usual.
+    void onMessageDropped(size_t length, const char *reason, uint32_t nowMs);
 
     State state() const { return state_; }
     // From auth_ok of the current connection ("" until then; cleared by every new attempt).
@@ -113,11 +133,13 @@ public:
     // "auth_invalid: <HA message>"); cleared on Ready, retry() and a config change.
     const std::string &lastError() const { return lastError_; }
     const HaUrl &endpoint() const { return endpoint_; }
+    const TlsSettings &tlsSettings() const { return tls_; }
     bool networkUp() const { return networkUp_; }
     uint32_t attempts() const { return attempts_; }      // connections opened so far
     uint32_t failures() const { return failures_; }      // consecutive failed connections
     uint32_t nextAttemptMs() const { return nextAttemptMs_; }  // Backoff: when the wait ends
     size_t pendingCount() const { return pending_.size(); }
+    uint32_t droppedMessages() const { return droppedMessages_; }  // onMessageDropped() counted
     // Incremented on every change of state(), haVersion() or lastError().
     uint32_t changeCount() const { return changeCount_; }
 
@@ -148,6 +170,7 @@ private:
 
     std::string url_;
     std::string token_;
+    TlsSettings tls_;
     HaUrl endpoint_;
     std::vector<std::string> entityIds_;
 
@@ -169,6 +192,7 @@ private:
     uint32_t subscriptionId_ = 0;  // id of the active subscribe_entities (0 = none)
     std::vector<Pending> pending_;
     uint32_t changeCount_ = 0;
+    uint32_t droppedMessages_ = 0;
 };
 
 }  // namespace ha

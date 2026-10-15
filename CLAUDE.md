@@ -6,7 +6,7 @@ Guidance for AI assistants working in this repository.
 
 HA Knob: Home Assistant controller firmware for the LilyGo T-Encoder Pro (ESP32-S3R8,
 16 MB flash, 8 MB OPI PSRAM, 390x390 round AMOLED, touch, rotary encoder, buzzer).
-PlatformIO + Arduino framework. Current version 0.5.0 (Step 5: Home Assistant connection).
+PlatformIO + Arduino framework. Current version 0.5.1 (Step 5b.2: own WebSocket client, large messages).
 
 The approved specification and change log live outside the repo in
 `~/.claude/workspace/chgreq/LilyGo T-encoderPro - HA Controller/chg001/`.
@@ -59,8 +59,9 @@ line, not only on `BOOT`.
 - `lib/core/src/ha/`: `HaUrl` (the only URL parser; ConfigModel's `parseUrlEndpoint` is an
   alias of it), `HaProtocol` (message builders + classifier), `HaSession` (connection
   state machine, clock-injected, talks to a `Transport` interface; native tests use a fake
-  transport). `src/ha/HaClient` (`ha::`) is only the transport adapter (links2004
-  `WebSocketsClient`) plus logging; main loop only, like all HA socket I/O. Never enable
+  transport). `src/ha/HaClient` (`ha::`) wires the session to `src/ha/WsTransport` (the
+  project's own WebSocket client on `WiFiClient`) and logs; main loop only, like all HA
+  socket I/O. Never enable
   `coalesce_messages`. The token lives only in `ConfigStore` and the session; log
   `token_set len=N`, never the value.
 - **Web callbacks run in the `async_tcp` task**: never call LVGL, `WiFi.*` or main-loop state
@@ -75,8 +76,8 @@ line, not only on `BOOT`.
   `innerHTML`), no inline scripts or styles (the CSP forbids them). Clients always send
   whole config sections (section replace is literal), `ssid` in every `wifi` section, `url`
   in every `ha` section, and the Wi-Fi password together with the SSID (`null` = open).
-- `lib/core/src/util/{Sha1,Base64}` and `lib/core/src/ws/` (Step 5b.1, pure, not yet used by
-  the device): WebSocket codec for the own client that replaces links2004 in Step 5b.2.
+- `lib/core/src/util/{Sha1,Base64}` and `lib/core/src/ws/` (Step 5b.1, pure): WebSocket
+  codec of the own client (device adapter `src/ha/WsTransport`, Step 5b.2).
   `WsHandshake` (upgrade request/response), `WsFrame` (masked client frames), `WsReceiver`
   (incremental, one event per `feed()`, message memory via a `BufferProvider`, 4 MB limit,
   oversize/binary/no-memory messages become `Dropped` events). Spec: `plan-step5b.md`.
@@ -138,7 +139,8 @@ line, not only on `BOOT`.
 - lv_font_conv 1.5.3 (font generation only, via `npx`); source fonts from LVGL 9.2.2's
   `scripts/built_in_font/` (Montserrat Medium and FontAwesome 5 Free, font files OFL 1.1)
 - bblanchon/ArduinoJson 7.4.3 (both envs, from Step 3)
-- links2004/WebSockets 2.7.3 (Step 5; the plan said 2.7.2, see Step 5 below)
+- links2004/WebSockets 2.7.3 was used in Step 5 and removed in Step 5b.2 (own client); no
+  library replaces it.
 
 ## Step 2 (2026-10-14)
 
@@ -234,13 +236,8 @@ line, not only on `BOOT`.
 
 ## Step 5 (2026-10-15)
 
-- **links2004/WebSockets 2.7.3, not 2.7.2**: 2.7.2 calls `WiFiClient::setTimeout(5000)`,
-  which core 2.x takes as seconds (5000 s socket/stream timeouts: a stalled peer could block
-  the main loop for over an hour). 2.7.3 converts it for core < 3.
-- **`WEBSOCKETS_MAX_DATA_SIZE` cannot be overridden in 2.7.x**: `WebSockets.h` defines it
-  (15 KB) without `#ifndef`, so `-D` only produces "redefined" warnings and the library
-  keeps 15 KB; a larger frame closes the connection (1009). The flag is not set. Step 6
-  (`get_states`, up to MBs) needs another way (open question).
+- Step 5 used links2004/WebSockets 2.7.3 (15 KB frame limit, blocking whole-frame reads);
+  it was replaced by the own client in Step 5b.2 (see below).
 - `HaSession` states: `no_config`, `connecting`, `authenticating`, `subscribing`, `ready`,
   `auth_failed`, `backoff`. Backoff 1, 2, 4, 8, 16, 30 s (consecutive failures; reset at
   Ready, new URL/token, Retry). `auth_failed` never reconnects by itself (not even after a
@@ -262,14 +259,7 @@ line, not only on `BOOT`.
   endpoint): TLS is out of scope (Q3) and the token must never go to a TLS port in
   plaintext. `validate()` still accepts https so no stored config becomes invalid.
 - Transport: the host is resolved first with lwIP `dns_gethostbyname` run in the tcpip task
-  (`tcpip_callback`), so an unresolvable name never blocks the main loop; the library's own
-  blocking lookup then hits lwIP's DNS cache. The TCP connect itself is synchronous: a host
-  that does not answer blocks the main loop up to 2 s per attempt
-  (`-DWEBSOCKETS_TCP_TIMEOUT=2000`, `#ifndef`-guarded in the library, unlike
-  `WEBSOCKETS_MAX_DATA_SIZE`; also the handshake and read-progress timeout).
-  The library's reconnect is disabled (interval 0 for the first `loop()` after `begin()`,
-  then `ULONG_MAX`), its heartbeat is off, no `Origin`/`Sec-WebSocket-Protocol` header.
-  `close()` from inside a library event is deferred until `loop()` returns.
+  (`tcpip_callback`), so an unresolvable name never blocks the main loop (kept in Step 5b.2).
 - `HB` gained `ha=<state> heap=<bytes>`. Free heap: 167 KB at boot (Step 4: ~169 KB),
   ~165 KB while connected. App 1.69 MB (26.0 %).
 - Web: HA tab (URL, write-only token, state, Retry, Remove). `/index.html%00` and other
@@ -277,6 +267,52 @@ line, not only on `BOOT`.
   everywhere (only GET reaches the handlers). Basic auth is checked before a POST body is
   buffered. WifiManager waits for a stopped scan's late `SCAN_DONE` (and frees it) before
   the next scan; mDNS is retried every 30 s while `MDNS.begin()` fails.
+
+## Step 5b.2 (2026-10-15)
+
+- Spec: `plan-step5b.md` (chg001). links2004 and `-DWEBSOCKETS_TCP_TIMEOUT` are gone; the
+  HA socket is `src/ha/WsTransport` on Arduino `WiFiClient` + the `lib/core/src/ws` codec.
+  App size 1.56 MB (24.1 %, was 1.69 MB with links2004).
+- Phases: Resolving (async DNS) -> Connecting (`WiFiClient::connect(ip, port, 2000)`; the
+  timeout is **milliseconds** on core 2.0.17 and also becomes SO_SNDTIMEO/SO_RCVTIMEO) ->
+  Upgrading (non-blocking, 10 s `handshake_timeout`) -> Open. One blocking step per poll:
+  the TCP connect runs on the poll after the DNS result.
+- **Read only when `available() > 0`** (F7: `WiFiClientSecure::read()` drops the connection
+  on WANT_READ); at most 32 KB or 8 ms per poll through a 2 KB internal buffer.
+  `WiFiClient::connected()` reads a stale `errno` after a 0-byte `recv()`, so a closed peer
+  is detected with `recv(fd, .., 1, MSG_PEEK | MSG_DONTWAIT)` (0 = FIN) when nothing is
+  available.
+- Messages are assembled in PSRAM (`PsramBufferProvider`, `heap_caps_realloc` SPIRAM); above
+  64 KB the largest free PSRAM block must be >= 1.5 x the size. Limit 4 MB; larger, binary
+  or unstorable messages are skipped without buffering (`HA frame dropped`,
+  `HaSession::onMessageDropped`), the connection stays up. A stalled transfer is ended by
+  the session's timers (connect 20 s, auth 10 s, HA ping 30 s + pong 10 s).
+- `WsReceiver`: a failed doubled `grow()` for a fragmented message is retried once with the
+  exact size before `no_memory`.
+- Server PING -> PONG with the same payload. Server Close -> Close reply (echo, but 1000
+  instead of 1005/1006/1015 or an unsendable code; empty if the server sent no code) ->
+  `closed_by_server`. ProtocolError -> Close 1002 -> `protocol_error`. Session close of an
+  open connection sends Close 1000. `close()`/`open()` called by the session inside
+  `poll()` are deferred until `poll()` returns (the Text buffer stays valid during
+  `onText`).
+- `HaProtocol::parseMessage`: messages > 256 KB (`kEnvelopeOnlyBytes`) are parsed with an
+  ArduinoJson filter (`type`, `id`, `success`, `ha_version`, `message`, `error.code`,
+  `error.message`), `Message::envelopeOnly`; peak allocation for 1 MB about 8 KB.
+- `HaSession::configure(url, token, TlsSettings, ids, now)` restarts on a TLS settings
+  change too; `Transport::open(endpoint, tls)`. https is still refused
+  (`tls_not_supported`) until Step 5b.4; the adapter refuses a TLS endpoint as well.
+- `HB` gained `heap_min=` (lowest internal free heap since boot) and `loopmax=` (longest
+  main-loop pass in ms since the previous HB, without the 5 ms delay); `/api/status` gained
+  top-level `heap_min_free`.
+- Core `log_e` (Arduino `log_printf` -> ROM `ets_printf`) **does reach COM14**: e.g.
+  `[E][WiFiClient.cpp:275] connect(): socket error ... "Connection reset by peer"` on a
+  refused connect. It does not use `HWCDC::write()` or `putc2` (HWCDC never installs
+  itself): `esp_rom_install_uart_printf` sets the ROM flags `g_uart_print` and
+  `g_usb_print` (`CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=1`), so the ROM writes to
+  UART0 and straight to the USB-Serial-JTAG FIFO. Measured: with COM14 closed for 2 min
+  (buffers full) a refused connect plus its `[E]` line kept the main loop busy 38-78 ms,
+  the same as with a reader (39-79 ms), so it does not block. These lines bypass
+  `logPrintf`'s drop accounting and can interleave with its output.
 
 ## Upcoming requirements
 

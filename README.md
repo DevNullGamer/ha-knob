@@ -4,7 +4,7 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.5.0, Step 5 (Home Assistant connection).** The firmware drives the hardware
+**Status: v0.5.1, Step 5b.2 (own WebSocket client, large messages).** The firmware drives the hardware
 (display, touch swipes, encoder, button, buzzer), loads its configuration from NVS, joins
 Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home Assistant and
 device settings, and keeps an authenticated, self-healing WebSocket connection to Home
@@ -104,7 +104,7 @@ BTN long                                 held 600 ms (fired while held; no "shor
 BTN verylong                             held 10 s
 BTN up                                   release after long / verylong
 TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
-HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes>   every 5 s
+HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes> loopmax=<ms>   every 5 s
 WIFI ap ssid=<HA-Knob-XXXX> ip=192.168.4.1   setup access point up
 WIFI ap off                              setup access point shut down
 WIFI sta connecting ssid=<ssid>
@@ -124,17 +124,24 @@ HA config url=<url> token_set len=<n>    HA settings applied (the token itself i
 HA config none url_set=<0|1> token_set=<0|1>   Home Assistant not configured
 HA connect attempt=<n> url=ws://<host>:<port><path>   one line per connection attempt
 HA dns host=<host> ok=<0|1>[ ip=<ip>]    name resolution of the attempt
-HA socket open                           WebSocket handshake done
-HA socket closed open=<0|1> reason=<library reason>
+HA tcp ok=<0|1> ms=<n>                   TCP connect (blocks the main loop, at most 2 s)
+HA socket open ms=<n>                    WebSocket handshake done (ms since the TCP connect started)
+HA handshake failed error=<http NNN|bad_accept|bad_response|closed> | HA handshake timeout
+HA rx len=<n> ms=<n> handle_ms=<n>       a message of 64 KB or more: receive time, processing time
+HA frame dropped len=<n> ms=<n> reason=<too_large|no_memory|binary>   message discarded, connection stays up
+HA socket closed by=server code=<n> reason=<text>   server sent a WebSocket Close
+HA socket closed by=peer                 TCP connection closed or reset
+HA protocol error reason=<r>             invalid WebSocket data from the server (connection closed)
 HA state=<state>[ ha_version=<v>][ error=<error>][ retry_in_ms=<ms>]   every state change
 HA retry                                 web UI Retry accepted
-HA frame ignored type=<n> len=<n> | HA socket error len=<n>
 SYS reboot | SYS factory reset           performed by the main loop just after the response
 ```
 
 In `HB`, `ip` is the station IP when connected, else `192.168.4.1` while the setup AP is up,
-else `0.0.0.0`; `ha` is the Home Assistant connection state and `heap` the free internal
-heap. SSIDs are logged, passwords and tokens never.
+else `0.0.0.0`; `ha` is the Home Assistant connection state, `heap` / `heap_min` the free
+internal heap now / the lowest since boot, and `loopmax` the longest main-loop pass (ms,
+without the loop's own 5 ms delay) since the previous `HB`. SSIDs are logged, passwords and
+tokens never.
 
 Serial output never blocks the firmware: when the board is plugged into a PC but no program
 reads the port, the 4 KB transmit buffer fills up and further lines are dropped (counted in
@@ -311,7 +318,7 @@ files were never flashed, `/` answers 503 with a hint to run `uploadfs`.
 
 | Method / path | Response |
 |---|---|
-| GET `/api/status` | `{fw, uptime_s, heap_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state, ha_version, last_error}}` (see Home Assistant) |
+| GET `/api/status` | `{fw, uptime_s, heap_free, heap_min_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state, ha_version, last_error}}` (see Home Assistant) |
 | GET `/api/config` | Redacted config: secrets only as `wifi.password_set`, `ha.token_set`, `web.password_set` |
 | POST `/api/config` | Patch (see Configuration). `200 {ok:true, restart_wifi}`, `400 {error, field}` (validation), `500 {error:"nvs_write_failed", field}` (storage failed; the config may be partly written and is re-read) |
 | GET `/api/wifi/scan` | `{scanning, age_s, failed, networks:[{ssid, rssi, secure}]}`; starts a new scan when there is none yet, the last one failed or it is older than 10 s. Poll until `scanning` is false (a scan takes about 2-5 s; requests during a scan can take up to about 3 s because the radio briefly leaves its channel) |
@@ -360,7 +367,7 @@ they can be stored, but the device never connects to them (`no_config` with `las
 | `subscribing` | Subscribing to the selected entities (from Step 6; Step 5 subscribes to nothing) |
 | `ready` | Connected and authenticated; `ha_version` is the Home Assistant version |
 | `auth_failed` | Home Assistant rejected the token (`last_error` `auth_invalid: <message>`). **No automatic retry** (Home Assistant would ban the IP after repeated failures): save a new token, or press Retry |
-| `backoff` | Not connected; the next attempt follows after 1, 2, 4, 8, 16, then every 30 s. `last_error` says why (`connect_failed`, `connection_lost`, `dns_failed`, `connect_timeout`, `auth_timeout`, `pong_timeout`, `send_failed`, `network_down`, `network_lost`) |
+| `backoff` | Not connected; the next attempt follows after 1, 2, 4, 8, 16, then every 30 s. `last_error` says why (`dns_failed`, `connect_failed`, `handshake_failed: http <code>` / `bad_accept` / `bad_response` / `closed` (the server closed the connection before answering the upgrade, e.g. a proxy refusing it), `handshake_timeout`, `connect_timeout`, `auth_timeout`, `pong_timeout`, `connection_lost`, `closed_by_server`, `protocol_error`, `send_failed`, `network_down`, `network_lost`) |
 
 - Without Wi-Fi the client waits in `backoff` and connects as soon as the station is up.
 - Liveness: an HA `ping` every 30 s; no `pong` within 10 s closes the connection and
@@ -368,8 +375,17 @@ they can be stored, but the device never connects to them (`no_config` with `las
   within 10 s, also counts as a failed attempt.
 - Message ids start at 1 on every connection.
 - Name resolution (also `.local` names via mDNS) runs in the background. The TCP connect
-  itself blocks the main loop for up to 2 s (`WEBSOCKETS_TCP_TIMEOUT=2000`) when the host
-  does not answer at all.
+  itself blocks the main loop for up to 2 s when the host does not answer at all. The
+  WebSocket handshake that follows does not block; no `101` answer within 10 s is
+  `handshake_timeout`.
+- The WebSocket client is the project's own (`lib/core/src/ws` codec, `src/ha/WsTransport`
+  adapter). It answers the server's WebSocket pings (Home Assistant's heartbeat) and reads
+  at most 32 KB or 8 ms per main-loop pass, so even multi-MB messages never stall the
+  loop. Messages are assembled in PSRAM, up to 4 MB; above 64 KB a message is only
+  accepted while the largest free PSRAM block is at least 1.5 times its size. A larger,
+  binary or unstorable message is skipped without buffering (`HA frame dropped`) and the
+  connection stays up. Messages over 256 KB are parsed envelope-only (`type`, `id`,
+  `success`, `error`), so they never need a JSON document of their own size.
 - Changing only the path of the address, or `http` to `https` on the same host and port,
   keeps the token; any other address change needs the token again (see Configuration).
 
@@ -454,12 +470,15 @@ All versions are pinned exactly in `platformio.ini`.
 | `bblanchon/ArduinoJson` | 7.4.3 | Config JSON (both envs); current v7 release, custom allocator support for PSRAM |
 | `ESP32Async/AsyncTCP` | 3.5.0 | TCP layer of the web server; maintained fork, core 2.x compatible |
 | `ESP32Async/ESPAsyncWebServer` | 3.12.1 | Web server (middleware, static files); maintained fork, core 2.x compatible. PlatformIO prints "Ignored `Hash` dependency": that dependency is for ESP8266 only |
-| `links2004/WebSockets` | 2.7.3 (`-DWEBSOCKETS_TCP_TIMEOUT=2000`: connect, handshake and read timeouts 2 s instead of 5 s; on the LAN that is ample and shortens the main-loop block when the host is down) | Home Assistant WebSocket client. The plan named 2.7.2, but 2.7.2 passes milliseconds to core 2.x's `WiFiClient::setTimeout()`, which takes seconds (5000 s socket timeouts); 2.7.3 fixes that for core < 3. Its `WEBSOCKETS_MAX_DATA_SIZE` (15 KB) is a plain `#define` and cannot be raised with `-D` |
 | `throwtheswitch/Unity` | 2.6.1 | Host test framework (native env); pinned to the version PlatformIO resolved |
 
+`links2004/WebSockets` 2.7.3 (Step 5) was removed in v0.5.1 (Step 5b.2): it read every frame
+in one blocking loop into an unguarded 15 KB-limited buffer, would silently fall back to an
+unverified TLS connection and could not shorten its TLS handshake timeout. The project's
+own WebSocket client replaces it (no new library).
+
 Licences:
-- LVGL MIT, SensorLib MIT, ArduinoJson MIT, AsyncTCP LGPL-3.0, ESPAsyncWebServer LGPL-3.0,
-  WebSockets (links2004) LGPL-2.1.
+- LVGL MIT, SensorLib MIT, ArduinoJson MIT, AsyncTCP LGPL-3.0, ESPAsyncWebServer LGPL-3.0.
 - Fonts: the Montserrat and FontAwesome Free font files are SIL OFL 1.1; the FontAwesome
   Free icon designs are CC BY 4.0. The generated `src/ui/fonts/*.c` are derived fonts, so
   before any public release the OFL notices (and FontAwesome attribution) must ship with
@@ -480,7 +499,7 @@ src/hal/          Display, Touch, Encoder, Button, Buzzer, PsramAllocator (hardw
 src/config/       ConfigStore (NVS persistence, mutex)
 src/util/         Log.h (non-blocking serial logging)
 src/net/          WifiManager (STA, setup AP, captive DNS, mDNS), WebServer (REST API, static files)
-src/ha/           HaClient (WebSocket transport for HaSession, logging)
+src/ha/           HaClient (HaSession wiring, logging), WsTransport (WebSocket client on WiFiClient)
 src/ui/           Ui (screen manager), Widgets, screens/ (Boot, Setup, Status), fonts/ (generated)
 data/             web UI (index.html, app.js, style.css), flashed with uploadfs
 lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the host
@@ -490,7 +509,8 @@ lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the h
   src/input/      QuadratureDecoder, ButtonFsm, Acceleration, SwipeClassifier
   src/ui/         Presenter (number formatting)
   src/web/        RequestGuard (Host allow-list, CSRF, body limit, Basic auth check)
-  src/util/       MathUtil
+  src/util/       MathUtil, Sha1, Base64
+  src/ws/         WsHandshake, WsFrame, WsReceiver (WebSocket client codec, RFC 6455)
 test/native/      host unit tests (Unity), run with `pio test -e native`
 tools/            serial_check.py, gen_fonts.sh
 ```

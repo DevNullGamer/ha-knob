@@ -46,7 +46,7 @@ HaSession::HaSession(Transport &transport, ArduinoJson::Allocator *allocator)
 
 // ---- Inputs ----------------------------------------------------------------------------
 
-void HaSession::configure(const std::string &url, const std::string &token,
+void HaSession::configure(const std::string &url, const std::string &token, const TlsSettings &tls,
                           const std::vector<std::string> &entityIds, uint32_t nowMs) {
     entityIds_.clear();
     for (const std::string &id : entityIds) {
@@ -54,12 +54,13 @@ void HaSession::configure(const std::string &url, const std::string &token,
             entityIds_.push_back(id);
         }
     }
-    if (!firstConfigure_ && url == url_ && token == token_) {
+    if (!firstConfigure_ && url == url_ && token == token_ && tls == tls_) {
         return;
     }
     firstConfigure_ = false;
     url_ = url;
     token_ = token;
+    tls_ = tls;
     endpoint_ = url.empty() ? HaUrl() : parseHaUrl(url);
 
     closeTransport();
@@ -217,6 +218,16 @@ void HaSession::onText(const char *data, size_t length, uint32_t nowMs) {
     }
 }
 
+void HaSession::onMessageDropped(size_t length, const char *reason, uint32_t nowMs) {
+    (void)length;
+    (void)reason;
+    (void)nowMs;
+    if (!transportOpen_ || !active()) {
+        return;
+    }
+    ++droppedMessages_;
+}
+
 // ---- Internals -------------------------------------------------------------------------
 
 bool HaSession::active() const {
@@ -257,7 +268,7 @@ void HaSession::connect(uint32_t nowMs) {
     transportOpen_ = true;
     setVersion("");  // learned again from this connection's auth_ok
     setState(State::Connecting);
-    transport_.open(endpoint_);
+    transport_.open(endpoint_, tls_);
 }
 
 void HaSession::fail(const std::string &reason, uint32_t nowMs) {

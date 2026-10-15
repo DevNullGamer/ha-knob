@@ -6,25 +6,19 @@
 #include "ha/HaSession.h"
 
 // Home Assistant WebSocket client (plan.md §3.7): core::ha::HaSession (state machine,
-// protocol) on top of links2004 WebSocketsClient. Main loop only (not thread-safe); the
-// web server sees the state through the snapshot the main loop publishes
-// (net::web::publishHa).
-//
-// Transport: the host name is first resolved asynchronously (lwIP DNS in the tcpip task,
-// incl. mDNS for ".local"), so a name that does not resolve never blocks the main loop.
-// The WebSocket library then connects synchronously with the address from the DNS cache
-// (the TCP connect blocks the main loop for up to 2 s, -DWEBSOCKETS_TCP_TIMEOUT=2000, when
-// the host does not answer at all). The library's own reconnect and heartbeat are off:
-// reconnects follow the session's backoff, liveness is the session's HA ping/pong.
-// https endpoints are never connected (HaSession: tls_not_supported; refused here too).
+// protocol) on top of ha::WsTransport (the project's own WebSocket client, see
+// src/ha/WsTransport.h for the transport phases, limits and its serial lines). Main loop
+// only (not thread-safe); the web server sees the state through the snapshot the main loop
+// publishes (net::web::publishHa). Reconnects follow the session's backoff, liveness is the
+// session's HA ping/pong; server WebSocket PINGs are answered by the transport.
+// https endpoints are never connected (HaSession: tls_not_supported; refused by the
+// transport too).
 //
 // Serial lines (the token is never logged, only its length):
 //   HA config url=<url> token_set len=<n>       |  HA config none
-//   HA connect attempt=<n> url=ws://<host>:<port><path>
-//   HA dns host=<host> ok=<0|1>[ ip=<ip>]
-//   HA socket open                               WebSocket handshake done
 //   HA state=<state>[ ha_version=<v>][ error=<error>]
 //   HA retry                                     web UI Retry accepted
+//   HA connect / dns / tcp / socket / rx / frame ...   transport (src/ha/WsTransport.h)
 namespace ha {
 
 struct Status {

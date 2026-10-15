@@ -54,6 +54,10 @@ void WsReceiver::reset() {
     ctrlLen_ = 0;
 }
 
+void WsReceiver::releaseDelivered() {
+    if (delivered_) releaseBuffer();
+}
+
 size_t WsReceiver::messageBytesSoFar() const { return clampSize(msgTotal_); }
 
 bool WsReceiver::fail(Event &ev, const char *reason) {
@@ -130,6 +134,12 @@ bool WsReceiver::beginFrame(Event &ev) {
                         if (doubled > target) target = doubled;
                     }
                     uint8_t *nb = (provider_ != nullptr) ? provider_->grow(buf_, target) : nullptr;
+                    if (nb == nullptr && target > need && provider_ != nullptr) {
+                        // The doubled size may not fit while the exact one does (buf_ is
+                        // still valid after a failed grow).
+                        target = need;
+                        nb = provider_->grow(buf_, target);
+                    }
                     if (nb == nullptr) {
                         startDiscard("no_memory");
                     } else {

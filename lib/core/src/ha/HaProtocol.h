@@ -23,8 +23,16 @@
 //     "service_data" is left out when serviceData is null; "target" when entityId is "".
 // The device never sends supported_features/coalesce_messages, so every frame holds
 // exactly one message (a top-level array is classified as Error).
+//
+// Messages longer than kEnvelopeOnlyBytes are parsed envelope-only: an ArduinoJson filter
+// keeps just "type", "id", "success", "ha_version", "message" and "error.code" /
+// "error.message", so a multi-MB message (e.g. a get_states result) never builds a
+// document of its own size. Such a Message has envelopeOnly set and an empty result() /
+// event() (hasAdded/hasChanged/hasRemoved stay false).
 namespace core {
 namespace ha {
+
+constexpr size_t kEnvelopeOnlyBytes = 256u * 1024u;
 
 std::string buildAuth(const std::string &accessToken, ArduinoJson::Allocator *allocator = nullptr);
 std::string buildPing(uint32_t id, ArduinoJson::Allocator *allocator = nullptr);
@@ -65,6 +73,7 @@ struct Message {
     bool hasAdded = false;
     bool hasChanged = false;
     bool hasRemoved = false;
+    bool envelopeOnly = false;  // parsed with the envelope filter (length > kEnvelopeOnlyBytes)
 
     JsonDocument doc;  // the parsed message (null for Error)
 

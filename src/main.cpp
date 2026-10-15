@@ -7,8 +7,10 @@
 //   BTN down | up | short | long | verylong
 //   TOUCH swipe=<left|right>
 //   HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<..>
-//      wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes>   (every 5 s; ip = STA IP,
-//      else 192.168.4.1 with the setup AP up, else 0.0.0.0; ha = HA connection state)
+//      wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes>
+//      loopmax=<ms>   (every 5 s; ip = STA IP, else 192.168.4.1 with the setup AP up, else
+//      0.0.0.0; ha = HA connection state; heap / heap_min = internal free heap now / lowest
+//      since boot; loopmax = longest loop() pass since the previous HB, without its delay)
 //   CFG ...   config store events (see src/config/ConfigStore.h)
 //   WIFI ...  Wi-Fi events (see src/net/WifiManager.h)
 //   WEB ...   web server events (see src/net/WebServer.h)
@@ -45,6 +47,7 @@ const char *bootCfgSource = "defaults";  // how this boot got its config: defaul
 bool displayOk = false;
 int32_t shownCount = 0;
 uint32_t lastHeartbeatMs = 0;
+uint32_t loopMaxUs = 0;  // longest loop() pass since the last heartbeat
 std::string apPassword;  // shown on the setup screen
 net::wifi::Status shownWifi;
 ui::NetworkView shownView;
@@ -68,13 +71,15 @@ void printHeartbeat(uint32_t nowMs) {
                      : wifi.apActive   ? net::wifi::kApIp
                                        : "0.0.0.0";
     util::logPrintf("HB up=%u psram=%u flash=%u touch=%s count=%d ctl=%u cfg=%s wifi=%s ip=%s ha=%s "
-                    "heap=%u\n",
+                    "heap=%u heap_min=%u loopmax=%u\n",
                     static_cast<unsigned>(nowMs / 1000), static_cast<unsigned>(ESP.getPsramSize()),
                     static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
                     static_cast<int>(shownCount),
                     static_cast<unsigned>(configStore.controlCount()), bootCfgSource,
                     net::wifi::modeName(wifi.mode), ip, core::ha::stateName(ha::status().state),
-                    static_cast<unsigned>(ESP.getFreeHeap()));
+                    static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMinFreeHeap()),
+                    static_cast<unsigned>((loopMaxUs + 999) / 1000));
+    loopMaxUs = 0;
 }
 
 // Publishes Wi-Fi state changes to the web server snapshot and the screens.
@@ -260,6 +265,7 @@ void setup() {
 }
 
 void loop() {
+    const uint32_t startUs = micros();
     const uint32_t nowMs = millis();
 
     handleEncoder();
@@ -281,6 +287,10 @@ void loop() {
     if (displayOk) {
         ui::tick(nowMs);
         lv_timer_handler();
+    }
+    const uint32_t passUs = micros() - startUs;
+    if (passUs > loopMaxUs) {
+        loopMaxUs = passUs;
     }
     delay(kLoopDelayMs);
 }

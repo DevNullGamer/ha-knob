@@ -71,6 +71,11 @@ public:
     // protocol error (used after a reconnect).
     void reset();
 
+    // Frees the buffer of the last Text event now instead of on the next feed()/reset(), so a
+    // large message does not keep its memory while the connection is idle. The event's data
+    // pointer is invalid afterwards. No-op if no Text buffer is held.
+    void releaseDelivered();
+
     // Payload bytes of the data message in progress (0 if none), including bytes that are
     // being discarded.
     size_t messageBytesSoFar() const;

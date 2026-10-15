@@ -25,6 +25,19 @@ JsonDocument makeCommand(uint32_t id, const char *type, ArduinoJson::Allocator *
     return doc;
 }
 
+// The fields parseMessage() looks at, for envelope-only parsing of large messages.
+JsonDocument makeEnvelopeFilter(ArduinoJson::Allocator *allocator) {
+    JsonDocument filter = makeDoc(allocator);
+    filter["type"] = true;
+    filter["id"] = true;
+    filter["success"] = true;
+    filter["ha_version"] = true;
+    filter["message"] = true;
+    filter["error"]["code"] = true;
+    filter["error"]["message"] = true;
+    return filter;
+}
+
 std::string stringOf(JsonVariantConst v) {
     const char *s = v.as<const char *>();
     return s != nullptr && v.is<const char *>() ? std::string(s) : std::string();
@@ -96,8 +109,17 @@ Message::Message(ArduinoJson::Allocator *allocator) : doc(makeDoc(allocator)) {}
 
 Message parseMessage(const char *json, size_t length, ArduinoJson::Allocator *allocator) {
     Message msg(allocator);
-    if (json == nullptr || length == 0 || deserializeJson(msg.doc, json, length) != DeserializationError::Ok ||
-        !msg.doc.is<JsonObjectConst>()) {
+    DeserializationError err = DeserializationError::InvalidInput;
+    if (json != nullptr && length > 0) {
+        if (length > kEnvelopeOnlyBytes) {
+            msg.envelopeOnly = true;
+            const JsonDocument filter = makeEnvelopeFilter(allocator);
+            err = deserializeJson(msg.doc, json, length, DeserializationOption::Filter(filter));
+        } else {
+            err = deserializeJson(msg.doc, json, length);
+        }
+    }
+    if (err != DeserializationError::Ok || !msg.doc.is<JsonObjectConst>()) {
         msg.doc.clear();
         msg.type = MessageType::Error;
         return msg;

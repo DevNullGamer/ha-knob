@@ -202,6 +202,7 @@ void handleStatus(AsyncWebServerRequest *request) {
     doc["fw"] = FW_VERSION;
     doc["uptime_s"] = millis() / 1000;
     doc["heap_free"] = ESP.getFreeHeap();
+    doc["heap_min_free"] = ESP.getMinFreeHeap();
     doc["psram_free"] = ESP.getFreePsram();
     doc["touch_variant"] = touchName;
     JsonObject w = doc["wifi"].to<JsonObject>();
