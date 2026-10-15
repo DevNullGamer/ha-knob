@@ -3,7 +3,7 @@
 
 Usage:
     python tools/http_check.py --ip 192.168.1.143 [--hostname ha-knob] [--reboot]
-                               [--web-password-test]
+                               [--web-password-test] [--tls-config-test]
                                [--ha-test --mock-python PY --mock-host PC_IP
                                 [--mock-port 8765] [--serial-log FILE]]
                                [--ws-test --mock-python PY --mock-host PC_IP --serial-log FILE]
@@ -13,6 +13,12 @@ header unless stated otherwise, like a browser opening http://<ip>/.
 
 Step 5 (always): the status "ha" block, POST /api/ha/retry (200 / 403 without the CSRF
 header / 404 on GET).
+
+--tls-config-test (Step 5b.3; changes the ha section with a fake token and always restores it to
+url "" / no CA / token null): /api/config shows ca_pem and tls_insecure and never a token; 400
+{error, field} for requires_https, not_a_certificate, conflicts_with_ca_pem, not_a_string,
+not_a_boolean, invalid_der and token_required (TLS weakening on an https url with a token
+stored); a valid https + CA + token saves and is returned normalised; tightening keeps the token.
 
 --ha-test (Step 5; changes the ha section and always restores it to url "" / token null):
 runs tools/mockha.py with --mock-python (a Python the Windows firewall lets accept LAN
@@ -209,6 +215,140 @@ def wait_ha(c, want_state, timeout, error_contains=None):
 def set_ha(c, url, token):
     body = json.dumps({"ha": {"url": url, "token": token}})
     return c.request("POST", "/api/config", body=body, headers=post_headers())
+
+
+# Throwaway public test certificate (RSA-2048 self-signed, no key); also in
+# test/native/test_config_tls/test_certs.h.
+TLS_TEST_CA = """-----BEGIN CERTIFICATE-----
+MIIDETCCAfmgAwIBAgIUDpzdr37XTTj3C6/ahUAwRlXcM48wDQYJKoZIhvcNAQEL
+BQAwGDEWMBQGA1UEAwwNVGVzdCBSU0EgUm9vdDAeFw0yNjEwMTUxODI1MTZaFw0z
+NjEwMTIxODI1MTZaMBgxFjAUBgNVBAMMDVRlc3QgUlNBIFJvb3QwggEiMA0GCSqG
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQC2mzSXgaopTusx389VWeJiuv5E1EKnALu3
+u7VUr/Tp2FYRyV449gxohLiprmD6hKBuJEsNAOZAefiPi2Y7kXIEFjep6XdzkhXp
+uzMbAr8WG0Sm7P+58U1vFgOR5DZd3fvf6uxiExQHRPUcS67YxxTSn0d5np0WRpf0
+eXS0unovQAYfC58cKpCXIqt/NXfcqngEL4GCb4oCl+uiXmRcO2V3Ei1MpFzRP1ik
+4IcdRjvxdyjy78g3YT9oG3VSXR3CGvD0b8Jayy4pBhpEUinXfjzOukZ6mth9tPMa
+3aW+h/wye5VWia5/iPON1jbHmH7ObU5UCZjUnIrT3r4UgP0wKvf9AgMBAAGjUzBR
+MB0GA1UdDgQWBBT+8kBFBdF7OQ3qL6w4LKpHdvGx0jAfBgNVHSMEGDAWgBT+8kBF
+BdF7OQ3qL6w4LKpHdvGx0jAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA
+A4IBAQAAFM2gAU/uq7Hxnyb/xXtBg034VYIsW8mZuW0sHjgdMQVmKKo9vu8zEhMv
+Bp5SqwlaYtSmhmjZquRzT8uD2PH1vDqZYrhihMmPmneC0DmoYa7lAnfh5oq6DTyM
+qXgplPD/ATfRjQNUn2iqe0QGbot84v6VDzaEV6GDtc6MTEV6fAlrJQ958CrbOFH8
+ahgAucdGzAoTAQzKoIV8St46rzrUJyciKx4WA8WXRo8g1vXyyU4a6q/plsn34CfZ
+NNmjD5OwsO0oMzWYz06ZtU9mwH5VjNHplT3qSZNpSXlcKHdqMr5P5HA9rrX+nwoh
+arP8Z30Fpkin39mlKbxmze8tgtL3
+-----END CERTIFICATE-----
+"""
+
+
+def run_tls_config_test(c):
+    """Step 5b.3: TLS settings in /api/config (no connect). Restores ha to no config."""
+    print("\n--- Step 5b.3 TLS config API tests (ha section is restored at the end) ---")
+    fake = "faketoken-tls-test-0123456789"
+    url = "https://tls-test.invalid:8443"
+    ca = TLS_TEST_CA
+
+    def post_ha(ha):
+        st, _, raw = c.request("POST", "/api/config", body=json.dumps({"ha": ha}),
+                               headers=post_headers())
+        return st, raw, (c.json_of(raw) or {})
+
+    def get_ha():
+        st, _, raw = c.request("GET", "/api/config")
+        return st, raw, ((c.json_of(raw) or {}).get("ha", {}))
+
+    def rejected(name, ha, field, error):
+        st, raw, body = post_ha(ha)
+        c.check(st == 400 and body.get("field") == field and body.get("error") == error,
+                name, f"status {st}, body {raw[:200]!r}, want {field}/{error}")
+
+    try:
+        st, raw, ha = get_ha()
+        c.expect_status("T: GET /api/config 200", st, 200, raw)
+        c.check(isinstance(ha.get("ca_pem"), str), "T: ha.ca_pem is a string", ha)
+        c.check(isinstance(ha.get("tls_insecure"), bool), "T: ha.tls_insecure is a bool", ha)
+        c.check("token" not in ha, "T: ha has no token key", ha)
+
+        # Clean start, then store a fake token with an https URL (no TLS settings).
+        st, raw, body = post_ha({"url": "", "ca_pem": "", "tls_insecure": False, "token": None})
+        c.expect_status("T: reset to no config", st, 200, raw)
+        st, raw, body = post_ha({"url": url, "ca_pem": "", "tls_insecure": False, "token": fake})
+        c.expect_status("T: https url + token saved", st, 200, raw)
+        st, raw, ha = get_ha()
+        c.check(ha.get("url") == url and ha.get("token_set") is True and ha.get("ca_pem") == ""
+                and ha.get("tls_insecure") is False, "T: GET shows https url, token_set, default TLS", ha)
+        c.check(fake not in raw.decode("utf-8", "replace"), "T: GET /api/config has no token value")
+
+        # Validation errors -> 400 {error, field}
+        rejected("T: http url + CA -> requires_https", {"url": "http://tls-test.invalid:8123", "ca_pem": ca,
+                                                         "tls_insecure": False, "token": fake},
+                 "ha.ca_pem", "requires_https")
+        rejected("T: http url + insecure -> requires_https", {"url": "http://tls-test.invalid:8123",
+                                                               "ca_pem": "", "tls_insecure": True, "token": fake},
+                 "ha.tls_insecure", "requires_https")
+        rejected("T: empty url + insecure -> requires_https", {"url": "", "ca_pem": "", "tls_insecure": True},
+                 "ha.tls_insecure", "requires_https")
+        rejected("T: private key -> not_a_certificate", {"url": url, "ca_pem": "-----BEGIN PRIVATE KEY-----\nAAAA\n"
+                                                         "-----END PRIVATE KEY-----\n", "tls_insecure": False},
+                 "ha.ca_pem", "not_a_certificate")
+        rejected("T: cert + key -> not_a_certificate", {"url": url, "ca_pem": ca + "-----BEGIN PRIVATE KEY-----\n"
+                                                        "AAAA\n-----END PRIVATE KEY-----\n", "tls_insecure": False},
+                 "ha.ca_pem", "not_a_certificate")
+        rejected("T: CA + insecure -> conflicts_with_ca_pem", {"url": url, "ca_pem": ca, "tls_insecure": True,
+                                                                "token": fake},
+                 "ha.tls_insecure", "conflicts_with_ca_pem")
+        rejected("T: ca_pem number -> not_a_string", {"url": url, "ca_pem": 5}, "ha.ca_pem", "not_a_string")
+        rejected("T: tls_insecure string -> not_a_boolean", {"url": url, "tls_insecure": "yes"},
+                 "ha.tls_insecure", "not_a_boolean")
+        rejected("T: truncated cert -> invalid_der or invalid_base64",
+                 {"url": url, "ca_pem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+                  "tls_insecure": False}, "ha.ca_pem", "invalid_der")
+        # Weakening on the https url with the fake token stored and no new token -> token_required.
+        rejected("T: insecure on without token -> token_required", {"url": url, "ca_pem": "", "tls_insecure": True},
+                 "ha.token", "token_required")
+        rejected("T: CA added without token -> token_required", {"url": url, "ca_pem": ca, "tls_insecure": False},
+                 "ha.token", "token_required")
+        rejected("T: CA added with empty token -> token_required", {"url": url, "ca_pem": ca, "tls_insecure": False,
+                                                                     "token": ""}, "ha.token", "token_required")
+        st, raw, ha = get_ha()
+        c.check(ha.get("ca_pem") == "" and ha.get("tls_insecure") is False and ha.get("token_set") is True,
+                "T: rejected patches changed nothing", ha)
+
+        # Valid https + CA + new fake token saves and comes back normalised.
+        messy = "\r\n" + ca.replace("\n", " \t\r\n") + "\r\n\r\n"
+        st, raw, body = post_ha({"url": url, "ca_pem": messy, "tls_insecure": False, "token": fake + "2"})
+        c.expect_status("T: https + CA (CRLF, trailing blanks) + token saved", st, 200, raw)
+        st, raw, ha = get_ha()
+        c.check(ha.get("ca_pem") == ca, "T: ca_pem returned normalised (LF, one trailing LF)",
+                repr(ha.get("ca_pem"))[:120])
+        c.check(ha.get("tls_insecure") is False and ha.get("token_set") is True, "T: tls_insecure false, token_set", ha)
+        c.check(fake not in raw.decode("utf-8", "replace"), "T: GET /api/config has no token value (2)")
+
+        # Same CA resent in another spelling without a token: accepted, token kept.
+        st, raw, body = post_ha({"url": url, "ca_pem": ca.replace("\n", "\r\n"), "tls_insecure": False})
+        c.expect_status("T: same CA resent (CRLF) without token accepted", st, 200, raw)
+        st, raw, ha = get_ha()
+        c.check(ha.get("ca_pem") == ca and ha.get("token_set") is True, "T: CA unchanged, token kept", ha)
+
+        # Tightening keeps the token; weakening again needs one.
+        st, raw, body = post_ha({"url": url, "ca_pem": "", "tls_insecure": False})
+        c.expect_status("T: CA removed without token accepted", st, 200, raw)
+        st, raw, ha = get_ha()
+        c.check(ha.get("ca_pem") == "" and ha.get("token_set") is True, "T: CA removed, token kept", ha)
+        st, raw, body = post_ha({"url": url, "ca_pem": "", "tls_insecure": True, "token": fake + "3"})
+        c.expect_status("T: insecure on with token saved", st, 200, raw)
+        st, raw, body = post_ha({"url": url, "ca_pem": "", "tls_insecure": False})
+        c.expect_status("T: insecure off without token accepted", st, 200, raw)
+        st, raw, ha = get_ha()
+        c.check(ha.get("tls_insecure") is False and ha.get("token_set") is True, "T: insecure off, token kept", ha)
+    finally:
+        st, raw, body = post_ha({"url": "", "ca_pem": "", "tls_insecure": False, "token": None})
+        c.expect_status("T: restore ha to no config", st, 200, raw)
+        st, raw, ha = get_ha()
+        c.check(ha.get("url") == "" and ha.get("ca_pem") == "" and ha.get("tls_insecure") is False
+                and ha.get("token_set") is False, "T: ha restored (no url, no CA, no token)", ha)
+        h, _ = wait_ha(c, "no_config", 15)
+        c.check(h.get("state") == "no_config", "T: ha.state no_config after restore", h)
 
 
 def run_ha_test(c, args):
@@ -912,6 +1052,8 @@ def run(args):
             if first_ip_ok:
                 print(f"      Host=ip accepted {first_ip_ok:.1f} s after the reboot request")
 
+    if args.tls_config_test:
+        run_tls_config_test(c)
     if args.ha_test:
         run_ha_test(c, args)
     if args.ws_test:
@@ -932,6 +1074,8 @@ def main():
                    help="number of complete Wi-Fi scan cycles to require (default 1)")
     p.add_argument("--web-password-test", action="store_true",
                    help="set a random web password, test 401/200, then clear it")
+    p.add_argument("--tls-config-test", action="store_true",
+                   help="Step 5b.3 ha.ca_pem / ha.tls_insecure API tests (restores the ha section)")
     p.add_argument("--ha-test", action="store_true",
                    help="Step 5 on-device tests against tools/mockha.py (restores the ha section)")
     p.add_argument("--ws-test", action="store_true",

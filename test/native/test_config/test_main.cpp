@@ -12,6 +12,7 @@
 
 #include "config/ConfigModel.h"
 #include "control/DomainActions.h"
+#include "util/Base64.h"
 
 namespace cfg = core::config;
 namespace da = core::domain_actions;
@@ -71,6 +72,25 @@ cfg::Config fullConfig() {
         ctl("input_boolean.guest_mode", "none", 0, "none"),
     };
     return c;
+}
+
+// A structurally valid (DER shape only) CERTIFICATE block of exactly `total` bytes,
+// already in normalised form.
+std::string certShapedPem(size_t total) {
+    const size_t bodyChars = 3980;  // multiple of 4
+    const size_t lines = total - 28 - 26 - bodyChars;
+    std::vector<uint8_t> der(bodyChars / 4 * 3, 0);
+    const size_t inner = der.size() - 8;  // outer 30 82 hh ll, inner 30 82 hh ll
+    der[0] = 0x30; der[1] = 0x82; der[2] = static_cast<uint8_t>((der.size() - 4) >> 8);
+    der[3] = static_cast<uint8_t>((der.size() - 4) & 0xFF);
+    der[4] = 0x30; der[5] = 0x82; der[6] = static_cast<uint8_t>(inner >> 8);
+    der[7] = static_cast<uint8_t>(inner & 0xFF);
+    const std::string b64 = core::util::base64Encode(der.data(), der.size());
+    std::string out = "-----BEGIN CERTIFICATE-----\n";
+    const size_t width = (b64.size() + lines - 1) / lines;
+    for (size_t pos = 0; pos < b64.size(); pos += width) out += b64.substr(pos, width) + "\n";
+    out += "-----END CERTIFICATE-----\n";
+    return out;
 }
 
 std::string repeat(const std::string &s, size_t n) {
@@ -160,7 +180,7 @@ static void test_round_trip_spec_example_string_equal() {
         "\"off_after_s\":300,\"buzzer\":true,\"encoder_reverse\":false,\"accel\":true,"
         "\"send_interval_ms\":250},"
         "\"wifi\":{\"ssid\":\"MyNetwork\"},"
-        "\"ha\":{\"url\":\"http://192.168.1.10:8123\"},"
+        "\"ha\":{\"url\":\"http://192.168.1.10:8123\",\"ca_pem\":\"\",\"tls_insecure\":false},"
         "\"controls\":["
         "{\"entity_id\":\"light.kitchen\",\"label\":\"\",\"action\":\"brightness\",\"step\":5,\"press\":\"toggle\"},"
         "{\"entity_id\":\"light.kitchen\",\"label\":\"Kitchen colour\",\"action\":\"color_temp\",\"step\":100,\"press\":\"toggle\"},"
@@ -716,7 +736,7 @@ static void test_duplicate_entity_ids_allowed() {
 // Size limit
 // ---------------------------------------------------------------------------
 
-static void test_24_controls_48_byte_labels_fit_8kb() {
+static void test_24_controls_48_byte_labels_fit_limit() {
     cfg::Config c = fullConfig();
     c.controls.clear();
     const char *entities[] = {"media_player.living_room_speaker_group", "light.kitchen_ceiling_spots",
@@ -731,7 +751,7 @@ static void test_24_controls_48_byte_labels_fit_8kb() {
                                  label.c_str()));
     }
     const std::string json = cfg::toJson(c);
-    TEST_ASSERT_TRUE_MESSAGE(json.size() <= 8192, std::to_string(json.size()).c_str());
+    TEST_ASSERT_TRUE_MESSAGE(json.size() <= cfg::kMaxConfigJsonBytes, std::to_string(json.size()).c_str());
     assertValid(c);
     const cfg::LoadResult r = load(json);
     TEST_ASSERT_EQUAL_INT(static_cast<int>(cfg::LoadStatus::Loaded), static_cast<int>(r.status));
@@ -750,16 +770,29 @@ static void test_oversize_config_too_large() {
     for (int i = 0; i < 24; ++i) {
         c.controls.push_back(ctl(id.c_str(), "volume", 2, "play_pause", std::string(48, 'L').c_str()));
     }
+    // 24 x 255-char ids is 9361 bytes: valid since the limit went from 8192 to 12288.
     TEST_ASSERT_TRUE(cfg::toJson(c).size() > 8192);
+    assertValid(c);
+    // Add a large (4096-byte, structurally valid) CA on an https URL to push it over
+    // kMaxConfigJsonBytes.
+    c.ha.url = "https://ha.example.com";
+    c.ha.caPem = certShapedPem(4096);
+    TEST_ASSERT_EQUAL_size_t(4096, c.ha.caPem.size());
+    TEST_ASSERT_TRUE(cfg::toJson(c).size() > cfg::kMaxConfigJsonBytes);
     const cfg::ValidationResult r = cfg::validate(c);
     TEST_ASSERT_FALSE(r.ok);
     TEST_ASSERT_EQUAL_STRING("controls", r.field.c_str());
     TEST_ASSERT_EQUAL_STRING("too_large", r.message.c_str());
 
-    // The same through mergePatch.
-    const std::string patch = "{\"controls\":" +
-                              cfg::toJson(c).substr(cfg::toJson(c).find("\"controls\":") + 11);
-    const std::string trimmed = patch.substr(0, patch.size());  // ends with "]}"
+    // The same through mergePatch (ha + controls sections of the oversize config).
+    JsonDocument patchDoc;
+    TEST_ASSERT_TRUE(deserializeJson(patchDoc, cfg::toJson(c)) == DeserializationError::Ok);
+    patchDoc.remove("schema");
+    patchDoc.remove("device");
+    patchDoc.remove("wifi");
+    patchDoc["ha"]["token"] = "tok";
+    std::string trimmed;
+    serializeJson(patchDoc, trimmed);
     const cfg::MergeResult m = merge(cfg::Config(), trimmed);
     TEST_ASSERT_FALSE(m.ok);
     TEST_ASSERT_EQUAL_STRING("controls", m.error.field.c_str());
@@ -1431,7 +1464,7 @@ int main() {
     RUN_TEST(test_validate_reports_index_of_bad_control);
     RUN_TEST(test_duplicate_entity_ids_allowed);
     // Size
-    RUN_TEST(test_24_controls_48_byte_labels_fit_8kb);
+    RUN_TEST(test_24_controls_48_byte_labels_fit_limit);
     RUN_TEST(test_oversize_config_too_large);
     // Redaction
     RUN_TEST(test_redacted_flags_and_no_secret_values);
