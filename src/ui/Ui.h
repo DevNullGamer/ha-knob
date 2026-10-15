@@ -28,6 +28,7 @@ struct HaView {
     core::ha::State state = core::ha::State::NoConfig;
     std::string haVersion;
     std::string lastError;
+    core::ha::TlsMode tls = core::ha::TlsMode::None;
     bool networkUp = false;  // Wi-Fi station connected
 };
 

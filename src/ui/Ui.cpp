@@ -87,11 +87,7 @@ void showHa(const HaView &view) {
     std::string line;
     switch (view.state) {
         case State::NoConfig:
-            if (view.lastError == "tls_not_supported") {
-                line = "HA: https not supported";
-            } else {
-                line = view.lastError.empty() ? "HA: not configured" : "HA: invalid address";
-            }
+            line = view.lastError.empty() ? "HA: not configured" : "HA: invalid address";
             break;
         case State::Connecting:
         case State::Authenticating:
@@ -99,7 +95,13 @@ void showHa(const HaView &view) {
             line = "HA: connecting...";
             break;
         case State::Ready:
-            line = view.haVersion.empty() ? "HA: connected" : "HA: connected (" + view.haVersion + ")";
+            if (view.tls == core::ha::TlsMode::Insecure) {
+                // " (TLS unverified)" instead of the version, so the warning fits the label
+                // (the version is shown in the web UI).
+                line = "HA: connected (TLS unverified)";
+            } else {
+                line = view.haVersion.empty() ? "HA: connected" : "HA: connected (" + view.haVersion + ")";
+            }
             break;
         case State::AuthFailed:
             line = "HA: token rejected";

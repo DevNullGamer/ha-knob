@@ -219,6 +219,7 @@ void handleStatus(AsyncWebServerRequest *request) {
     h["state"] = core::ha::stateName(haNow.state);
     h["ha_version"] = haNow.haVersion;
     h["last_error"] = haNow.lastError;
+    h["tls"] = core::ha::tlsModeName(haNow.tls);
     sendJson(request, 200, doc);
 }
 

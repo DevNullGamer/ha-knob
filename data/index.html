@@ -60,6 +60,7 @@
       <dt>Home Assistant version</dt><dd id="ha-version">-</dd>
       <dt>Last error</dt><dd id="ha-error">-</dd>
       <dt>Stored address</dt><dd id="ha-current">-</dd>
+      <dt>Certificate check</dt><dd id="ha-tls-state">-</dd>
       <dt>Token</dt><dd id="ha-token-set">-</dd>
     </dl>
     <div class="row">
@@ -70,13 +71,35 @@
         <input id="ha-url" maxlength="300" spellcheck="false" autocapitalize="off"
                placeholder="http://homeassistant.local:8123">
       </label>
+      <fieldset id="ha-tls" hidden>
+        <legend>Certificate (https)</legend>
+        <p class="hint">Leave the field empty if Home Assistant uses a certificate from a public
+          certificate authority (e.g. Let's Encrypt). For a self-signed certificate or your own
+          CA, paste the CA certificate: only the <code>-----BEGIN CERTIFICATE-----</code> ...
+          <code>-----END CERTIFICATE-----</code> block(s), up to 3, nothing else (no
+          <code>subject=</code> lines, never a private key).</p>
+        <label>CA certificate (PEM)
+          <textarea id="ha-ca-pem" rows="6" spellcheck="false" autocapitalize="off"
+                    placeholder="empty = public certificate authorities"></textarea>
+        </label>
+        <p class="hint">With an IP address in the address above, the certificate is only accepted
+          if its name (CN) is exactly that IP address and it has no other names (SAN). Otherwise
+          use the host name the certificate was issued for. The device supports TLS 1.2 and does
+          not check certificate expiry dates.</p>
+        <label class="check"><input id="ha-tls-insecure" type="checkbox"> Do not verify the
+          certificate (insecure)</label>
+        <p id="ha-insecure-warning" class="hint warning" hidden>Certificate verification is off:
+          anyone who can intercept the connection can pretend to be Home Assistant and capture the
+          token. Use this only on a network you trust.</p>
+      </fieldset>
       <label>Long-lived access token
         <input id="ha-token" type="password" maxlength="512" autocomplete="new-password"
                placeholder="leave empty to keep the stored token">
       </label>
       <p class="hint">Create the token in Home Assistant under your user profile, Security,
         "Long-lived access tokens". Use a dedicated non-admin user for the knob. A new
-        address (another host or port) always needs the token again.</p>
+        address (another host or port) always needs the token again, and so does a weaker
+        certificate check (turning verification off or a different CA certificate).</p>
       <div class="row">
         <button type="submit">Save Home Assistant</button>
         <button type="button" id="ha-forget" class="danger">Remove Home Assistant</button>

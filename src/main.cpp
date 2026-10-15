@@ -105,6 +105,14 @@ void publishNetwork() {
     shownView = view;
 }
 
+// How an https Home Assistant URL is verified (ha.tls_insecure, ha.ca_pem).
+core::ha::TlsSettings haTlsSettings(const core::config::Config &config) {
+    core::ha::TlsSettings tls;
+    tls.insecure = config.ha.tlsInsecure;
+    tls.caPem = config.ha.caPem;
+    return tls;
+}
+
 // Publishes Home Assistant connection changes to the web server snapshot and the screens.
 void publishHa() {
     const ha::Status &status = ha::status();
@@ -123,6 +131,7 @@ void publishHa() {
         view.state = status.state;
         view.haVersion = status.haVersion;
         view.lastError = status.lastError;
+        view.tls = status.tls;
         view.networkUp = networkUp;
         ui::showHa(view);
     }
@@ -137,7 +146,7 @@ void handleWebRequests(uint32_t nowMs) {
         }
         net::wifi::applyConfig(config.wifi.ssid, configStore.wifiPassword(), config.device.hostname,
                                nowMs);
-        ha::configure(config.ha.url, configStore.haToken(), nowMs);
+        ha::configure(config.ha.url, configStore.haToken(), haTlsSettings(config), nowMs);
     }
 
     if (net::web::takeHaRetry()) {
@@ -258,7 +267,7 @@ void setup() {
                      millis());
     publishNetwork();  // the web server guards need the network state from the start
     ha::begin();
-    ha::configure(config.ha.url, configStore.haToken(), millis());
+    ha::configure(config.ha.url, configStore.haToken(), haTlsSettings(config), millis());
     publishHa();
     net::web::begin(configStore, hal::touch::variantName());
     printBootLine();

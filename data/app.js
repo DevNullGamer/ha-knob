@@ -9,6 +9,7 @@ const $ = (id) => document.getElementById(id);
 let config = null;          // last GET /api/config
 let statusTimer = null;     // polls /api/status while the Status or Home Assistant tab is open
 let followTimer = null;
+let haFormFilled = false;   // the certificate fields were filled from the stored config
 
 // ---- API ---------------------------------------------------------------------------
 
@@ -29,6 +30,9 @@ async function api(method, path, body) {
   return { status: response.status, ok: response.ok, data };
 }
 
+const PEM_ONLY = 'Paste only the -----BEGIN CERTIFICATE----- ... -----END CERTIFICATE----- ' +
+  'block(s) of the CA, nothing else (no "subject=" or "issuer=" lines, never a private key).';
+
 const ERROR_TEXT = {
   password_required: 'A new network needs its password (or tick "Open network").',
   token_required: 'A new Home Assistant address needs a new token.',
@@ -42,10 +46,24 @@ const ERROR_TEXT = {
   body_too_large: 'The request is too large.',
 };
 
-function describeError(result) {
+// Texts for one field's error codes (checked before ERROR_TEXT).
+const FIELD_ERROR_TEXT = {
+  'ha.ca_pem/length': 'The CA certificate text is too long (at most 4096 characters). ' + PEM_ONLY,
+  'ha.ca_pem/not_a_certificate': 'This is not a CA certificate. ' + PEM_ONLY,
+  'ha.ca_pem/too_many': 'At most 3 certificates. ' + PEM_ONLY,
+  'ha.ca_pem/invalid_base64': 'The certificate text is damaged or incomplete. ' + PEM_ONLY,
+  'ha.ca_pem/invalid_der': 'The certificate text is damaged or incomplete. ' + PEM_ONLY,
+  'ha.ca_pem/requires_https': 'A CA certificate is only used with an https:// address.',
+  'ha.tls_insecure/requires_https': '"Do not verify" is only used with an https:// address.',
+  'ha.tls_insecure/conflicts_with_ca_pem': 'Use either a CA certificate or "Do not verify", not both.',
+};
+
+// errorText(data) may return a better text for a 4xx/5xx answer (or null).
+function describeError(result, errorText) {
   if (result.status === 401) return 'Not authorised: reload the page and enter the web password.';
   const data = result.data || {};
-  const text = ERROR_TEXT[data.error] || data.error || ('HTTP ' + result.status);
+  const text = (errorText && errorText(data)) || FIELD_ERROR_TEXT[data.field + '/' + data.error] ||
+    ERROR_TEXT[data.error] || data.error || ('HTTP ' + result.status);
   return data.field ? data.field + ': ' + text : text;
 }
 
@@ -114,8 +132,27 @@ const HA_STATE_TEXT = {
 };
 
 const HA_CONFIG_ERROR_TEXT = {
-  tls_not_supported: 'not connecting: https is not supported, use the http:// address',
   invalid_url: 'not connecting: the stored address cannot be used',
+};
+
+const TLS_TEXT = {
+  none: 'not used (http)',
+  bundle: 'public certificate authorities (built-in list)',
+  custom_ca: 'own CA certificate',
+  insecure: 'OFF: the certificate is not verified (insecure)',
+};
+
+// Explanations shown next to last_error.
+const HA_ERROR_TEXT = {
+  tls_cert_rejected: 'the server certificate was not accepted. With a public certificate leave ' +
+    'the CA field empty; with your own CA paste that CA. With an IP address in the URL the ' +
+    'certificate is only accepted if its name (CN) is exactly that IP address and it has no other ' +
+    'names (SAN): use the host name the certificate was issued for, or "Do not verify".',
+  tls_ca_invalid: 'the stored CA certificate cannot be used by the device. ' + PEM_ONLY,
+  tls_handshake_failed: 'the TLS connection failed. The port may not speak https, or the server ' +
+    'only allows TLS 1.3 (the device supports TLS 1.2).',
+  tls_timeout: 'the server did not complete the TLS handshake in time.',
+  connect_failed: 'the address could not be reached (wrong host or port, or the server is down).',
 };
 
 function haSummary(ha) {
@@ -123,14 +160,18 @@ function haSummary(ha) {
   if (ha.state === 'no_config' && HA_CONFIG_ERROR_TEXT[ha.last_error]) {
     return HA_CONFIG_ERROR_TEXT[ha.last_error];
   }
-  const text = HA_STATE_TEXT[ha.state] || ha.state;
-  return ha.state === 'ready' && ha.ha_version ? text + ' (' + ha.ha_version + ')' : text;
+  let text = HA_STATE_TEXT[ha.state] || ha.state;
+  if (ha.state === 'ready' && ha.ha_version) text += ' (' + ha.ha_version + ')';
+  if (ha.state === 'ready' && ha.tls === 'insecure') text += ', certificate NOT verified';
+  return text;
 }
 
 function renderHa(ha) {
   $('ha-state').textContent = haSummary(ha);
   $('ha-version').textContent = (ha && ha.ha_version) || '-';
-  $('ha-error').textContent = (ha && ha.last_error) || '-';
+  const error = (ha && ha.last_error) || '';
+  $('ha-error').textContent = error ? (HA_ERROR_TEXT[error] ? error + ': ' + HA_ERROR_TEXT[error] : error) : '-';
+  $('ha-tls-state').textContent = (ha && (TLS_TEXT[ha.tls] || ha.tls)) || '-';
   $('ha-retry').disabled = !ha || (ha.state !== 'auth_failed' && ha.state !== 'backoff');
 }
 
@@ -210,15 +251,23 @@ async function loadConfig() {
   $('ha-current').textContent = ha.url || 'none';
   $('ha-token-set').textContent = ha.token_set ? 'stored' : 'not stored';
   if (!$('ha-url').value) $('ha-url').value = ha.url || '';
+  if (!haFormFilled) {
+    // Only once: a failed save must not overwrite what the user is editing.
+    haFormFilled = true;
+    $('ha-ca-pem').value = ha.ca_pem || '';
+    $('ha-tls-insecure').checked = !!ha.tls_insecure;
+  }
+  updateHaTlsForm();
 }
 
 // Sends a patch. Sections are replaced as a whole, so callers always send complete ones.
-async function savePatch(patch, successText) {
+// errorText: optional, see describeError().
+async function savePatch(patch, successText, errorText) {
   try {
     const result = await api('POST', '/api/config', patch);
     await loadConfig().catch(() => {});  // show the *_set flags as stored now
     if (!result.ok) {
-      showMessage(describeError(result), 'error');
+      showMessage(describeError(result, errorText), 'error');
       return null;
     }
     showMessage(successText, 'success');
@@ -348,6 +397,56 @@ async function forgetWifi() {
 
 // ---- Home Assistant ----------------------------------------------------------------
 
+function isHttps(url) {
+  return /^https:/i.test(url);
+}
+
+// The certificate fields apply to https addresses only; "Do not verify" replaces the CA.
+function updateHaTlsForm() {
+  const https = isHttps($('ha-url').value.trim());
+  const insecure = $('ha-tls-insecure').checked;
+  $('ha-tls').hidden = !https;
+  $('ha-ca-pem').disabled = insecure;
+  $('ha-insecure-warning').hidden = !insecure;
+}
+
+function confirmInsecure() {
+  if ($('ha-tls-insecure').checked &&
+      !confirm('Turn off certificate verification? Anyone who can intercept the connection could ' +
+        'pretend to be Home Assistant and capture the token. Use this only on a network you trust.')) {
+    $('ha-tls-insecure').checked = false;
+  }
+  updateHaTlsForm();
+}
+
+// The PEM as the device stores it (CRLF -> LF, trailing blanks per line removed, trimmed,
+// one final LF), so an unchanged CA is recognised.
+function normalizePem(text) {
+  const pem = text.replace(/\r\n?/g, '\n').split('\n').map((l) => l.replace(/[ \t]+$/, '')).join('\n').trim();
+  return pem ? pem + '\n' : '';
+}
+
+// "https:", host and port of an address, or null.
+function endpointOf(url) {
+  try {
+    const u = new URL(url);
+    return { https: u.protocol === 'https:', host: u.hostname.toLowerCase(),
+      port: u.port || (u.protocol === 'https:' ? '443' : '80') };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Mirrors the device's rule: on the same https host:port, turning verification off or a
+// different CA certificate needs the token again (else the address changed).
+function trustWeakened(oldHa, newHa) {
+  const a = endpointOf(oldHa.url || '');
+  const b = endpointOf(newHa.url);
+  if (!a || !b || !a.https || !b.https || a.host !== b.host || a.port !== b.port) return false;
+  return (newHa.tls_insecure && !oldHa.tls_insecure) ||
+    (newHa.ca_pem !== '' && newHa.ca_pem !== (oldHa.ca_pem || ''));
+}
+
 async function saveHa(event) {
   event.preventDefault();
   if (!config) return;
@@ -357,17 +456,28 @@ async function saveHa(event) {
     showMessage('Enter the Home Assistant address, or use "Remove Home Assistant".', 'error');
     return;
   }
-  if (/^https:/i.test(url)) {
-    showMessage('https is not supported: the device would not connect. Use the http:// address ' +
-      '(Home Assistant on the local network).', 'error');
-    return;
-  }
   if (!token && !(config.ha && config.ha.token_set)) {
     showMessage('Enter the long-lived access token.', 'error');
     return;
   }
-  // The URL goes with every ha section; an empty token keeps the stored one.
-  const result = await savePatch({ ha: { url: url, token: token } }, 'Home Assistant saved. Connecting...');
+  const https = isHttps(url);
+  const insecure = https && $('ha-tls-insecure').checked;
+  // Every ha section carries url, ca_pem and tls_insecure (sections are replaced as a whole);
+  // an empty token keeps the stored one.
+  const ha = {
+    url: url,
+    ca_pem: https && !insecure ? normalizePem($('ha-ca-pem').value) : '',
+    tls_insecure: insecure,
+    token: token,
+  };
+  const oldHa = config.ha || {};
+  const result = await savePatch({ ha: ha }, 'Home Assistant saved. Connecting...', (data) => {
+    if (data.error !== 'token_required') return null;
+    return trustWeakened(oldHa, ha)
+      ? 'A weaker certificate check (verification turned off, or a different CA certificate) ' +
+        'needs the token again: enter the long-lived access token and save.'
+      : null;
+  });
   if (!result) return;
   $('ha-token').value = '';
   loadStatus();
@@ -375,10 +485,14 @@ async function saveHa(event) {
 
 async function forgetHa() {
   if (!confirm('Remove the Home Assistant address and token from the device?')) return;
-  const result = await savePatch({ ha: { url: '', token: null } }, 'Home Assistant removed.');
+  const result = await savePatch({ ha: { url: '', ca_pem: '', tls_insecure: false, token: null } },
+    'Home Assistant removed.');
   if (result) {
     $('ha-url').value = '';
     $('ha-token').value = '';
+    $('ha-ca-pem').value = '';
+    $('ha-tls-insecure').checked = false;
+    updateHaTlsForm();
     loadStatus();
   }
 }
@@ -458,6 +572,8 @@ document.addEventListener('DOMContentLoaded', () => {
     $('wifi-password').disabled = $('wifi-open').checked;
   });
   $('ha-form').addEventListener('submit', saveHa);
+  $('ha-url').addEventListener('input', updateHaTlsForm);
+  $('ha-tls-insecure').addEventListener('change', confirmInsecure);
   $('ha-forget').addEventListener('click', forgetHa);
   $('ha-retry').addEventListener('click', retryHa);
   $('device-form').addEventListener('submit', saveDevice);

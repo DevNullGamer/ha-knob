@@ -6,7 +6,7 @@ Guidance for AI assistants working in this repository.
 
 HA Knob: Home Assistant controller firmware for the LilyGo T-Encoder Pro (ESP32-S3R8,
 16 MB flash, 8 MB OPI PSRAM, 390x390 round AMOLED, touch, rotary encoder, buzzer).
-PlatformIO + Arduino framework. Current version 0.5.1 (Step 5b.2: own WebSocket client, large messages).
+PlatformIO + Arduino framework. Current version 0.5.2 (Step 5b.4: https / wss to Home Assistant).
 
 The approved specification and change log live outside the repo in
 `~/.claude/workspace/chgreq/LilyGo T-encoderPro - HA Controller/chg001/`.
@@ -255,10 +255,10 @@ line, not only on `BOOT`.
   Ready. `ha_version` is cleared by every new attempt.
 - `ha.url` validation and the token guard accept exactly what v0.4.0 accepted. `HaUrl`
   flags a `?`/`#` (`hasQueryOrFragment`); the session refuses such a URL (`no_config`,
-  `invalid_url`). **https URLs are refused by the session** (`no_config`,
-  `tls_not_supported`, `Transport::open` never called; the adapter also refuses a TLS
-  endpoint): TLS is out of scope (Q3) and the token must never go to a TLS port in
-  plaintext. `validate()` still accepts https so no stored config becomes invalid.
+  `invalid_url`). Until Step 5b.4 the session refused https URLs (`no_config`,
+  `tls_not_supported`, `Transport::open` never called; the adapter refused a TLS endpoint
+  too) so the token never went to a TLS port in plaintext; since 5b.4 they connect over
+  wss. `validate()` always accepted https, so no stored config became invalid.
 - Transport: the host is resolved first with lwIP `dns_gethostbyname` run in the tcpip task
   (`tcpip_callback`), so an unresolvable name never blocks the main loop (kept in Step 5b.2).
 - `HB` gained `ha=<state> heap=<bytes>`. Free heap: 167 KB at boot (Step 4: ~169 KB),
@@ -300,8 +300,8 @@ line, not only on `BOOT`.
   ArduinoJson filter (`type`, `id`, `success`, `ha_version`, `message`, `error.code`,
   `error.message`), `Message::envelopeOnly`; peak allocation for 1 MB about 8 KB.
 - `HaSession::configure(url, token, TlsSettings, ids, now)` restarts on a TLS settings
-  change too; `Transport::open(endpoint, tls)`. https is still refused
-  (`tls_not_supported`) until Step 5b.4; the adapter refuses a TLS endpoint as well.
+  change too; `Transport::open(endpoint, tls)`. In 5b.2/5b.3 https was still refused
+  (`tls_not_supported`, also by the adapter); lifted in Step 5b.4.
 - `HB` gained `heap_min=` (lowest internal free heap since boot) and `loopmax=` (longest
   main-loop pass in ms since the previous HB, without the 5 ms delay); `/api/status` gained
   top-level `heap_min_free`.
@@ -338,14 +338,63 @@ line, not only on `BOOT`.
   host:port, and insecure false -> true or a non-empty CA different from the stored one ->
   `ha.token`/`token_required` unless the patch sets a token. Tightening and http -> https
   keep the token. Insecure -> custom CA also asks for the token (spec rule taken literally).
-- Not wired yet: `ha::configure` still passes default `TlsSettings` (HaClient signature
-  change belongs to 5b.4); https stays refused with `tls_not_supported`. The web UI does not
-  send the TLS fields yet, which resets them to defaults on save (fine while it only
-  accepts http URLs).
+- Until 5b.4, `ha::configure` passed default `TlsSettings` (the HaClient signature change
+  came with 5b.4), https was refused with `tls_not_supported`, and the web UI did not send
+  the TLS fields (a save reset them to defaults). All three were resolved in 5b.4.
+
+## Step 5b.4 (2026-10-15)
+
+- https URLs connect over wss (`tls_not_supported` is gone). `HaSession` opens them with
+  `endpoint.tls` and the `TlsSettings` from the config (`ha::configure(url, token, tls, now)`;
+  main.cpp builds them with `haTlsSettings(config)`). `core::ha::TlsMode`
+  (`none|bundle|custom_ca|insecure`, `tlsModeFor()`, `tlsModeName()`; CA wins if both are
+  set) is reported as `/api/status ha.tls` and in `HA config ... tls=`.
+- **TLS rules (WsTransport):** exactly one mode per attempt, never a fallback (to another
+  mode or to plaintext). The one `SecureClient` is reset before every attempt
+  (`stop()`, `setCACert(nullptr)` clears CA + insecure, `setCACertBundle(nullptr)`), then
+  `setTimeout(2)` (seconds; TCP connect + socket I/O), `setHandshakeTimeout(4)`, and one of
+  `setInsecure()` / CA PEM passed to `connect(ip, port, host, caPem, nullptr, nullptr)` /
+  `setCACertBundle(_binary_x509_crt_bundle_start)`. Always connect with the pre-resolved IP
+  and the URL host (SNI + name check). Never call `setCACertBundle` with anything but the
+  IDF bundle symbol, never use `connect(host, ...)` (blocking DNS).
+- **Core bug worked around (`ha::SecureClient`):** `WiFiClientSecure::stop()` leaves
+  `sslclient->socket` at 0 (stop_ssl_socket zeroes the context), so `fd()` reports 0 and
+  the next `stop()` calls `close(0)`, closing whatever VFS fd 0 is (stdin, later possibly a
+  LittleFS file of the web server). `SecureClient::stop()` resets it to -1. Use
+  `SecureClient`, never a bare `WiFiClientSecure`.
+- A custom CA is parsed with `mbedtls_x509_crt_parse` before connecting; any failure
+  (also a partial one) is `tls_ca_invalid` with no connection.
+- Error mapping: `-0x2700` (and `-0x3000` in bundle mode: the bundle's verify callback
+  returns FATAL_ERROR for an unknown issuer) -> `tls_cert_rejected`; core `-1` ->
+  `tls_timeout` if >= 4 s elapsed, else `connect_failed` (the core returns -1 for both);
+  other negative codes -> `tls_handshake_failed`. Serial: `HA tls mode= host=`,
+  `WARN HA tls verify=off` (every insecure connect), `HA tls ok ms= heap=`,
+  `HA tls failed error= code=-0x.... ms= msg=<60 chars>`.
+- R9 verified: `_binary_x509_crt_bundle_start` (136 CAs, 63.7 KB, flash rodata) links and
+  `setCACertBundle` accepts it (`https://www.google.com` -> `tls ok ms=~900`, then
+  `handshake_failed: http 404`, as expected for a non-HA host).
+- R8: TLS failures add 1-3 core `[E]` lines per attempt (`ssl_client.cpp _handle_error`,
+  `WiFiClientSecure.cpp connect(): start_ssl_client: <code>`, bundle: `esp_crt_bundle.c
+  Failed to verify certificate`); a TLS peer reset/EOF while open adds one
+  (`data_to_read(): (-80)`). Rate-limited by the backoff, no flood, no blocking.
+- Measured against a LAN mock (RSA-2048, TLS 1.2 ECDHE-RSA-AES256-GCM): handshake
+  0.41-0.47 s; internal heap ~119 KB right after connect, settling at ~115.5 KB over many
+  reconnects (no leak over 67 close/reconnect cycles; the first ~15 cycles cost ~230 B
+  each, then flat), `heap_min` ~105 KB; ~152-156 KB without a connection; 3 MB message
+  over TLS in 6.9-7.3 s (~410-435 KB/s, `handle_ms` ~450 for the envelope-only parse);
+  stalled handshake `tls_timeout` after 4.02 s (`loopmax` 4027). App 1.76 MB (+188 KB).
+- Web UI: "Certificate (https)" fieldset (CA textarea, "Do not verify" checkbox with
+  confirm() and warning), "Certificate check" row from `ha.tls`, explanations for the TLS
+  `last_error` values (IP-address hint on `tls_cert_rejected`, "paste only the BEGIN/END
+  CERTIFICATE blocks" on CA errors), a distinct `token_required` text when the trust was
+  weakened on the same address. Remove sends
+  `{url:"", ca_pem:"", tls_insecure:false, token:null}`.
+- Status screen: "HA: connected (TLS unverified)" in insecure mode (the version is left
+  out so the warning fits the 340 px label).
 
 ## Upcoming requirements
 
-- Home Assistant is reached over plain `http`/`ws` on the LAN; TLS is not planned.
+- Home Assistant is reached over `http`/`ws` or `https`/`wss` (Step 5b.4).
 
 ## Secrets
 

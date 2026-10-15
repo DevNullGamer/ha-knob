@@ -15,7 +15,8 @@ class ConfigStore;
 //
 // Endpoints:
 //   GET  /api/status         device, Wi-Fi and HA state (heap_free / heap_min_free = internal
-//                            heap now / lowest since boot; ha:{state, ha_version, last_error})
+//                            heap now / lowest since boot; ha:{state, ha_version, last_error,
+//                            tls: none|bundle|custom_ca|insecure})
 //   GET  /api/config         redacted config (secrets only as *_set flags)
 //   POST /api/config         patch (ConfigStore::applyPatch): 200 {ok,restart_wifi},
 //                            400 {error,field}, 500 {error:"nvs_write_failed",field}

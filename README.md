@@ -4,7 +4,7 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.5.1, Step 5b.2 (own WebSocket client, large messages).** The firmware drives the hardware
+**Status: v0.5.2, Step 5b.4 (https / wss to Home Assistant).** The firmware drives the hardware
 (display, touch swipes, encoder, button, buzzer), loads its configuration from NVS, joins
 Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home Assistant and
 device settings, and keeps an authenticated, self-healing WebSocket connection to Home
@@ -23,7 +23,8 @@ Assistant. Entity selection and control come in later steps.
 5. From then on the setup page is at `http://<device IP>/` or `http://ha-knob.local/` (the
    status screen shows both).
 6. In the **Home Assistant** tab, enter the Home Assistant address (e.g.
-   `http://homeassistant.local:8123` or `http://192.168.1.10:8123`) and a long-lived access
+   `http://homeassistant.local:8123`, `http://192.168.1.10:8123` or an `https://` address,
+   see "TLS (https)" below) and a long-lived access
    token (Home Assistant: your user profile, Security, "Long-lived access tokens"; best for a
    dedicated non-admin user) and save. The tab and the status screen show the connection
    state ("connected" plus the Home Assistant version once it works).
@@ -120,11 +121,15 @@ LOG dropped=<n>                          n lines were dropped while nothing read
 WEB config saved restart_wifi=<0|1>
 WEB config rejected field=<field> error=<error>
 WEB reboot requested | WEB factory reset requested | WEB ha retry requested
-HA config url=<url> token_set len=<n>    HA settings applied (the token itself is never logged)
+HA config url=<url> token_set len=<n> tls=<none|bundle|custom_ca|insecure>[ ca_len=<n>]   HA settings applied (token and CA never logged)
 HA config none url_set=<0|1> token_set=<0|1>   Home Assistant not configured
-HA connect attempt=<n> url=ws://<host>:<port><path>   one line per connection attempt
+HA connect attempt=<n> url=<ws|wss>://<host>:<port><path>   one line per connection attempt
 HA dns host=<host> ok=<0|1>[ ip=<ip>]    name resolution of the attempt
-HA tcp ok=<0|1> ms=<n>                   TCP connect (blocks the main loop, at most 2 s)
+HA tcp ok=<0|1> ms=<n>                   ws: TCP connect (blocks the main loop, at most 2 s)
+HA tls mode=<bundle|custom_ca|insecure> host=<host>   wss: TLS connect starts (TCP + handshake block the main loop, at most about 6 s)
+WARN HA tls verify=off                   wss without certificate verification (every connect)
+HA tls ok ms=<n> heap=<bytes>            wss: TCP + TLS handshake done; free internal heap
+HA tls failed error=<e> code=-0x<hex> ms=<n> msg=<mbedTLS text, max 60 chars>   wss connect failed (see TLS errors)
 HA socket open ms=<n>                    WebSocket handshake done (ms since the TCP connect started)
 HA handshake failed error=<http NNN|bad_accept|bad_response|closed> | HA handshake timeout
 HA rx len=<n> ms=<n> handle_ms=<n>       a message of 64 KB or more: receive time, processing time
@@ -136,6 +141,11 @@ HA state=<state>[ ha_version=<v>][ error=<error>][ retry_in_ms=<ms>]   every sta
 HA retry                                 web UI Retry accepted
 SYS reboot | SYS factory reset           performed by the main loop just after the response
 ```
+
+A failed TLS connect is also accompanied by one to three core lines such as
+`[E][ssl_client.cpp:37] _handle_error(): ... (-9984) X509 - Certificate verification failed`
+(Arduino's own logging; they do not block the firmware and are rate-limited by the
+reconnect backoff).
 
 In `HB`, `ip` is the station IP when connected, else `192.168.4.1` while the setup AP is up,
 else `0.0.0.0`; `ha` is the Home Assistant connection state, `heap` / `heap_min` the free
@@ -337,7 +347,7 @@ files were never flashed, `/` answers 503 with a hint to run `uploadfs`.
 
 | Method / path | Response |
 |---|---|
-| GET `/api/status` | `{fw, uptime_s, heap_free, heap_min_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state, ha_version, last_error}}` (see Home Assistant) |
+| GET `/api/status` | `{fw, uptime_s, heap_free, heap_min_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state, ha_version, last_error, tls}}` (see Home Assistant; `tls` is `none`, `bundle`, `custom_ca` or `insecure`, the mode of the stored address) |
 | GET `/api/config` | Redacted config (including `ha.ca_pem` and `ha.tls_insecure`, which are not secret): secrets only as `wifi.password_set`, `ha.token_set`, `web.password_set` |
 | POST `/api/config` | Patch (see Configuration). `200 {ok:true, restart_wifi}`, `400 {error, field}` (validation), `500 {error:"nvs_write_failed", field}` (storage failed; the config may be partly written and is re-read) |
 | GET `/api/wifi/scan` | `{scanning, age_s, failed, networks:[{ssid, rssi, secure}]}`; starts a new scan when there is none yet, the last one failed or it is older than 10 s. Poll until `scanning` is false (a scan takes about 2-5 s; requests during a scan can take up to about 3 s because the radio briefly leaves its channel) |
@@ -372,21 +382,19 @@ to the main loop through atomic flags.
 
 ## Home Assistant
 
-The device keeps one WebSocket connection to `<HA URL>/api/websocket` (`ws://`) and
-authenticates with the long-lived token. REST is not used. **`https` URLs are refused**:
-they can be stored, but the device never connects to them (`no_config` with `last_error`
-`tls_not_supported`), so the token is never sent unencrypted to a TLS port. Use the
-`http://` address of Home Assistant on the local network.
+The device keeps one WebSocket connection to `<HA URL>/api/websocket` (`ws://` for an
+`http` address, `wss://` for an `https` address, see "TLS (https)") and authenticates with
+the long-lived token. REST is not used.
 
 | `ha.state` | Meaning |
 |---|---|
-| `no_config` | No address or no token stored; or the stored address is not used: `last_error` `tls_not_supported` (https) or `invalid_url` (e.g. a `?` or `#` in the address) |
+| `no_config` | No address or no token stored; or the stored address is not used: `last_error` `invalid_url` (e.g. a `?` or `#` in the address) |
 | `connecting` | Resolving the name, connecting, waiting for Home Assistant's `auth_required` |
 | `authenticating` | Token sent, waiting for the answer |
 | `subscribing` | Subscribing to the selected entities (from Step 6; Step 5 subscribes to nothing) |
 | `ready` | Connected and authenticated; `ha_version` is the Home Assistant version |
 | `auth_failed` | Home Assistant rejected the token (`last_error` `auth_invalid: <message>`). **No automatic retry** (Home Assistant would ban the IP after repeated failures): save a new token, or press Retry |
-| `backoff` | Not connected; the next attempt follows after 1, 2, 4, 8, 16, then every 30 s. `last_error` says why (`dns_failed`, `connect_failed`, `handshake_failed: http <code>` / `bad_accept` / `bad_response` / `closed` (the server closed the connection before answering the upgrade, e.g. a proxy refusing it), `handshake_timeout`, `connect_timeout`, `auth_timeout`, `pong_timeout`, `connection_lost`, `closed_by_server`, `protocol_error`, `send_failed`, `network_down`, `network_lost`) |
+| `backoff` | Not connected; the next attempt follows after 1, 2, 4, 8, 16, then every 30 s. `last_error` says why (`dns_failed`, `connect_failed`, `handshake_failed: http <code>` / `bad_accept` / `bad_response` / `closed` (the server closed the connection before answering the upgrade, e.g. a proxy refusing it), `handshake_timeout`, `connect_timeout`, `auth_timeout`, `pong_timeout`, `connection_lost`, `closed_by_server`, `protocol_error`, `send_failed`, `network_down`, `network_lost`, and for `https` the TLS errors below) |
 
 - Without Wi-Fi the client waits in `backoff` and connects as soon as the station is up.
 - Liveness: an HA `ping` every 30 s; no `pong` within 10 s closes the connection and
@@ -407,6 +415,50 @@ they can be stored, but the device never connects to them (`no_config` with `las
   `success`, `error`), so they never need a JSON document of their own size.
 - Changing only the path of the address, or `http` to `https` on the same host and port,
   keeps the token; any other address change needs the token again (see Configuration).
+
+### TLS (https)
+
+An `https://` address connects over `wss://` (Arduino `WiFiClientSecure`, mbedTLS 2.28).
+Each attempt uses exactly one of three modes (`ha.tls` in `/api/status`), never a fallback
+to another mode or to plaintext:
+
+| Mode | Config | Verification |
+|---|---|---|
+| `bundle` (default) | `ca_pem` empty, `tls_insecure` false | Against the public CA list built into the firmware (the ESP-IDF certificate bundle: 136 root CAs, e.g. ISRG Root X1 for Let's Encrypt) |
+| `custom_ca` | `ca_pem` = 1 to 3 CA certificates (PEM) | Against these certificates only (your own CA, or a self-signed server certificate itself) |
+| `insecure` | `tls_insecure` true | None: the connection is encrypted, but anyone who can intercept it can pretend to be Home Assistant and capture the token. Logged as `WARN HA tls verify=off` on every connect; the status screen shows "HA: connected (TLS unverified)" |
+
+The token is only sent after the TLS handshake (verified per mode) and the WebSocket
+upgrade succeeded. Turning verification off or changing the CA on the same address needs
+the token again (see Configuration).
+
+Limitations (mbedTLS 2.28 in Arduino-ESP32 2.0.17):
+- **TLS 1.2 only.** A server that only allows TLS 1.3 fails with `tls_handshake_failed`.
+- **Certificate dates are not checked** (expired or not-yet-valid certificates are accepted;
+  the prebuilt SDK has no time support in mbedTLS), and there is no revocation check.
+- **IP addresses:** the host is matched against DNS names in the certificate's SAN only,
+  never against IP-address SANs; a certificate without SAN is matched by its CN. An
+  `https://<IP>` address therefore only verifies if the certificate's CN is exactly that IP
+  and it has no SAN. Otherwise use the host name the certificate was issued for (it must
+  resolve on the LAN), or the insecure mode.
+- Client certificates (mTLS) are not supported.
+
+TLS errors (`last_error`, state `backoff`; the serial line `HA tls failed` adds the mbedTLS
+code and text):
+
+| `last_error` | Cause |
+|---|---|
+| `tls_cert_rejected` | Certificate verification failed (mbedTLS `-0x2700`, or `-0x3000` when no CA in the built-in list issued it): wrong CA, name mismatch (see IP addresses), or a self-signed certificate in `bundle` mode |
+| `tls_ca_invalid` | The stored CA PEM passed the config check but mbedTLS cannot parse it; no connection is made |
+| `tls_handshake_failed` | Any other TLS error, e.g. the port does not speak TLS (`-0x7200`), TLS 1.3 only (`-0x7780`) |
+| `tls_timeout` | The TLS handshake did not finish within 4 s |
+| `connect_failed` | The TCP connection was refused or timed out (2 s) |
+
+Cost and timing: the CA bundle and TLS code add about 188 KB of flash (app 1.76 MB). A
+connection uses about 37 KB of internal heap (two 16 KB TLS record buffers plus state;
+measured 115-119 KB free while connected, about 155 KB without a connection). The TCP
+connect and the handshake block the main loop: about 0.4 s against an RSA-2048 server on
+the LAN, about 0.9 s for a public host, at most about 6 s (2 s TCP + 4 s handshake).
 
 ## Hardware notes
 
@@ -518,7 +570,7 @@ src/hal/          Display, Touch, Encoder, Button, Buzzer, PsramAllocator (hardw
 src/config/       ConfigStore (NVS persistence, mutex)
 src/util/         Log.h (non-blocking serial logging)
 src/net/          WifiManager (STA, setup AP, captive DNS, mDNS), WebServer (REST API, static files)
-src/ha/           HaClient (HaSession wiring, logging), WsTransport (WebSocket client on WiFiClient)
+src/ha/           HaClient (HaSession wiring, logging), WsTransport (WebSocket client on WiFiClient / WiFiClientSecure)
 src/ui/           Ui (screen manager), Widgets, screens/ (Boot, Setup, Status), fonts/ (generated)
 data/             web UI (index.html, app.js, style.css), flashed with uploadfs
 lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the host
@@ -543,9 +595,10 @@ tools/            serial_check.py, gen_fonts.sh
   `*_set` flags) and are never logged (at most `token_set len=N`).
 - NVS is not encrypted: anyone with physical access can read the token. Use a dedicated
   non-admin Home Assistant user for the knob's token.
-- The connection to Home Assistant is plain `ws://` on the LAN, so the token can be sniffed
-  there (TLS is not planned). The token is only ever sent to the stored address; changing
-  the host or port requires entering it again.
+- With an `http://` address the connection to Home Assistant is plain `ws://`, so the token
+  can be sniffed on the LAN; use an `https://` address to encrypt it (see TLS). The token is
+  only ever sent to the stored address; changing the host or port, turning certificate
+  verification off or changing the CA requires entering it again.
 - The web UI is plain HTTP on the LAN. The optional web password (Device tab, user `admin`)
   is sent with HTTP Basic auth and can be sniffed on the network; there is no lockout
   after wrong passwords. The setup AP is always WPA2-protected.

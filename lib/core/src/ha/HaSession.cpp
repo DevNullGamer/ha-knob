@@ -35,6 +35,22 @@ const char *stateName(State state) {
     }
 }
 
+TlsMode tlsModeFor(const HaUrl &endpoint, const TlsSettings &tls) {
+    if (!endpoint.ok || !endpoint.tls) return TlsMode::None;
+    if (!tls.caPem.empty()) return TlsMode::CustomCa;
+    return tls.insecure ? TlsMode::Insecure : TlsMode::Bundle;
+}
+
+const char *tlsModeName(TlsMode mode) {
+    switch (mode) {
+        case TlsMode::None: return "none";
+        case TlsMode::Bundle: return "bundle";
+        case TlsMode::CustomCa: return "custom_ca";
+        case TlsMode::Insecure: return "insecure";
+        default: return "unknown";
+    }
+}
+
 uint32_t HaSession::backoffDelayMs(uint32_t failures) {
     if (failures == 0) return 0;
     const size_t index = std::min<size_t>(failures - 1, kBackoffSteps - 1);
@@ -74,12 +90,6 @@ void HaSession::configure(const std::string &url, const std::string &token, cons
     }
     if (!endpoint_.ok || endpoint_.hasQueryOrFragment) {
         setError("invalid_url");
-        setState(State::NoConfig);
-        return;
-    }
-    if (endpoint_.tls) {
-        // TLS (wss) is not implemented: never send the token in cleartext to an https URL.
-        setError("tls_not_supported");
         setState(State::NoConfig);
         return;
     }

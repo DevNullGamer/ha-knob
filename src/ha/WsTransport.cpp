@@ -7,6 +7,9 @@
 #include <lwip/ip_addr.h>
 #include <lwip/sockets.h>
 #include <lwip/tcpip.h>
+#include <mbedtls/error.h>
+#include <mbedtls/x509.h>
+#include <mbedtls/x509_crt.h>
 
 #include <atomic>
 #include <cerrno>
@@ -26,6 +29,13 @@ namespace ws = core::ws;
 constexpr size_t kMaxLoggedReason = 40;
 constexpr uint16_t kCloseNormal = 1000;
 constexpr uint16_t kCloseProtocolError = 1002;
+constexpr size_t kMaxLoggedTlsError = 60;
+
+// The IDF certificate bundle (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE, full Mozilla list) that
+// is already part of libmbedtls.a; referencing it links the 64 KB blob into the firmware.
+// Its format (count, then name/key records sorted by subject) is the one Arduino's
+// setCACertBundle() expects.
+extern "C" const uint8_t x509CrtBundleStart[] asm("_binary_x509_crt_bundle_start");
 
 // ---- Asynchronous name resolution ------------------------------------------------------
 // One lookup at a time, run by lwIP in the tcpip task (dns_gethostbyname must not be
@@ -66,6 +76,21 @@ void dnsStart(void *arg) {  // tcpip task
 
 uint32_t randomMask() { return esp_random(); }
 
+// mbedTLS result of parsing the CA PEM: 0 if every certificate in it parsed, > 0 the number
+// of certificates that did not, < 0 an error. The config check only validates the PEM/DER
+// structure, so a certificate mbedTLS rejects (e.g. an unsupported key type) is caught
+// here, before any connection is made.
+int parseCaPem(const std::string &pem) {
+    mbedtls_x509_crt crt;
+    mbedtls_x509_crt_init(&crt);
+    const int ret =
+        mbedtls_x509_crt_parse(&crt, reinterpret_cast<const unsigned char *>(pem.c_str()), pem.size() + 1);
+    mbedtls_x509_crt_free(&crt);
+    return ret;
+}
+
+unsigned absCode(int code) { return static_cast<unsigned>(code < 0 ? -code : code); }
+
 // The code sent back in reply to a server Close (RFC 6455 §5.5.1, §7.4): the server's code
 // if it is one an endpoint may send, else 1000. 1005, 1006 and 1015 must never be sent.
 uint16_t closeReplyCode(uint16_t code) {
@@ -102,6 +127,13 @@ uint8_t *PsramBufferProvider::grow(uint8_t *current, size_t total) {
 }
 
 void PsramBufferProvider::release(uint8_t *buffer) { heap_caps_free(buffer); }
+
+// ---- TLS client ------------------------------------------------------------------------
+
+void SecureClient::stop() {
+    WiFiClientSecure::stop();
+    sslclient->socket = -1;  // see the class comment: never leave socket 0 behind
+}
 
 // ---- Transport -------------------------------------------------------------------------
 
@@ -141,12 +173,8 @@ bool WsTransport::sendText(const std::string &text) {
 void WsTransport::poll() {
     inPoll_ = true;
     switch (phase_) {
-        case Phase::Refused:
-            phase_ = Phase::Idle;
-            session_->onClosed("tls_not_supported", millis());
-            break;
         case Phase::Resolving: pollDns(); break;
-        case Phase::Connecting: connectTcp(); break;
+        case Phase::Connecting: connectSocket(); break;
         case Phase::Upgrading: pollUpgrade(); break;
         case Phase::Open: pollOpen(); break;
         default: break;
@@ -165,13 +193,6 @@ void WsTransport::poll() {
 void WsTransport::start(const hc::HaUrl &endpoint, const hc::TlsSettings &tls) {
     endpoint_ = endpoint;
     tls_ = tls;
-    if (endpoint_.tls) {
-        // HaSession never opens an https endpoint yet (tls_not_supported); refuse it here
-        // too rather than connect in plaintext to a TLS port.
-        util::logPrintf("ERR HA tls endpoint refused\n");
-        phase_ = Phase::Refused;  // reported on the next poll()
-        return;
-    }
     ++attempt_;
     util::logPrintf("HA connect attempt=%u url=%s\n", static_cast<unsigned>(attempt_),
                     hc::webSocketUrl(endpoint_).c_str());
@@ -210,19 +231,15 @@ void WsTransport::pollDns() {
     phase_ = Phase::Connecting;  // connect on the next poll(): one blocking step per loop
 }
 
-void WsTransport::connectTcp() {
-    tcpStartMs_ = millis();
-    const bool ok = client_.connect(ip_, endpoint_.port, kTcpConnectTimeoutMs) == 1;
-    const uint32_t ms = millis() - tcpStartMs_;
-    util::logPrintf("HA tcp ok=%d ms=%u\n", ok ? 1 : 0, static_cast<unsigned>(ms));
+void WsTransport::connectSocket() {
+    const bool ok = endpoint_.tls ? connectTls() : connectTcp();
     if (!ok) {
-        fail("connect_failed");
         return;
     }
-    client_.setNoDelay(true);
     key_ = ws::makeWebSocketKey(randomMask);
-    const std::string request = ws::buildUpgradeRequest(endpoint_.host, endpoint_.port, false, endpoint_.path, key_);
-    if (client_.write(reinterpret_cast<const uint8_t *>(request.data()), request.size()) != request.size()) {
+    const std::string request =
+        ws::buildUpgradeRequest(endpoint_.host, endpoint_.port, endpoint_.tls, endpoint_.path, key_);
+    if (client_->write(reinterpret_cast<const uint8_t *>(request.data()), request.size()) != request.size()) {
         fail("connect_failed");
         return;
     }
@@ -232,8 +249,97 @@ void WsTransport::connectTcp() {
     phase_ = Phase::Upgrading;
 }
 
+bool WsTransport::connectTcp() {
+    client_ = &plain_;
+    tcpStartMs_ = millis();
+    const bool ok = plain_.connect(ip_, endpoint_.port, kTcpConnectTimeoutMs) == 1;
+    const uint32_t ms = millis() - tcpStartMs_;
+    util::logPrintf("HA tcp ok=%d ms=%u\n", ok ? 1 : 0, static_cast<unsigned>(ms));
+    if (!ok) {
+        fail("connect_failed");
+        return false;
+    }
+    plain_.setNoDelay(true);
+    return true;
+}
+
+bool WsTransport::connectTls() {
+    client_ = &secure_;
+    const hc::TlsMode mode = hc::tlsModeFor(endpoint_, tls_);
+    util::logPrintf("HA tls mode=%s host=%s\n", hc::tlsModeName(mode), endpoint_.host.c_str());
+    tcpStartMs_ = millis();
+
+    if (mode == hc::TlsMode::CustomCa) {
+        const int ret = parseCaPem(tls_.caPem);
+        if (ret != 0) {
+            char message[kMaxLoggedTlsError + 1] = "some certificates in the CA PEM not accepted";
+            if (ret < 0) {
+                mbedtls_strerror(ret, message, sizeof(message));
+            }
+            util::logPrintf("HA tls failed error=tls_ca_invalid code=%s0x%04X ms=0 msg=%s\n", ret < 0 ? "-" : "+",
+                            absCode(ret), message);
+            fail("tls_ca_invalid");
+            return false;
+        }
+    }
+
+    // Exactly one mode per attempt: clear whatever the previous attempt set (CA pointer,
+    // insecure flag, bundle), then set this attempt's mode. With no mode set the core
+    // refuses to connect (fail closed); it never falls back to another mode.
+    secure_.stop();
+    secure_.setCACert(nullptr);        // also clears the insecure flag
+    secure_.setCACertBundle(nullptr);  // frees the bundle index, clears the bundle flag
+    secure_.setTimeout(kTlsSocketTimeoutS);
+    secure_.setHandshakeTimeout(kTlsHandshakeTimeoutS);
+    const char *caPem = nullptr;
+    switch (mode) {
+        case hc::TlsMode::Insecure:
+            secure_.setInsecure();
+            util::logPrintf("WARN HA tls verify=off\n");
+            break;
+        case hc::TlsMode::CustomCa:
+            caPem = tls_.caPem.c_str();  // verified against this CA only
+            break;
+        default:
+            secure_.setCACertBundle(x509CrtBundleStart);
+            break;
+    }
+
+    const bool ok = secure_.connect(ip_, endpoint_.port, endpoint_.host.c_str(), caPem, nullptr, nullptr) == 1;
+    const uint32_t ms = millis() - tcpStartMs_;
+    if (ok) {
+        util::logPrintf("HA tls ok ms=%u heap=%u\n", static_cast<unsigned>(ms),
+                        static_cast<unsigned>(ESP.getFreeHeap()));
+        return true;
+    }
+
+    char message[kMaxLoggedTlsError + 1] = "";
+    const int code = secure_.lastError(message, sizeof(message));
+    const char *reason;
+    if (code == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED ||
+        (code == MBEDTLS_ERR_X509_FATAL_ERROR && mode == hc::TlsMode::Bundle)) {
+        // The bundle's verify callback reports an issuer it does not know as FATAL_ERROR.
+        reason = "tls_cert_rejected";
+    } else if (code == -1) {
+        // The core returns -1 both for a failed TCP connect (within kTlsSocketTimeoutS) and
+        // for a handshake that ran out of time (at least kTlsHandshakeTimeoutS after the TCP
+        // connect); the elapsed time tells them apart.
+        reason = ms >= kTlsHandshakeTimeoutS * 1000u ? "tls_timeout" : "connect_failed";
+    } else if (code < 0) {
+        reason = "tls_handshake_failed";
+    } else {
+        reason = "connect_failed";  // no TLS error recorded
+    }
+    char shown[kMaxLoggedTlsError + 1];
+    printable(message, kMaxLoggedTlsError, shown, sizeof(shown));
+    util::logPrintf("HA tls failed error=%s code=-0x%04X ms=%u msg=%s\n", reason, absCode(code),
+                    static_cast<unsigned>(ms), shown);
+    fail(reason);
+    return false;
+}
+
 void WsTransport::pollUpgrade() {
-    const int avail = client_.available();
+    const int avail = client_->available();
     if (avail > 0) {
         // The header block is at most kMaxUpgradeResponseBytes; anything read after it (the
         // first frames) is passed on to the receiver.
@@ -241,7 +347,7 @@ void WsTransport::pollUpgrade() {
         size_t want = static_cast<size_t>(avail);
         if (want > sizeof(chunk_)) want = sizeof(chunk_);
         if (want > room) want = room;
-        const int n = want > 0 ? client_.read(chunk_, want) : 0;
+        const int n = want > 0 ? client_->read(chunk_, want) : 0;
         if (n > 0) {
             upgradeBuf_.append(reinterpret_cast<const char *>(chunk_), static_cast<size_t>(n));
         }
@@ -280,7 +386,7 @@ void WsTransport::pollOpen() {
     while (phase_ == Phase::Open && !closeRequested_) {
         // Read only what is there (WiFiClientSecure::read() would drop the connection on
         // WANT_READ; plain WiFiClient is read the same way).
-        const int avail = client_.available();
+        const int avail = client_->available();
         if (avail <= 0) {
             if (total == 0 && peerClosed()) {
                 util::logPrintf("HA socket closed by=peer\n");
@@ -291,7 +397,7 @@ void WsTransport::pollOpen() {
         size_t want = static_cast<size_t>(avail);
         if (want > sizeof(chunk_)) want = sizeof(chunk_);
         if (want > kPollMaxBytes - total) want = kPollMaxBytes - total;
-        const int n = client_.read(chunk_, want);
+        const int n = client_->read(chunk_, want);
         if (n <= 0) {
             return;  // a failed read stops the client; seen as closed on the next poll
         }
@@ -379,7 +485,7 @@ bool WsTransport::handleEvent(const ws::Event &event) {
 // WiFiClient::connected() reads a stale errno after a zero-length recv(), so the socket is
 // asked directly: a peeked recv() of 0 bytes means the peer closed (FIN).
 bool WsTransport::peerClosed() {
-    const int fd = client_.fd();
+    const int fd = client_->fd();
     if (fd < 0) {
         return true;
     }
@@ -395,7 +501,7 @@ bool WsTransport::peerClosed() {
 }
 
 bool WsTransport::writeFrame(const std::vector<uint8_t> &frame) {
-    return client_.write(frame.data(), frame.size()) == frame.size();
+    return client_->write(frame.data(), frame.size()) == frame.size();
 }
 
 void WsTransport::fail(const char *reason) { fail(std::string(reason)); }
@@ -406,11 +512,11 @@ void WsTransport::fail(const std::string &reason) {
 }
 
 void WsTransport::shutdown(bool goodbye) {
-    if (goodbye && phase_ == Phase::Open && client_.fd() >= 0) {
+    if (goodbye && phase_ == Phase::Open && client_->fd() >= 0) {
         writeFrame(ws::encodeClose(kCloseNormal, randomMask()));  // best effort
     }
     closeRequested_ = false;
-    client_.stop();
+    client_->stop();
     rx_.reset();
     std::string().swap(upgradeBuf_);
     phase_ = Phase::Idle;

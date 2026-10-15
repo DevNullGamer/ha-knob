@@ -50,8 +50,6 @@ const char *stateName(State state);
 // http endpoints. Defaults: verify against the built-in public CA bundle.
 //  - insecure: no certificate verification at all
 //  - caPem:    verify against this CA certificate (PEM) instead of the bundle
-// TLS is not connected yet (HaSession refuses https with "tls_not_supported"); the settings
-// are only plumbed through.
 struct TlsSettings {
     bool insecure = false;
     std::string caPem;
@@ -59,6 +57,20 @@ struct TlsSettings {
     bool operator==(const TlsSettings &o) const { return insecure == o.insecure && caPem == o.caPem; }
     bool operator!=(const TlsSettings &o) const { return !(*this == o); }
 };
+
+// The one TLS mode a connection uses (never a fallback to another one):
+//  None      http endpoint (plain ws)
+//  Bundle    https, verified against the built-in public CA bundle (no caPem, not insecure)
+//  CustomCa  https, verified against caPem only
+//  Insecure  https, no certificate verification
+// Config validation never stores insecure together with a CA; if both are set anyway the
+// verifying mode (CustomCa) wins.
+enum class TlsMode : uint8_t { None, Bundle, CustomCa, Insecure };
+
+TlsMode tlsModeFor(const HaUrl &endpoint, const TlsSettings &tls);
+
+// "none", "bundle", "custom_ca", "insecure" (as in /api/status ha.tls and the serial log).
+const char *tlsModeName(TlsMode mode);
 
 // The WebSocket as the session sees it. All calls are made from within the session's
 // methods.
@@ -100,9 +112,8 @@ public:
     // the connection is closed and, with both set and a usable URL, a new one is started
     // (Connecting, or Backoff while the network is down). Empty URL or token: NoConfig.
     // An invalid URL (or one with a query/fragment): NoConfig with lastError
-    // "invalid_url". An https URL: NoConfig with lastError "tls_not_supported" (TLS is not
-    // implemented; the token is never sent unencrypted to it). Transport::open() is never
-    // called in NoConfig. Unchanged URL, token and TLS settings keep the connection (also
+    // "invalid_url". An https URL is opened with tls = true and these settings (wss, see
+    // TlsMode). Transport::open() is never called in NoConfig. Unchanged URL, token and TLS settings keep the connection (also
     // AuthFailed); entity ids are de-duplicated and used from the next subscribe on.
     void configure(const std::string &url, const std::string &token, const TlsSettings &tls,
                    const std::vector<std::string> &entityIds, uint32_t nowMs);
@@ -134,6 +145,8 @@ public:
     const std::string &lastError() const { return lastError_; }
     const HaUrl &endpoint() const { return endpoint_; }
     const TlsSettings &tlsSettings() const { return tls_; }
+    // The mode the configured endpoint uses (None for http or no valid URL).
+    TlsMode tlsMode() const { return tlsModeFor(endpoint_, tls_); }
     bool networkUp() const { return networkUp_; }
     uint32_t attempts() const { return attempts_; }      // connections opened so far
     uint32_t failures() const { return failures_; }      // consecutive failed connections

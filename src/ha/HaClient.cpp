@@ -22,10 +22,12 @@ Status status_;
 uint32_t shownChange = UINT32_MAX;
 std::string configuredUrl;
 std::string configuredToken;
+hc::TlsSettings configuredTls;
 bool configuredOnce = false;
 
 // Mirrors the session into status_ and logs every change.
 void refresh() {
+    status_.tls = session.tlsMode();  // changes only in configure(), which logs it
     if (session.changeCount() == shownChange) {
         return;
     }
@@ -50,22 +52,27 @@ void begin() {
     transport.begin(session);
 }
 
-void configure(const std::string &url, const std::string &token, uint32_t nowMs) {
-    if (!configuredOnce || url != configuredUrl || token != configuredToken) {
+void configure(const std::string &url, const std::string &token, const hc::TlsSettings &tls, uint32_t nowMs) {
+    if (!configuredOnce || url != configuredUrl || token != configuredToken || tls != configuredTls) {
         configuredOnce = true;
         configuredUrl = url;
         configuredToken = token;
+        configuredTls = tls;
         if (url.empty() || token.empty()) {
             util::logPrintf("HA config none url_set=%d token_set=%d\n", url.empty() ? 0 : 1,
                             token.empty() ? 0 : 1);
         } else {
-            util::logPrintf("HA config url=%s token_set len=%u\n", url.c_str(),
-                            static_cast<unsigned>(token.size()));
+            const hc::TlsMode mode = hc::tlsModeFor(hc::parseHaUrl(url), tls);
+            char caLen[24] = "";
+            if (mode == hc::TlsMode::CustomCa) {
+                snprintf(caLen, sizeof(caLen), " ca_len=%u", static_cast<unsigned>(tls.caPem.size()));
+            }
+            util::logPrintf("HA config url=%s token_set len=%u tls=%s%s\n", url.c_str(),
+                            static_cast<unsigned>(token.size()), hc::tlsModeName(mode), caLen);
         }
     }
     // Step 5 subscribes to nothing; Step 6 passes the configured controls' entity ids.
-    // TLS settings come from the config in Step 5b.4 (https is refused until then).
-    session.configure(url, token, hc::TlsSettings(), std::vector<std::string>(), nowMs);
+    session.configure(url, token, tls, std::vector<std::string>(), nowMs);
     refresh();
 }
 
