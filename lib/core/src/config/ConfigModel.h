@@ -16,7 +16,7 @@
 //   {"schema":1,
 //    "device":{"hostname","brightness","dim_after_s","dim_level","off_after_s","buzzer",
 //              "encoder_reverse","accel","send_interval_ms"},
-//    "wifi":{"ssid"}, "ha":{"url"},
+//    "wifi":{"ssid"}, "ha":{"url","ca_pem","tls_insecure"},
 //    "controls":[{"entity_id","label","action","step","press"}]}
 // Secrets (Wi-Fi password, HA token, web password) are never part of Config; they are
 // stored separately and only appear as *_set flags in the redacted JSON.
@@ -28,7 +28,7 @@ namespace config {
 
 constexpr int kSchemaVersion = 1;
 constexpr size_t kMaxControls = 24;
-constexpr size_t kMaxConfigJsonBytes = 8192;  // NVS blob limit for "cfg"
+constexpr size_t kMaxConfigJsonBytes = 12288;  // NVS blob limit for "cfg" (was 8192 up to v0.5.1)
 constexpr size_t kMaxHostnameLen = 32;
 constexpr size_t kMaxSsidBytes = 32;
 constexpr size_t kMinWifiPasswordLen = 8;
@@ -37,6 +37,8 @@ constexpr size_t kMaxHaTokenLen = 512;
 constexpr size_t kMaxWebPasswordLen = 64;
 constexpr size_t kMaxEntityIdLen = 255;
 constexpr size_t kMaxLabelBytes = 48;
+constexpr size_t kMaxCaPemBytes = 4096;  // ha.ca_pem after normalisation
+constexpr size_t kMaxCaCerts = 3;        // CERTIFICATE blocks in ha.ca_pem
 
 struct DeviceConfig {
     std::string hostname = "ha-knob";
@@ -60,8 +62,16 @@ struct WifiConfig {
 
 struct HaConfig {
     std::string url;  // empty = not configured; else http(s)://host[:port][/prefix]
+    // TLS settings for an https URL (both must stay at their defaults otherwise):
+    //  - caPem: "" = verify against the built-in public CA bundle; else 1-3 PEM CERTIFICATE
+    //    blocks to verify against instead, stored normalised (see normalizePem)
+    //  - tlsInsecure: skip certificate verification (excludes caPem)
+    std::string caPem;
+    bool tlsInsecure = false;
 
-    bool operator==(const HaConfig &o) const { return url == o.url; }
+    bool operator==(const HaConfig &o) const {
+        return url == o.url && caPem == o.caPem && tlsInsecure == o.tlsInsecure;
+    }
 };
 
 struct Control {
@@ -194,6 +204,12 @@ struct MergeResult {
 //    ha.token in the same patch (else "ha.token"/"token_required"). Whenever the patched
 //    URL is "" (unconfigured), the token is cleared, even if the patch supplied one. A
 //    path-only change or an http -> https upgrade on the same host:port keeps the token.
+//    TLS weakening: if the old and new URL are both https on the same host:port, turning
+//    ha.tls_insecure on (false -> true) or setting ha.ca_pem to a non-empty value that
+//    differs from the stored one (after normalisation) also requires a new ha.token in the
+//    same patch. Tightening (CA removed, insecure turned off) keeps the token. The TLS
+//    fields of the merged ha section are checked before the guard, so an unusable CA
+//    reports its own error rather than token_required.
 //  - The merged config must pass validate().
 // Errors use the same {field, message} shape as validate(); malformed JSON gives
 // field "" / "invalid_json".
@@ -212,6 +228,22 @@ bool isValidHostname(const std::string &hostname);
 bool isValidEntityId(const std::string &entityId);
 // Well-formed UTF-8 without control characters.
 bool isValidLabelText(const std::string &text);
+
+// ha.ca_pem normalisation (applied when parsing stored JSON and patches): CRLF and CR ->
+// LF, trailing spaces and tabs removed from every line, surrounding whitespace trimmed,
+// then exactly one trailing LF; whitespace-only -> "".
+// A PEM resent with other line endings therefore compares equal to the stored one.
+std::string normalizePem(const std::string &text);
+
+// Checks a normalised, non-empty ha.ca_pem (field "ha.ca_pem"): <= kMaxCaPemBytes
+// ("length"); nothing but 1..kMaxCaCerts "-----BEGIN CERTIFICATE-----" ...
+// "-----END CERTIFICATE-----" blocks separated by blank space ("not_a_certificate", e.g. a
+// PRIVATE KEY block; "too_many"); each body strict Base64 ("invalid_base64") decoding to
+// one DER SEQUENCE whose outer length matches the decoded size ("invalid_der") and whose
+// first element is itself a SEQUENCE fitting inside it, the tbsCertificate (else
+// "not_a_certificate": a private key relabelled as CERTIFICATE starts with an INTEGER).
+// Whether the certificate is usable is only known when mbedTLS parses it on connect.
+ValidationResult checkCaPem(const std::string &pem);
 
 // The ha.url parser is core::ha::parseHaUrl (ha/HaUrl.h), the only URL parser; these
 // names remain for existing callers.

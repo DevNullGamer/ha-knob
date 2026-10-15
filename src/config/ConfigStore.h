@@ -8,7 +8,8 @@
 #include "config/ConfigModel.h"
 
 // Persists the configuration in NVS (namespace "haknob" by default):
-//   cfg       blob    non-secret config JSON (core::config::toJson), <= 8 KB
+//   cfg       blob    non-secret config JSON (core::config::toJson), <= 12 KB
+//                     (kMaxConfigJsonBytes; firmware <= v0.5.1 treats > 8 KB as corrupt)
 //   wifi_pw   string  Wi-Fi password            (secret)
 //   ha_token  string  HA long-lived token       (secret)
 //   web_pw    string  optional web UI password  (secret)

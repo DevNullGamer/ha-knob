@@ -173,8 +173,9 @@ assets, so `uploadfs` never touches the config.
 
 Why it looks like this:
 
-- **NVS is 64 KB** (20 KB in the default table): rewriting the 8 KB `cfg` blob needs space
-  for the old and the new copy (about 16.5 KB) next to the secrets and the Wi-Fi/PHY data.
+- **NVS is 64 KB** (20 KB in the default table): rewriting the `cfg` blob (at most 12 KB)
+  needs space for the old and the new copy (about 25 KB) next to the secrets and the
+  Wi-Fi/PHY data.
 - **otadata must stay at 0xE000 and app0 at 0x10000.** PlatformIO does not take the upload
   addresses from the partition table: the Arduino builder always flashes `boot_app0.bin`
   to 0xE000, and PlatformIO flashes the app to the board's `upload.offset_address`
@@ -193,7 +194,7 @@ upload**; this wipes the config, all secrets and `ap_pw`.
 
 | NVS key | Type | Content |
 |---|---|---|
-| `cfg` | blob | Non-secret config JSON (below), at most 8 KB |
+| `cfg` | blob | Non-secret config JSON (below), at most 12 KB (12288 bytes; 8 KB before Step 5b.3) |
 | `wifi_pw` | string | Wi-Fi password (secret) |
 | `ha_token` | string | Home Assistant long-lived token (secret, at most 512 characters) |
 | `web_pw` | string | Optional web UI password (secret; none = no password, the default) |
@@ -202,6 +203,13 @@ upload**; this wipes the config, all secrets and `ap_pw`.
 On the very first boot (nothing stored) the defaults are used and saved, so the next boot
 logs `CFG loaded`. A corrupt or invalid stored config, or one with a newer schema, gives
 defaults for that boot and is left in place until the next save.
+
+Downgrade note: firmware before Step 5b.3 (the v0.5.1 release and older) accepts at most
+8 KB. After a downgrade a stored config larger than that (e.g. many controls plus a
+custom CA) is
+reported as `CFG defaults reason=corrupt`; the old firmware boots on defaults (setup AP)
+and leaves the blob in place until the next save. A config without `ha.ca_pem` /
+`ha.tls_insecure` (stored by v0.5.1 or older) loads unchanged: the keys take their defaults.
 
 Non-secret config, schema 1 (defaults shown; `controls` example):
 
@@ -212,7 +220,7 @@ Non-secret config, schema 1 (defaults shown; `controls` example):
                "off_after_s": 300, "buzzer": true, "encoder_reverse": false, "accel": true,
                "send_interval_ms": 250 },
   "wifi":    { "ssid": "" },
-  "ha":      { "url": "" },
+  "ha":      { "url": "", "ca_pem": "", "tls_insecure": false },
   "controls": [
     { "entity_id": "light.kitchen", "label": "", "action": "brightness", "step": 5, "press": "toggle" }
   ]
@@ -232,9 +240,11 @@ Validation (`lib/core/src/config/ConfigModel.cpp`, first failure is reported as
 | `wifi.ssid` | empty (not configured) or at most 32 bytes |
 | `wifi.password` | 8 to 63 printable ASCII characters (none stored = open network) |
 | `ha.url` | empty (not configured) or `http(s)://host[:port][/prefix]`, host up to 253 characters, port 1 to 65535, prefix of printable ASCII without spaces (the device only connects to `http` URLs without `?`/`#`, see Home Assistant) |
+| `ha.ca_pem` | empty (verify against the built-in public CA bundle) or 1 to 3 PEM `CERTIFICATE` blocks and nothing else, at most 4096 bytes after normalisation (`length`). Normalised on input: CRLF/CR become LF, trailing spaces and tabs are removed from every line, surrounding whitespace is trimmed and one trailing LF added; whitespace only becomes empty. Any other content, e.g. a `PRIVATE KEY` block, text around the blocks, a missing END line, or a body whose outer SEQUENCE does not start with a nested SEQUENCE (the tbsCertificate; a private key relabelled as `CERTIFICATE` starts with an INTEGER), is `not_a_certificate`; more than 3 blocks `too_many`; a body that is not strict Base64 `invalid_base64`; a body that is not one DER SEQUENCE whose length matches `invalid_der`. Only allowed with an `https` URL (`requires_https`) |
+| `ha.tls_insecure` | boolean, default `false` (skip certificate verification). Only allowed with an `https` URL (`requires_https`) and an empty `ha.ca_pem` (`conflicts_with_ca_pem`) |
 | `ha.token` | up to 512 printable ASCII characters, no spaces |
 | `web.password` | up to 64 characters, no control characters |
-| `controls` | at most 24; the serialised config must fit in 8 KB |
+| `controls` | at most 24; the serialised config must fit in 12288 bytes (`controls` / `too_large`, also when a large `ha.ca_pem` pushes it over) |
 | `entity_id` | `[a-z_]+\.[a-z0-9_]+`, at most 255 characters, domain light, climate, cover, fan, media_player, switch or input_boolean |
 | `label` | at most 48 bytes of UTF-8 (æ ø å etc. allowed), no control characters |
 | `action`, `press`, `step` | must be offered by the domain (`lib/core/src/control/DomainActions.cpp`); `step` within the action's range |
@@ -263,7 +273,11 @@ replaces that section **literally** (keys missing inside it take their defaults,
 `wifi` section without `ssid` unconfigures Wi-Fi); secrets (`wifi.password`, `ha.token`,
 `web.password`) are kept when absent or `""`, set when a string, cleared when `null`.
 Clients must therefore always send whole sections, `ssid` in every `wifi` section, `url` in
-every `ha` section, and the Wi-Fi password together with the SSID (`null` = open network).
+every `ha` section together with `ca_pem` and `tls_insecure` (absent = `""` / `false`, so
+leaving them out resets the TLS settings), and the Wi-Fi password together with the SSID
+(`null` = open network). Unconfiguring Home Assistant therefore sends
+`{"ha":{"url":"","ca_pem":"","tls_insecure":false,"token":null}}`; an empty URL with a CA or
+`tls_insecure` set is rejected (`requires_https`).
 `restartWifi` is reported when the SSID changes or the password is set or cleared for a
 configured SSID (not for an SSID that was and stays empty); the web server additionally
 compares the stored credentials before and after, so saving the same password again does
@@ -285,7 +299,12 @@ Token guard for `ha.url` changes:
 | Different host:port (host lower-cased, default port 80/443) | New `ha.token` required in the same request, else `token_required` |
 | `https` to `http` on the same host:port (TLS downgrade) | New `ha.token` required, else `token_required` |
 | URL `""` (unconfigured), cleared or already empty | Cleared, even if the request carries a token |
-| Path-only change, or `http` to `https` (TLS upgrade) on the same host:port | Kept |
+| Path-only change, or `http` to `https` (TLS upgrade) on the same host:port | Kept (whatever the TLS fields are) |
+| `https` before and after on the same host:port, and `ha.tls_insecure` turns on (`false` to `true`) or `ha.ca_pem` becomes non-empty and differs from the stored one (after normalisation) | New `ha.token` required, else `token_required` (the stored token is never sent over a connection that is trusted less) |
+| `https` on the same host:port, CA removed or `tls_insecure` turned off (tightening), or the same CA resent (also with other line endings) | Kept |
+
+The TLS fields are validated before the guard runs, so an unusable CA reports its own
+error (e.g. `ha.ca_pem` / `not_a_certificate`) rather than `token_required`.
 
 Secrets are never returned: the redacted JSON only carries `wifi.password_set`,
 `ha.token_set` and `web.password_set`.
@@ -319,7 +338,7 @@ files were never flashed, `/` answers 503 with a hint to run `uploadfs`.
 | Method / path | Response |
 |---|---|
 | GET `/api/status` | `{fw, uptime_s, heap_free, heap_min_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state, ha_version, last_error}}` (see Home Assistant) |
-| GET `/api/config` | Redacted config: secrets only as `wifi.password_set`, `ha.token_set`, `web.password_set` |
+| GET `/api/config` | Redacted config (including `ha.ca_pem` and `ha.tls_insecure`, which are not secret): secrets only as `wifi.password_set`, `ha.token_set`, `web.password_set` |
 | POST `/api/config` | Patch (see Configuration). `200 {ok:true, restart_wifi}`, `400 {error, field}` (validation), `500 {error:"nvs_write_failed", field}` (storage failed; the config may be partly written and is re-read) |
 | GET `/api/wifi/scan` | `{scanning, age_s, failed, networks:[{ssid, rssi, secure}]}`; starts a new scan when there is none yet, the last one failed or it is older than 10 s. Poll until `scanning` is false (a scan takes about 2-5 s; requests during a scan can take up to about 3 s because the radio briefly leaves its channel) |
 | POST `/api/ha/retry` | `200 {ok:true}`; leaves `auth_failed` (or ends a backoff wait) and reconnects. A no-op in other states |

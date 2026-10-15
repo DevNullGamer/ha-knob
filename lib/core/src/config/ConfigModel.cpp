@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "control/DomainActions.h"
+#include "util/Base64.h"
 
 namespace core {
 namespace config {
@@ -141,6 +142,9 @@ ValidationResult parseHa(JsonVariantConst v, HaConfig &out) {
     if (!v.is<JsonObjectConst>()) return notAnObject("ha");
     SectionReader r(v.as<JsonObjectConst>(), "ha");
     r.str("url", out.url);
+    r.str("ca_pem", out.caPem);
+    r.boolean("tls_insecure", out.tlsInsecure);
+    out.caPem = normalizePem(out.caPem);
     return r.result();
 }
 
@@ -197,7 +201,10 @@ void writeConfig(JsonObject root, const Config &c) {
     device["accel"] = c.device.accel;
     device["send_interval_ms"] = c.device.sendIntervalMs;
     root["wifi"].to<JsonObject>()["ssid"] = c.wifi.ssid;
-    root["ha"].to<JsonObject>()["url"] = c.ha.url;
+    JsonObject ha = root["ha"].to<JsonObject>();
+    ha["url"] = c.ha.url;
+    ha["ca_pem"] = c.ha.caPem;
+    ha["tls_insecure"] = c.ha.tlsInsecure;
     JsonArray controls = root["controls"].to<JsonArray>();
     for (const Control &control : c.controls) {
         JsonObject o = controls.add<JsonObject>();
@@ -280,6 +287,76 @@ bool tokenEndpointChanged(const std::string &oldUrl, const std::string &newUrl) 
     const UrlEndpoint b = parseUrlEndpoint(newUrl);
     if (!a.ok || !b.ok) return oldUrl != newUrl;
     return a.host != b.host || a.port != b.port || (a.tls && !b.tls);
+}
+
+// True if both URLs are https on the same host:port and the new TLS settings trust more
+// than the old ones: verification turned off, or a different non-empty custom CA (which
+// could be the attacker's). Removing the CA or turning insecure off is a tightening.
+bool tlsTrustWeakened(const HaConfig &oldHa, const HaConfig &newHa) {
+    if (oldHa.url.empty() || newHa.url.empty()) return false;
+    const UrlEndpoint a = parseUrlEndpoint(oldHa.url);
+    const UrlEndpoint b = parseUrlEndpoint(newHa.url);
+    if (!a.ok || !b.ok || !a.tls || !b.tls || a.host != b.host || a.port != b.port) return false;
+    return (!oldHa.tlsInsecure && newHa.tlsInsecure) ||
+           (!newHa.caPem.empty() && newHa.caPem != oldHa.caPem);
+}
+
+// ha.ca_pem content, requires_https and conflicts_with_ca_pem. An invalid non-empty URL is
+// left to the ha.url check (it is reported as "ha.url"/"invalid" by validate()).
+ValidationResult checkHaTls(const HaConfig &ha) {
+    if (!ha.caPem.empty()) {
+        ValidationResult r = checkCaPem(ha.caPem);
+        if (!r.ok) return r;
+    }
+    const UrlEndpoint endpoint = parseUrlEndpoint(ha.url);
+    if (!ha.url.empty() && !endpoint.ok) return ValidationResult::success();
+    const bool https = endpoint.ok && endpoint.tls;
+    if (!ha.caPem.empty() && !https) return ValidationResult::failure("ha.ca_pem", "requires_https");
+    if (ha.tlsInsecure && !https) return ValidationResult::failure("ha.tls_insecure", "requires_https");
+    if (ha.tlsInsecure && !ha.caPem.empty()) {
+        return ValidationResult::failure("ha.tls_insecure", "conflicts_with_ca_pem");
+    }
+    return ValidationResult::success();
+}
+
+// Reads the DER SEQUENCE header (tag 0x30, definite length of at most 4 length bytes) at
+// der[pos]. On success *contentStart / *contentLen describe its content, which must fit in
+// the first `limit` bytes of der.
+bool readDerSequence(const std::vector<uint8_t> &der, size_t pos, size_t limit, size_t *contentStart,
+                     size_t *contentLen) {
+    if (limit > der.size() || pos + 2 > limit || der[pos] != 0x30) return false;
+    size_t header = 2;
+    size_t length = der[pos + 1];
+    if (length & 0x80) {
+        const size_t count = length & 0x7F;
+        if (count == 0 || count > 4 || pos + 2 + count > limit) return false;  // 0 = indefinite
+        length = 0;
+        for (size_t i = 0; i < count; ++i) length = (length << 8) | der[pos + 2 + i];
+        header += count;
+    }
+    if (length > limit - pos - header) return false;
+    *contentStart = pos + header;
+    *contentLen = length;
+    return true;
+}
+
+// The decoded PEM body as far as we check it without an X.509 parser:
+//  - Malformed: no outer SEQUENCE spanning exactly the whole buffer (invalid_der).
+//  - NotCertificate: the outer SEQUENCE does not start with a nested SEQUENCE (the
+//    tbsCertificate) that fits inside it. Private keys (PKCS#8, PKCS#1, SEC1) start with an
+//    INTEGER there, so a key relabelled as CERTIFICATE ends up here (not_a_certificate).
+enum class DerShape : uint8_t { Malformed, NotCertificate, Certificate };
+
+DerShape certificateShape(const std::vector<uint8_t> &der) {
+    size_t start = 0;
+    size_t len = 0;
+    if (!readDerSequence(der, 0, der.size(), &start, &len) || start + len != der.size()) {
+        return DerShape::Malformed;
+    }
+    size_t innerStart = 0;
+    size_t innerLen = 0;
+    if (!readDerSequence(der, start, der.size(), &innerStart, &innerLen)) return DerShape::NotCertificate;
+    return DerShape::Certificate;
 }
 
 bool isLowerAlpha(char c) { return c >= 'a' && c <= 'z'; }
@@ -366,6 +443,73 @@ bool isValidLabelText(const std::string &text) {
         i += len;
     }
     return true;
+}
+
+std::string normalizePem(const std::string &text) {
+    std::string out;
+    out.reserve(text.size() + 1);
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\r') {
+            out.push_back('\n');
+            if (i + 1 < text.size() && text[i + 1] == '\n') ++i;
+        } else {
+            out.push_back(text[i]);
+        }
+    }
+    // Trailing spaces and tabs on each line.
+    std::string stripped;
+    stripped.reserve(out.size());
+    for (char c : out) {
+        if (c == '\n') {
+            while (!stripped.empty() && (stripped.back() == ' ' || stripped.back() == '\t')) stripped.pop_back();
+        }
+        stripped.push_back(c);
+    }
+    out.swap(stripped);
+    static constexpr const char *kSpace = " \t\n\v\f";
+    const size_t first = out.find_first_not_of(kSpace);
+    if (first == std::string::npos) return std::string();
+    const size_t last = out.find_last_not_of(kSpace);
+    out = out.substr(first, last - first + 1);
+    out.push_back('\n');
+    return out;
+}
+
+ValidationResult checkCaPem(const std::string &pem) {
+    using VR = ValidationResult;
+    static const std::string kBegin = "-----BEGIN CERTIFICATE-----\n";
+    static const std::string kEnd = "-----END CERTIFICATE-----";
+    if (pem.size() > kMaxCaPemBytes) return VR::failure("ha.ca_pem", "length");
+
+    std::vector<std::string> bodies;
+    size_t pos = 0;
+    while (pos < pem.size()) {
+        const char c = pem[pos];
+        if (c == '\n' || c == ' ' || c == '\t') {  // blank space between blocks
+            ++pos;
+            continue;
+        }
+        if (pem.compare(pos, kBegin.size(), kBegin) != 0) return VR::failure("ha.ca_pem", "not_a_certificate");
+        const size_t bodyStart = pos + kBegin.size();
+        // The body is Base64 only, so the next "-----" must start the matching END line.
+        const size_t end = pem.find("-----", bodyStart);
+        if (end == std::string::npos || pem.compare(end, kEnd.size(), kEnd) != 0 || pem[end - 1] != '\n') {
+            return VR::failure("ha.ca_pem", "not_a_certificate");
+        }
+        pos = end + kEnd.size();
+        if (pos < pem.size() && pem[pos] != '\n') return VR::failure("ha.ca_pem", "not_a_certificate");
+        bodies.push_back(pem.substr(bodyStart, end - bodyStart));
+    }
+    if (bodies.empty()) return VR::failure("ha.ca_pem", "not_a_certificate");
+    if (bodies.size() > kMaxCaCerts) return VR::failure("ha.ca_pem", "too_many");
+    for (const std::string &body : bodies) {
+        std::vector<uint8_t> der;
+        if (!core::util::base64Decode(body, der)) return VR::failure("ha.ca_pem", "invalid_base64");
+        const DerShape shape = certificateShape(der);
+        if (shape == DerShape::Malformed) return VR::failure("ha.ca_pem", "invalid_der");
+        if (shape == DerShape::NotCertificate) return VR::failure("ha.ca_pem", "not_a_certificate");
+    }
+    return VR::success();
 }
 
 std::string makeApPassword(uint32_t (*random32)(), size_t length) {
@@ -484,6 +628,10 @@ ValidationResult validate(const Config &c) {
     if (hasControlChars(c.wifi.ssid)) return VR::failure("wifi.ssid", "invalid_chars");
 
     if (!c.ha.url.empty() && !parseUrlEndpoint(c.ha.url).ok) return VR::failure("ha.url", "invalid");
+    {
+        VR r = checkHaTls(c.ha);
+        if (!r.ok) return r;
+    }
 
     if (c.controls.size() > kMaxControls) return VR::failure("controls", "too_many");
     for (size_t i = 0; i < c.controls.size(); ++i) {
@@ -567,6 +715,14 @@ MergeResult mergePatch(const Config &current, const char *patchJson, size_t leng
         if (!r.ok) return fail(r);
         r = readSecret(root["ha"].as<JsonObjectConst>(), "token", "ha.token", checkHaToken, secrets.haToken);
         if (!r.ok) return fail(r);
+        // An unusable CA or TLS combination is reported as such, not as token_required.
+        r = checkHaTls(merged.ha);
+        if (!r.ok) return fail(r);
+        if (tlsTrustWeakened(current.ha, merged.ha) && secrets.haToken.kind != SecretChange::Kind::Set) {
+            // Never send the stored token over a connection we now trust less (a Web-UI
+            // attacker could otherwise point the device at their own certificate).
+            return fail(ValidationResult::failure("ha.token", "token_required"));
+        }
         if (tokenEndpointChanged(current.ha.url, merged.ha.url)) {
             // Never send the stored token to a new endpoint (token exfiltration guard).
             if (!merged.ha.url.empty() && secrets.haToken.kind != SecretChange::Kind::Set) {

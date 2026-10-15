@@ -74,8 +74,9 @@ line, not only on `BOOT`.
   request passes it in the server middleware. Never add CORS headers.
 - Web UI (`data/`): vanilla JS, no build step, DOM text via `textContent` only (no
   `innerHTML`), no inline scripts or styles (the CSP forbids them). Clients always send
-  whole config sections (section replace is literal), `ssid` in every `wifi` section, `url`
-  in every `ha` section, and the Wi-Fi password together with the SSID (`null` = open).
+  whole config sections (section replace is literal), `ssid` in every `wifi` section, `url`,
+  `ca_pem` and `tls_insecure` in every `ha` section (absent = reset to `""`/`false`), and
+  the Wi-Fi password together with the SSID (`null` = open).
 - `lib/core/src/util/{Sha1,Base64}` and `lib/core/src/ws/` (Step 5b.1, pure): WebSocket
   codec of the own client (device adapter `src/ha/WsTransport`, Step 5b.2).
   `WsHandshake` (upgrade request/response), `WsFrame` (masked client frames), `WsReceiver`
@@ -157,7 +158,7 @@ line, not only on `BOOT`.
 
 ## Step 3 (2026-10-14)
 
-- NVS namespace `haknob`: `cfg` (blob, JSON, <= 8 KB), `wifi_pw`, `ha_token`, `web_pw`,
+- NVS namespace `haknob`: `cfg` (blob, JSON, <= 8 KB; 12 KB from Step 5b.3), `wifi_pw`, `ha_token`, `web_pw`,
   `ap_pw` (10 chars, generated on first boot, survives `factoryReset()`).
 - First boot (nothing stored) logs `CFG defaults reason=missing` and saves the defaults, so
   later boots log `CFG loaded controls=N`. Corrupt / invalid / newer-schema data gives
@@ -182,9 +183,9 @@ line, not only on `BOOT`.
   failure), write `cfg`, write the new secrets. Worst case after a failure is "new cfg,
   secret missing". The in-memory config mirrors NVS once `cfg` is written.
 - `ap_pw` is generated with `bootloader_random_enable()` around `esp_random()` (RF is not up
-  at that point). A stored `cfg` that is empty, > 8 KB or unreadable is `Corrupt` (never
+  at that point). A stored `cfg` that is empty, > `kMaxConfigJsonBytes` or unreadable is `Corrupt` (never
   overwritten automatically).
-- **Custom `partitions.csv`, NVS 64 KB** (was 20 KB in `default_16MB.csv`) so the 8 KB cfg
+- **Custom `partitions.csv`, NVS 64 KB** (was 20 KB in `default_16MB.csv`) so the 8 KB (12 KB from 5b.3) cfg
   blob can be rewritten safely. otadata 0xE000, app0 0x10000 / app1 0x640000 (0x630000
   each), spiffs 0xC70000 (0x370000), **nvs 0xFE0000**, coredump 0xFF0000; 0x9000-0xE000
   unused. Changing the table requires `pio run -e t-encoder-pro -t erase` + upload.
@@ -313,6 +314,34 @@ line, not only on `BOOT`.
   (buffers full) a refused connect plus its `[E]` line kept the main loop busy 38-78 ms,
   the same as with a reader (39-79 ms), so it does not block. These lines bypass
   `logPrintf`'s drop accounting and can interleave with its output.
+
+## Step 5b.3 (2026-10-15)
+
+- `HaConfig` gained `caPem` (`ha.ca_pem`, "" = built-in CA bundle) and `tlsInsecure`
+  (`ha.tls_insecure`, false); not secret, in the cfg blob and `GET /api/config`; schema
+  stays 1, a stored config without them loads unchanged (defaults).
+- `normalizePem` runs in `parseHa` (stored JSON and patches): CRLF/CR -> LF, trailing
+  spaces/tabs per line removed, trim, one trailing LF, whitespace-only -> "". A PEM resent with other line endings compares equal
+  (no token requirement, no NVS write).
+- `checkCaPem` (field `ha.ca_pem`): `length` (> 4096 after normalisation),
+  `not_a_certificate` (anything but 1-3 `CERTIFICATE` blocks separated by blank space),
+  `too_many`, `invalid_base64` (strict `core::util::base64Decode`), `invalid_der` (not one
+  SEQUENCE whose definite outer length equals the decoded size); an outer SEQUENCE whose
+  first element is not a SEQUENCE (relabelled PKCS#8/PKCS#1/SEC1 key) is
+  `not_a_certificate`. `checkHaTls` adds
+  `requires_https` (both fields; an empty URL counts as non-https) and
+  `ha.tls_insecure`/`conflicts_with_ca_pem`. `mergePatch` runs `checkHaTls` before the
+  token guard so a bad CA reports its own error.
+- `kMaxConfigJsonBytes` 8192 -> 12288 (64 KB NVS holds old + new copy). Firmware before
+  5b.3 reports a > 8 KB blob as `corrupt` and boots on defaults (README downgrade note).
+- Token guard extension (`tlsTrustWeakened`): old and new URL both https on the same
+  host:port, and insecure false -> true or a non-empty CA different from the stored one ->
+  `ha.token`/`token_required` unless the patch sets a token. Tightening and http -> https
+  keep the token. Insecure -> custom CA also asks for the token (spec rule taken literally).
+- Not wired yet: `ha::configure` still passes default `TlsSettings` (HaClient signature
+  change belongs to 5b.4); https stays refused with `tls_not_supported`. The web UI does not
+  send the TLS fields yet, which resets them to defaults on save (fine while it only
+  accepts http URLs).
 
 ## Upcoming requirements
 
