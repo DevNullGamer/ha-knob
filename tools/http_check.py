@@ -7,6 +7,8 @@ Usage:
                                [--ha-test --mock-python PY --mock-host PC_IP
                                 [--mock-port 8765] [--serial-log FILE]]
                                [--ws-test --mock-python PY --mock-host PC_IP --serial-log FILE]
+                               [--tls-test --cert-dir DIR --mock-python PY --mock-host PC_IP
+                                --serial-log FILE]
 
 Only uses the Python standard library. Every request uses the device IP as the Host
 header unless stated otherwise, like a browser opening http://<ip>/.
@@ -22,7 +24,7 @@ stored); a valid https + CA + token saves and is returned normalised; tightening
 
 --ha-test (Step 5; changes the ha section and always restores it to url "" / token null):
 runs tools/mockha.py with --mock-python (a Python the Windows firewall lets accept LAN
-connections) and checks https -> no_config/tls_not_supported, ready + ha_version, wrong
+connections) and checks https -> connects (nothing listening: connect_failed/backoff, ha.tls bundle), ready + ha_version, wrong
 token -> auth_failed with exactly one connect attempt, no pong -> reconnect, mock killed ->
 backoff -> recovery, and that no token value reaches /api/config, /api/status or the
 serial log. --serial-log FILE is a file a background serial logger appends to (lines of
@@ -37,7 +39,17 @@ closed_by_server + reconnect, Close without code, upgrade 502 -> handshake_faile
 coalesced handshake, close before 101 -> handshake_failed: closed, mock killed / stalled
 mid-3 MB (connection_lost, PSRAM freed, no reboot). Prints the measured numbers at the end.
 
-Safety: without --ha-test/--ws-test never touches the wifi or ha sections. The only state-changing requests are
+--tls-test (Step 5b.4; same ha restore; needs --cert-dir from tools/gen_test_certs.sh and
+--serial-log written by tools/serial_log.py): wss against tools/mockha.py with throwaway certs:
+cn-ip + CA-A ready (custom_ca, handshake <= 1500 ms, TLS 1.2, ws PING/PONG, Close 1001),
+wrong CA / bundle mode / IP-SAN-only leaf -> tls_cert_rejected with no WebSocket request, insecure
+ready + "WARN HA tls verify=off", self-signed leaf as CA ready, https at a plain HTTP server and a
+TLS 1.3-only server -> tls_handshake_failed, stalled handshake -> tls_timeout (loopmax <= 6.5 s,
+backoff continues), unparsable CA -> tls_ca_invalid without TCP connect, 3 MB over TLS, heap gate
+with a ~4 KB CA bundle, 20 kill/restart cycles (no leak, heap_min >= 70 KB), no maxlength on the
+CA textarea and > 4096 chars -> 400 length. Prints the measured numbers at the end.
+
+Safety: without --ha-test/--ws-test/--tls-test never touches the wifi or ha sections. The only state-changing requests are
  - a device patch with an invalid hostname (must be rejected with 400),
  - with --web-password-test: setting a random web password and clearing it again
    (always cleared in a finally block),
@@ -391,35 +403,31 @@ def run_ha_test(c, args):
 
     secrets_seen = [good, wrong, fake_https]
     try:
-        # A. https: refused, no connection attempt
+        # A. https: since 5b.4 it connects (wss); nothing listens on the port yet -> backoff
         mark = slog.mark() if slog else 0
-        st, _, raw = set_ha(c, "https://ha.example.com", fake_https)
+        st, _, raw = set_ha(c, f"https://{args.mock_host}:{args.mock_port}", fake_https)
         c.expect_status("A: set https url + fake token 200", st, 200, raw)
-        h, _ = wait_ha(c, "no_config", 10, "tls_not_supported")
-        c.check(h.get("state") == "no_config" and "tls_not_supported" in h.get("last_error", ""),
-                "A: https -> no_config + tls_not_supported", h)
-        time.sleep(5)
-        h = ha_status(c)
-        c.check(h.get("state") == "no_config", "A: still no_config after 5 s", h)
+        h, _ = wait_ha(c, "backoff", 25)
+        c.check(h.get("state") == "backoff" and "tls_not_supported" not in h.get("last_error", ""),
+                "A: https -> tries to connect (backoff), no tls_not_supported", h)
+        c.check(h.get("tls") == "bundle", "A: ha.tls == bundle for an https url without CA", h)
         n = attempts(mark)
         if n is not None:
-            c.check(n == 0, "A: no 'HA connect attempt' on serial for https", n)
+            c.check(n >= 1, "A: 'HA connect attempt' on serial for https", n)
         st, _, raw = c.request("GET", "/api/config")
         cfgj = c.json_of(raw) or {}
         c.check(fake_https not in raw.decode("utf-8", "replace"),
                 "A: /api/config does not contain the token")
         c.check(cfgj.get("ha", {}).get("token_set") is True
-                and cfgj.get("ha", {}).get("url") == "https://ha.example.com",
+                and cfgj.get("ha", {}).get("url") == f"https://{args.mock_host}:{args.mock_port}",
                 "A: config ha.token_set true, url kept", cfgj.get("ha"))
         st, _, raw = c.request("GET", "/api/status")
         c.check(fake_https not in raw.decode("utf-8", "replace"),
                 "A: /api/status does not contain the token")
         st, _, raw = c.request("POST", "/api/ha/retry", body="{}", headers=post_headers())
-        c.expect_status("A: retry in no_config still 200", st, 200, raw)
+        c.expect_status("A: retry in backoff 200", st, 200, raw)
         time.sleep(2)
-        c.check(ha_status(c).get("state") == "no_config", "A: retry does not leave no_config")
-        if slog:
-            c.check(attempts(mark) == 0, "A: still no attempts after retry")
+        c.check(ha_status(c).get("state") != "no_config", "A: retry does not leave the https config")
 
         # B. mock HA: ready + version
         start_mock()
@@ -795,6 +803,385 @@ def run_ws_test(c, args):
             print(f"      {name}: {kw}")
 
 
+def tls_serial(slog, mark, needle):
+    return [l for l in slog.since(mark) if needle in l]
+
+
+def run_tls_test(c, args):
+    """Step 5b.4 device matrix T1-T14, T16 + heap gate: wss against tools/mockha.py with throwaway
+    certificates from tools/gen_test_certs.sh (--cert-dir). Restores ha to no config."""
+    print("\n--- Step 5b.4 on-device wss tests (ha section is restored at the end) ---")
+    if not (args.serial_log and args.cert_dir):
+        c.check(False, "--tls-test needs --serial-log and --cert-dir")
+        return
+    slog = SerialLog(args.serial_log)
+    root = os.path.dirname(os.path.abspath(__file__))
+    mock_path = os.path.join(root, "mockha.py")
+    cd = args.cert_dir
+
+    def pem(name):
+        with open(os.path.join(cd, name), encoding="utf-8") as f:
+            return f.read()
+
+    def cert(name):
+        return ["--tls-cert", os.path.join(cd, name + ".pem"), "--tls-key", os.path.join(cd, name + ".key")]
+
+    ca_a, ca_b, self_pem = pem("ca-a.pem"), pem("ca-b.pem"), pem("self.pem")
+    big_bundle, bad_ca = pem("bigbundle.pem"), pem("bad-ca.pem")
+    port = args.mock_port
+    base = f"https://{args.mock_host}:{port}"
+    tokens = []
+    mock = {"proc": None, "log": None}
+    http_srv = {"proc": None, "log": None, "dir": None}
+    results = []
+
+    def record(name, **kw):
+        results.append((name, kw))
+
+    def stop_mock():
+        if mock["proc"] is not None:
+            mock["proc"].kill()
+            mock["proc"].wait()
+            mock["proc"] = None
+            time.sleep(0.3)
+
+    def start_mock(*extra, port_=None):
+        stop_mock()
+        mock["log"] = tempfile.NamedTemporaryFile("w+", suffix=".log", delete=False)
+        mock["proc"] = subprocess.Popen(
+            [args.mock_python, mock_path, "--port", str(port_ or port), "--token", tokens[-1],
+             "--seconds", "1500", *map(str, extra)], stdout=mock["log"], stderr=subprocess.STDOUT)
+        time.sleep(1.5)
+
+    def mock_lines():
+        mock["log"].flush()
+        with open(mock["log"].name, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+
+    def status():
+        st, _, raw = c.request("GET", "/api/status")
+        return c.json_of(raw) or {}
+
+    def safe_status():
+        try:
+            return status()
+        except (OSError, http.client.HTTPException):
+            return None
+
+    def post_ha(url, ca="", insecure=False, token=True):
+        ha = {"url": url, "ca_pem": ca, "tls_insecure": insecure}
+        if token:
+            tokens.append(f"tls-test-token-{len(tokens)}-{secrets.token_hex(3)}")
+            ha["token"] = tokens[-1]
+        st, _, raw = c.request("POST", "/api/config", body=json.dumps({"ha": ha}), headers=post_headers())
+        return st, raw
+
+    def scenario(label, mock_args, ca="", insecure=False, url=None, want_state="ready", want_err=None,
+                 timeout=30, start=True):
+        """Starts the mock (token = the one set below), points the device at it, waits for the state."""
+        # The old mock goes first and the new settings are saved while nothing listens, so the
+        # device can never talk to the new mock with the previous scenario's TLS settings.
+        tokens.append(f"tls-test-token-{len(tokens)}-{secrets.token_hex(3)}")
+        stop_mock()
+        mark = slog.mark()
+        ha = {"url": url or base, "ca_pem": ca, "tls_insecure": insecure, "token": tokens[-1]}
+        st, _, raw = c.request("POST", "/api/config", body=json.dumps({"ha": ha}), headers=post_headers())
+        c.expect_status(f"{label}: config saved", st, 200, raw)
+        if start:
+            start_mock(*mock_args)
+        h, took = wait_ha(c, want_state, timeout, want_err)
+        return mark, h, took
+
+    def tls_ok_ms(mark):
+        out = []
+        for l in tls_serial(slog, mark, "HA tls ok ms="):
+            try:
+                out.append((int(l.split("ms=")[1].split()[0]), int(l.split("heap=")[1].split()[0])))
+            except (IndexError, ValueError):
+                pass
+        return out
+
+    def hb_max(mark, key):
+        vals = [kv.get(key, 0) for _, kv in hb_samples(slog, mark)]
+        return max(vals) if vals else None
+
+    def no_ws_traffic(label):
+        ml = mock_lines()
+        c.check(not any(" REQ " in l for l in ml) and not any(" RX " in l for l in ml),
+                f"{label}: mock saw no WebSocket request and no auth", [l for l in ml if " REQ " in l or " RX " in l][:3])
+
+    try:
+        # ---- start from a clean slate (an earlier aborted run may have left a config behind)
+        clear = {"ha": {"url": "", "ca_pem": "", "tls_insecure": False, "token": None}}
+        st, _, raw = c.request("POST", "/api/config", body=json.dumps(clear), headers=post_headers())
+        c.expect_status("start: ha cleared", st, 200, raw)
+        wait_ha(c, "no_config", 15)
+        s0 = status()
+        c.check(isinstance(s0.get("ha", {}).get("tls"), str), "T14: /api/status ha.tls present (no config)", s0.get("ha"))
+        c.check(s0.get("ha", {}).get("tls") == "none", "T14: ha.tls == none without a config", s0.get("ha"))
+
+        # ---- T1 cn-ip + CA-A -> ready custom_ca ; T13 PING/PONG over TLS
+        mark, h, took = scenario("T1", cert("cn-ip") + ["--ws-ping-after-auth", "--after-auth-delay", 2], ca=ca_a)
+        c.check(h.get("state") == "ready", "T1: cn-ip leaf + CA-A -> ready", h)
+        c.check(h.get("tls") == "custom_ca", "T1/T14: ha.tls == custom_ca", h)
+        c.check(h.get("ha_version") == "2099.1.0-mock", "T1: ha_version over TLS", h)
+        oks = tls_ok_ms(mark)
+        c.check(bool(oks) and oks[0][0] <= 1500, "T1: 'HA tls ok ms=' <= 1500", oks[:2])
+        c.check(bool(tls_serial(slog, mark, "HA tls mode=custom_ca host=")), "T1: serial 'HA tls mode=custom_ca host='")
+        c.check(not tls_serial(slog, mark, "verify=off"), "T1: no 'verify=off' warning in custom_ca mode")
+        time.sleep(4)
+        ml = mock_lines()
+        c.check(any("TLS handshake ok" in l and "TLSv1.2" in l for l in ml), "T1: mock negotiated TLS 1.2",
+                [l for l in ml if "TLS handshake" in l][:2])
+        c.check(any("RX PONG payload=b'hb-123'" in l for l in ml), "T13: ws PING over TLS answered with same payload", ml[-4:])
+        c.check(not any("not masked" in l for l in ml), "T13: client frames masked over TLS")
+        s = status()
+        time.sleep(4)
+        s = status()
+        heap_conn = s.get("heap_free")
+        c.check(isinstance(heap_conn, int) and heap_conn >= 90 * 1024, "heap: internal free >= 90 KB while connected (cn-ip/CA-A)",
+                heap_conn)
+        record("T1", handshake_ms=oks[0][0] if oks else None, heap_at_tls_ok=oks[0][1] if oks else None,
+               heap_free_connected=heap_conn, heap_min=s.get("heap_min_free"),
+               ready_after_s=round(took or 0, 1))
+        st, _, raw = c.request("GET", "/api/config")
+        hc = (c.json_of(raw) or {}).get("ha", {})
+        c.check(hc.get("ca_pem") == ca_a and hc.get("tls_insecure") is False and hc.get("token_set") is True,
+                "T14: GET /api/config shows ca_pem (normalised), tls_insecure false, token_set", {k: (v if k != "ca_pem" else len(v)) for k, v in hc.items()})
+        c.check(not any(t in raw.decode("utf-8", "replace") for t in tokens), "T16: /api/config has no token")
+        st, _, raw = c.request("GET", "/api/status")
+        c.check(not any(t in raw.decode("utf-8", "replace") for t in tokens) and "BEGIN CERTIFICATE" not in raw.decode("utf-8", "replace"),
+                "T16: /api/status has no token and no CA text")
+
+        # ---- T13 Close over TLS
+        mark, h, _ = scenario("T13b", cert("cn-ip") + ["--close-after-auth", 1001, "--after-auth-delay", 2], ca=ca_a)
+        h2, _ = wait_ha(c, "backoff", 15, "closed_by_server")
+        c.check(h2.get("state") == "backoff" and "closed_by_server" in h2.get("last_error", ""),
+                "T13: Close 1001 over TLS -> backoff + closed_by_server", h2)
+        time.sleep(2)
+        c.check(any("RX CLOSE code=1001" in l for l in mock_lines()), "T13: device replied to the Close over TLS",
+                [l for l in mock_lines() if "CLOSE" in l][:2])
+        h3, _ = wait_ha(c, "ready", 20)
+        c.check(h3.get("state") == "ready", "T13: reconnects over TLS after the Close", h3)
+
+        # ---- T2 CA-B for a CA-A leaf -> tls_cert_rejected, no WS traffic
+        mark, h, _ = scenario("T2", cert("cn-ip"), ca=ca_b, want_state="backoff", want_err="tls_cert_rejected")
+        c.check("tls_cert_rejected" in h.get("last_error", ""), "T2: wrong CA -> tls_cert_rejected", h)
+        c.check(h.get("tls") == "custom_ca", "T2: ha.tls custom_ca", h)
+        time.sleep(3)
+        no_ws_traffic("T2")
+        c.check(any("TLS handshake failed" in l for l in mock_lines()), "T2: mock saw the TLS handshake fail (client alert)")
+        c.check(bool(tls_serial(slog, mark, "HA tls failed error=tls_cert_rejected")), "T2: serial 'HA tls failed error=tls_cert_rejected'",
+                tls_serial(slog, mark, "HA tls failed")[:1])
+
+        # ---- T3 bundle mode vs the mock -> rejected
+        mark, h, _ = scenario("T3", cert("cn-ip"), ca="", want_state="backoff", want_err="tls_cert_rejected")
+        c.check("tls_cert_rejected" in h.get("last_error", ""), "T3: bundle mode vs private CA -> tls_cert_rejected", h)
+        c.check(h.get("tls") == "bundle", "T3/T14: ha.tls == bundle", h)
+        c.check(bool(tls_serial(slog, mark, "HA tls mode=bundle host=")), "T3: serial 'HA tls mode=bundle'")
+        time.sleep(2)
+        no_ws_traffic("T3")
+
+        # ---- T4 insecure -> ready + WARN
+        mark, h, took = scenario("T4", cert("cn-ip"), insecure=True)
+        c.check(h.get("state") == "ready", "T4: insecure -> ready", h)
+        c.check(h.get("tls") == "insecure", "T4/T14: ha.tls == insecure", h)
+        time.sleep(1)
+        c.check(bool(tls_serial(slog, mark, "WARN HA tls verify=off")), "T4: serial 'WARN HA tls verify=off'")
+        c.check(bool(tls_serial(slog, mark, "HA tls mode=insecure host=")), "T4: serial 'HA tls mode=insecure'")
+        oks = tls_ok_ms(mark)
+        record("T4", handshake_ms=oks[0][0] if oks else None, ready_after_s=round(took or 0, 1))
+        # insecure also accepts an unrelated certificate (self) - trust is not checked at all
+        mark, h, _ = scenario("T4b", cert("self"), insecure=True)
+        c.check(h.get("state") == "ready", "T4: insecure accepts a self-signed leaf", h)
+
+        # ---- T5 san-ip + CA-A -> rejected (mbedTLS has no IP SAN matching)
+        mark, h, _ = scenario("T5", cert("san-ip"), ca=ca_a, want_state="backoff", want_err="tls_cert_rejected")
+        c.check("tls_cert_rejected" in h.get("last_error", ""), "T5: IP-SAN-only leaf -> tls_cert_rejected", h)
+        time.sleep(2)
+        no_ws_traffic("T5")
+
+        # ---- T6 self-signed leaf pasted as CA -> ready
+        mark, h, _ = scenario("T6", cert("self"), ca=self_pem)
+        c.check(h.get("state") == "ready", "T6: self-signed leaf as CA -> ready", h)
+        c.check(h.get("tls") == "custom_ca", "T6: ha.tls custom_ca", h)
+
+        # ---- T7 https at a plain HTTP server -> tls_handshake_failed, no plaintext fallback
+        http_srv["dir"] = tempfile.mkdtemp(prefix="plainhttp_")
+        http_srv["log"] = tempfile.NamedTemporaryFile("w+", suffix=".log", delete=False)
+        p7 = port + 1
+        http_srv["proc"] = subprocess.Popen([args.mock_python, "-I", "-m", "http.server", str(p7), "--bind", "0.0.0.0"],
+                                            cwd=http_srv["dir"], stdout=http_srv["log"], stderr=subprocess.STDOUT)
+        time.sleep(1.5)
+        stop_mock()
+        mark, h, _ = scenario("T7", [], ca=ca_a, url=f"https://{args.mock_host}:{p7}", start=False,
+                              want_state="backoff", want_err="tls_handshake_failed")
+        c.check("tls_handshake_failed" in h.get("last_error", ""), "T7: https at a plain HTTP port -> tls_handshake_failed", h)
+        time.sleep(3)
+        http_srv["log"].flush()
+        with open(http_srv["log"].name, encoding="utf-8", errors="replace") as f:
+            hl = f.read()
+        c.check("api/websocket" not in hl and "Upgrade" not in hl and not any(t in hl for t in tokens),
+                "T7: the plain server never saw a WebSocket request or token (no plaintext fallback)", hl[-300:])
+        http_srv["proc"].kill()
+        http_srv["proc"].wait()
+        http_srv["proc"] = None
+
+        # ---- T8 TLS 1.3 only -> tls_handshake_failed
+        mark, h, _ = scenario("T8", cert("cn-ip") + ["--tls13-only"], ca=ca_a, want_state="backoff",
+                              want_err="tls_handshake_failed")
+        c.check("tls_handshake_failed" in h.get("last_error", ""), "T8: TLS 1.3-only server -> tls_handshake_failed", h)
+        time.sleep(2)
+        no_ws_traffic("T8")
+
+        # ---- T9 stalled handshake -> tls_timeout, block <= 6.5 s, backoff continues
+        mark, h, _ = scenario("T9", ["--stall"], ca=ca_a, want_state="backoff", want_err="tls_timeout", timeout=40)
+        c.check("tls_timeout" in h.get("last_error", ""), "T9: stalled TLS handshake -> tls_timeout", h)
+        time.sleep(32)  # at least two more attempts (1 s, 2 s, 4 s backoff plus 4 s timeouts)
+        att = len(tls_serial(slog, mark, "HA connect attempt"))
+        c.check(att >= 3, "T9: backoff continues (>= 3 attempts in ~45 s)", att)
+        lm = hb_max(mark, "loopmax")
+        c.check(lm is not None and 3500 <= lm <= 6500, "T9: single loop block (HB loopmax) between 3.5 and 6.5 s", lm)
+        record("T9", loopmax_ms=lm, attempts=att)
+        stop_mock()
+
+        # ---- T10 structurally valid but unparsable CA -> tls_ca_invalid with no TCP connect
+        mark, h, _ = scenario("T10", cert("cn-ip"), ca=bad_ca, want_state="backoff", want_err="tls_ca_invalid")
+        c.check("tls_ca_invalid" in h.get("last_error", ""), "T10: unparsable CA -> tls_ca_invalid", h)
+        time.sleep(4)
+        c.check(not any("CONNECT from" in l for l in mock_lines()), "T10: the device made no TCP connection to the mock",
+                [l for l in mock_lines() if "CONNECT" in l][:2])
+        stop_mock()
+
+        # ---- T11 3 MB after auth over TLS
+        mark, h, _ = scenario("T11", cert("cn-ip") + ["--big-after-auth", 3145728, "--after-auth-delay", 3], ca=ca_a)
+        c.check(h.get("state") == "ready", "T11: ready before the 3 MB message", h)
+        time.sleep(3)
+        fails, states = 0, []
+        t0 = time.time()
+        while time.time() - t0 < 20:
+            s = safe_status()
+            if s is None:
+                fails += 1
+            else:
+                states.append(s.get("ha", {}).get("state"))
+            time.sleep(0.5)
+        rx = tls_serial(slog, mark, "HA rx len=")
+        got = None
+        for l in rx:
+            try:
+                ln = int(l.split("len=")[1].split()[0])
+                ms = int(l.split("ms=")[1].split()[0])
+                if ln == 3145728:
+                    got = ms
+            except (IndexError, ValueError):
+                pass
+        c.check(got is not None, "T11: 3 MB message received over TLS ('HA rx len=3145728')", rx[-3:])
+        if got:
+            kbs = 3145728 / 1024.0 / max(got, 1) * 1000.0
+            c.check(kbs >= 300, "T11: throughput >= 300 KB/s", f"{kbs:.0f} KB/s ({got} ms)")
+        c.check(all(x == "ready" for x in states), "T11: state stays ready", sorted(set(states)))
+        lm_all = hb_max(mark, "loopmax")
+        lines = slog.since(mark)
+        idx = next((i for i, l in enumerate(lines) if "HA state=ready" in l), 0)
+        ready_hb = []
+        for l in lines[idx:]:
+            if " HB " in l and "loopmax=" in l:
+                try:
+                    ready_hb.append(int(l.split("loopmax=")[1].split()[0]))
+                except ValueError:
+                    pass
+        record("T11", rx_ms=got, kb_per_s=int(3145728 / 1024.0 / max(got, 1) * 1000.0) if got else None,
+               loopmax_ms_ready_to_end=ready_hb, loopmax_ms_whole_run=lm_all, status_failures=fails)
+
+        # ---- heap gate with a near-4096-char CA bundle (one of its certs is CA-A)
+        norm_len = len(big_bundle.replace("\r\n", "\n").strip()) + 1
+        print(f"      bigbundle normalised length {norm_len}")
+        mark, h, took = scenario("H", cert("cn-ip"), ca=big_bundle)
+        c.check(h.get("state") == "ready", f"H: ready with a {norm_len}-char CA bundle (CA-A is one of 3)", h)
+        c.check(h.get("tls") == "custom_ca", "H: ha.tls custom_ca", h)
+        time.sleep(6)
+        s = status()
+        oks = tls_ok_ms(mark)
+        hf, hm = s.get("heap_free"), s.get("heap_min_free")
+        c.check(isinstance(hf, int) and hf >= 90 * 1024, "H: internal free heap >= 90 KB connected (big CA)", hf)
+        c.check(isinstance(hm, int) and hm >= 70 * 1024, "H: heap_min >= 70 KB (big CA)", hm)
+        c.check(bool(oks) and oks[0][0] <= 1500, "H: handshake <= 1500 ms (big CA)", oks[:1])
+        record("H big CA", ca_chars=norm_len, heap_free=hf, heap_min=hm, handshake_ms=oks[0][0] if oks else None,
+               heap_at_tls_ok=oks[0][1] if oks else None)
+
+        # ---- T12 20 kill/restart cycles (custom CA, cn-ip)
+        mark, h, _ = scenario("T12", cert("cn-ip"), ca=ca_a)
+        c.check(h.get("state") == "ready", "T12: ready before the kill/restart cycles", h)
+        time.sleep(5)
+        heaps = {}
+        s = status()
+        heaps[0] = s.get("heap_free")
+        for i in range(1, 21):
+            n_before = len(tls_ok_ms(mark))
+            start_mock(*cert("cn-ip"))  # kills the old mock (connection dropped), starts a new one
+            deadline = time.time() + 60
+            while time.time() < deadline and len(tls_ok_ms(mark)) <= n_before:
+                time.sleep(1)
+            h, _ = wait_ha(c, "ready", 25)
+            if h.get("state") != "ready":
+                c.check(False, f"T12: cycle {i} reached ready", h)
+                break
+            time.sleep(4)
+            s = safe_status() or {}
+            heaps[i] = s.get("heap_free")
+            print(f"      cycle {i:2d}: heap_free={heaps[i]} heap_min={s.get('heap_min_free')}")
+        s = status()
+        done = max(heaps)
+        c.check(done == 20, "T12: all 20 kill/restart cycles completed", done)
+        if done == 20:
+            drift_settled = abs(heaps[20] - heaps[10])
+            drift_total = heaps[0] - heaps[20]
+            c.check(drift_settled <= 2048, "T12: heap after settling (cycle 10 -> 20) within 2 KB", f"{drift_settled} B")
+            c.check(drift_total <= 4096, "T12 (info): heap start -> cycle 20 drift <= 4 KB (warm-up allocations)", f"{drift_total} B")
+            if drift_total > 2048:
+                print(f"      NOTE start->20 drift {drift_total} B exceeds 2 KB (first cycles warm up), settled drift {drift_settled} B")
+        hm = s.get("heap_min_free")
+        c.check(isinstance(hm, int) and hm >= 70 * 1024, "T12: heap_min >= 70 KB after the cycles", hm)
+        record("T12", heaps={k: v for k, v in heaps.items() if k in (0, 1, 5, 10, 15, 20)}, heap_min=hm)
+        stop_mock()
+
+        # ---- T14/UI: no maxlength on the CA textarea in the served page; > 4096 chars -> 400 length
+        st, _, raw = c.request("GET", "/")
+        page = raw.decode("utf-8", "replace")
+        i = page.find('id="ha-ca-pem"')
+        tag = page[page.rfind("<", 0, i): page.find(">", i) + 1] if i >= 0 else ""
+        c.check(i >= 0 and "maxlength" not in tag, "UI: CA textarea served without maxlength", tag)
+        too_long = ca_a + "A" * 4100
+        st, raw = post_ha(base, ca=too_long)
+        body = c.json_of(raw) or {}
+        c.check(st == 400 and body.get("field") == "ha.ca_pem" and body.get("error") == "length",
+                "UI: > 4096-char CA POST -> 400 length ha.ca_pem", f"{st} {raw[:150]!r}")
+    finally:
+        stop_mock()
+        if http_srv["proc"] is not None:
+            http_srv["proc"].kill()
+            http_srv["proc"].wait()
+        body = {"ha": {"url": "", "ca_pem": "", "tls_insecure": False, "token": None}}
+        st, _, raw = c.request("POST", "/api/config", body=json.dumps(body), headers=post_headers())
+        c.expect_status("restore: ha cleared (url, CA, insecure, token)", st, 200, raw)
+        h, _ = wait_ha(c, "no_config", 15)
+        c.check(h.get("state") == "no_config", "restore: ha.state no_config", h)
+        st, _, raw = c.request("GET", "/api/config")
+        hc = (c.json_of(raw) or {}).get("ha", {})
+        c.check(hc.get("url") == "" and hc.get("ca_pem") == "" and hc.get("tls_insecure") is False
+                and hc.get("token_set") is False, "restore: url '', no CA, not insecure, no token", hc)
+        text = "\n".join(slog.since(0))
+        for tok in tokens:
+            c.check(tok not in text, f"T16: serial log never contains the token value (...{tok[-8:]})")
+        c.check("access_token" not in text, "T16: serial log never contains access_token")
+        c.check("BEGIN CERTIFICATE" not in text and "MIID" not in text and "MIIC" not in text,
+                "T16: serial log never contains CA text")
+        print("\n      --- scenario numbers ---")
+        for name, kw in results:
+            print(f"      {name}: {kw}")
+
+
 def run(args):
     c = Checker(args.ip)
     hostname = args.hostname
@@ -1058,6 +1445,8 @@ def run(args):
         run_ha_test(c, args)
     if args.ws_test:
         run_ws_test(c, args)
+    if args.tls_test:
+        run_tls_test(c, args)
 
     print(f"\n{c.passes} passed, {len(c.failures)} failed")
     for f in c.failures:
@@ -1080,15 +1469,20 @@ def main():
                    help="Step 5 on-device tests against tools/mockha.py (restores the ha section)")
     p.add_argument("--ws-test", action="store_true",
                    help="Step 5b.2 on-device WebSocket transport tests (needs --serial-log; restores the ha section)")
+    p.add_argument("--tls-test", action="store_true",
+                   help="Step 5b.4 on-device wss matrix (needs --cert-dir, --serial-log; restores the ha section)")
+    p.add_argument("--cert-dir", help="directory written by tools/gen_test_certs.sh (never commit it)")
     p.add_argument("--mock-python", help="Python executable that may accept LAN connections")
     p.add_argument("--mock-host", help="LAN IP of this PC as seen from the device")
     p.add_argument("--mock-port", type=int, default=8765)
     p.add_argument("--serial-log", help="file appended to by a background serial logger")
     args = p.parse_args()
-    if (args.ha_test or args.ws_test) and not (args.mock_python and args.mock_host):
+    if (args.ha_test or args.ws_test or args.tls_test) and not (args.mock_python and args.mock_host):
         p.error("--ha-test / --ws-test need --mock-python and --mock-host")
     if args.ws_test and not args.serial_log:
         p.error("--ws-test needs --serial-log")
+    if args.tls_test and not (args.serial_log and args.cert_dir):
+        p.error("--tls-test needs --serial-log and --cert-dir")
     socket.setdefaulttimeout(TIMEOUT)
     sys.exit(run(args))
 

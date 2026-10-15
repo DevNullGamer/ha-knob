@@ -1,4 +1,4 @@
-"""Mock of the HA WebSocket API for on-device checks (Steps 5 and 5b.2; not a unit test).
+"""Mock of the HA WebSocket API for on-device checks (Steps 5, 5b.2 and 5b.4; not a unit test).
 
 Run with a Python the Windows firewall allows on the LAN, e.g.
   C:\\Users\\Jesper\\AppData\\Local\\Python\\pythoncore-3.15-64\\python.exe tools/mockha.py --seconds 300
@@ -26,10 +26,17 @@ Actions after auth_ok, in this order (all after --after-auth-delay):
   --close-after-auth-nocode  send a ws Close frame with an empty body
 The mock logs "RX PONG payload=..." for ws pongs and "RX CLOSE code=..." for the device's
 Close reply (code=None when the body was empty), and "ERROR client frame not masked".
+TLS options (Step 5b.4; the mock then speaks wss)
+  --tls-cert F --tls-key F  wrap accepted sockets with TLS (Python ssl, TLS 1.2 and 1.3 allowed)
+  --tls13-only        require TLS 1.3 (the device only speaks 1.2: handshake must fail)
+  --stall             accept the TCP connection and never answer the TLS ClientHello
+                      (also without --tls-cert); the socket is closed after 20 s
+Per connection the mock logs "TLS handshake ok/failed ..."; a rejected certificate shows up as
+"TLS handshake failed" and no "REQ" line (no WebSocket request, no auth, no token sent).
 It answers subscribe_entities with a success result. The access token is never printed (only
 its length).
 """
-import argparse, base64, hashlib, json, socket, struct, threading, time
+import argparse, base64, hashlib, json, socket, ssl, struct, threading, time
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -211,6 +218,26 @@ def handle(c, addr, args):
                 send(text({"id": msg["id"], "type": "pong"}))
 
 
+def tls_conn(c, addr, args, ctx):
+    """Handshake (or stall) on a freshly accepted socket, then run the normal mock."""
+    t0 = time.time()
+    if args.stall:
+        print(f"STALL {addr} (TCP accepted, no TLS answer)", flush=True)
+        time.sleep(20)
+        c.close()
+        return
+    try:
+        c.settimeout(10)
+        sc = ctx.wrap_socket(c, server_side=True)
+        sc.settimeout(None)
+    except Exception as e:
+        print(f"TLS handshake failed {addr} after {time.time()-t0:.2f}s: {e!r}", flush=True)
+        c.close()
+        return
+    print(f"TLS handshake ok {addr} {sc.version()} {sc.cipher()[0]} {time.time()-t0:.2f}s", flush=True)
+    handle_safe(sc, addr, args)
+
+
 def handle_safe(c, addr, args):
     try:
         handle(c, addr, args)
@@ -242,7 +269,20 @@ def main():
     ap.add_argument("--rst-after-auth", action="store_true")
     ap.add_argument("--close-after-auth", type=int, default=None, metavar="CODE")
     ap.add_argument("--close-after-auth-nocode", action="store_true")
+    ap.add_argument("--tls-cert", default=None)
+    ap.add_argument("--tls-key", default=None)
+    ap.add_argument("--tls13-only", action="store_true")
+    ap.add_argument("--stall", action="store_true")
     args = ap.parse_args()
+    ctx = None
+    if args.tls_cert or args.tls13_only or args.stall:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        if args.tls13_only:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        if args.tls_cert:
+            ctx.load_cert_chain(args.tls_cert, args.tls_key)
+        elif not args.stall:
+            ap.error("--tls13-only needs --tls-cert/--tls-key")
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", args.port))
@@ -256,7 +296,10 @@ def main():
         except socket.timeout:
             continue
         print("CONNECT from", addr, flush=True)
-        threading.Thread(target=handle_safe, args=(c, addr, args), daemon=True).start()
+        if ctx is not None or args.stall:
+            threading.Thread(target=tls_conn, args=(c, addr, args, ctx), daemon=True).start()
+        else:
+            threading.Thread(target=handle_safe, args=(c, addr, args), daemon=True).start()
 
 
 if __name__ == "__main__":

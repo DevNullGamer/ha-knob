@@ -3,6 +3,7 @@
 
 #include <ArduinoJson.h>
 
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
@@ -377,26 +378,33 @@ static void test_unknown_result_id_ignored() {
     TEST_ASSERT_EQUAL(S::Subscribing, s.state());
 }
 
-static void test_https_not_supported() {
+static void test_https_opens_with_tls() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
     s.configure("https://x.ui.nabu.casa", "tok", ha::TlsSettings(), {}, 0);
-    TEST_ASSERT_EQUAL(S::NoConfig, s.state());
-    TEST_ASSERT_EQUAL_STRING("tls_not_supported", s.lastError().c_str());
-    s.setNetworkUp(false, 10);
-    s.setNetworkUp(true, 20);
-    s.tick(100000);
-    TEST_ASSERT_FALSE(s.retry(100001));
-    s.tick(200000);
-    TEST_ASSERT_EQUAL(0, t.opens);
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    TEST_ASSERT_EQUAL_STRING("", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(1, t.opens);
+    TEST_ASSERT_TRUE(t.lastEndpoint.ok);
+    TEST_ASSERT_TRUE(t.lastEndpoint.tls);
+    TEST_ASSERT_EQUAL_STRING("x.ui.nabu.casa", t.lastEndpoint.host.c_str());
+    TEST_ASSERT_EQUAL_UINT16(443, t.lastEndpoint.port);
+    TEST_ASSERT_FALSE(t.lastTls.insecure);
+    TEST_ASSERT_EQUAL_STRING("", t.lastTls.caPem.c_str());
+    TEST_ASSERT_EQUAL(ha::TlsMode::Bundle, s.tlsMode());
+    // the normal auth flow works over a TLS endpoint, token only after auth_required
     TEST_ASSERT_EQUAL(0, (int)t.sent.size());
-    TEST_ASSERT_EQUAL(S::NoConfig, s.state());
-    // switching to http connects
+    feed(s, kAuthRequired, 1);
+    TEST_ASSERT_EQUAL(S::Authenticating, s.state());
+    feed(s, kAuthOk, 2);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    // switching to http reconnects in plain mode
     s.configure(kUrl, "tok", ha::TlsSettings(), {}, 300000);
     TEST_ASSERT_EQUAL(S::Connecting, s.state());
-    TEST_ASSERT_EQUAL(1, t.opens);
-    TEST_ASSERT_EQUAL_STRING("", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(2, t.opens);
+    TEST_ASSERT_FALSE(t.lastEndpoint.tls);
+    TEST_ASSERT_EQUAL(ha::TlsMode::None, s.tlsMode());
 }
 
 static void test_tls_settings_reach_transport_open() {
@@ -473,22 +481,200 @@ static void test_tls_settings_in_auth_failed() {
     TEST_ASSERT_EQUAL(2, t.opens);
 }
 
-static void test_https_still_refused_with_tls_settings_zero_opens() {
+static void test_https_with_tls_settings_opens_with_them() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
     ha::TlsSettings ins;
     ins.insecure = true;
     s.configure("https://ha.example.com", "tok", ins, {}, 0);
-    TEST_ASSERT_EQUAL(S::NoConfig, s.state());
-    TEST_ASSERT_EQUAL_STRING("tls_not_supported", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    TEST_ASSERT_EQUAL_STRING("", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(1, t.opens);
+    TEST_ASSERT_TRUE(t.lastEndpoint.tls);
+    TEST_ASSERT_TRUE(t.lastTls.insecure);
+    TEST_ASSERT_EQUAL(ha::TlsMode::Insecure, s.tlsMode());
     ha::TlsSettings ca;
     ca.caPem = "pem";
     s.configure("https://ha.example.com", "tok", ca, {}, 5);
-    s.tick(100000);
-    TEST_ASSERT_EQUAL(0, t.opens);
-    TEST_ASSERT_EQUAL(S::NoConfig, s.state());
-    TEST_ASSERT_EQUAL_STRING("tls_not_supported", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(2, t.opens);
+    TEST_ASSERT_TRUE(t.lastEndpoint.tls);
+    TEST_ASSERT_FALSE(t.lastTls.insecure);
+    TEST_ASSERT_EQUAL_STRING("pem", t.lastTls.caPem.c_str());
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    TEST_ASSERT_EQUAL(ha::TlsMode::CustomCa, s.tlsMode());
+}
+
+static void test_tls_mode_for_and_name() {
+    const ha::HaUrl plain = ha::parseHaUrl("http://192.168.1.10:8123");
+    const ha::HaUrl secure = ha::parseHaUrl("https://ha.example.com");
+    const ha::HaUrl bad = ha::parseHaUrl("ftp://h");
+    ha::TlsSettings none, ins, ca, both;
+    ins.insecure = true;
+    ca.caPem = "pem";
+    both.insecure = true;
+    both.caPem = "pem";
+    TEST_ASSERT_TRUE(plain.ok);
+    TEST_ASSERT_TRUE(secure.ok);
+    TEST_ASSERT_FALSE(bad.ok);
+    // ws: settings are ignored
+    TEST_ASSERT_EQUAL(ha::TlsMode::None, ha::tlsModeFor(plain, none));
+    TEST_ASSERT_EQUAL(ha::TlsMode::None, ha::tlsModeFor(plain, ins));
+    TEST_ASSERT_EQUAL(ha::TlsMode::None, ha::tlsModeFor(plain, ca));
+    TEST_ASSERT_EQUAL(ha::TlsMode::None, ha::tlsModeFor(bad, ins));
+    // https
+    TEST_ASSERT_EQUAL(ha::TlsMode::Insecure, ha::tlsModeFor(secure, ins));
+    TEST_ASSERT_EQUAL(ha::TlsMode::CustomCa, ha::tlsModeFor(secure, ca));
+    TEST_ASSERT_EQUAL(ha::TlsMode::Bundle, ha::tlsModeFor(secure, none));
+    TEST_ASSERT_EQUAL(ha::TlsMode::CustomCa, ha::tlsModeFor(secure, both));  // CA wins
+    TEST_ASSERT_EQUAL_STRING("none", ha::tlsModeName(ha::TlsMode::None));
+    TEST_ASSERT_EQUAL_STRING("bundle", ha::tlsModeName(ha::TlsMode::Bundle));
+    TEST_ASSERT_EQUAL_STRING("custom_ca", ha::tlsModeName(ha::TlsMode::CustomCa));
+    TEST_ASSERT_EQUAL_STRING("insecure", ha::tlsModeName(ha::TlsMode::Insecure));
+}
+
+static void test_tls_mode_getter() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    TEST_ASSERT_EQUAL(ha::TlsMode::None, s.tlsMode());  // nothing configured
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
+    TEST_ASSERT_EQUAL(ha::TlsMode::None, s.tlsMode());
+    ha::TlsSettings ins;
+    ins.insecure = true;
+    s.configure("https://h.example", "tok", ha::TlsSettings(), {}, 1);
+    TEST_ASSERT_EQUAL(ha::TlsMode::Bundle, s.tlsMode());
+    s.configure("https://h.example", "tok", ins, {}, 2);
+    TEST_ASSERT_EQUAL(ha::TlsMode::Insecure, s.tlsMode());
+    ha::TlsSettings ca;
+    ca.caPem = "pem";
+    s.configure("https://h.example", "tok", ca, {}, 3);
+    TEST_ASSERT_EQUAL(ha::TlsMode::CustomCa, s.tlsMode());
+    s.configure("https://h.example", "tok", ins, {}, 4);
+    TEST_ASSERT_EQUAL(ha::TlsMode::Insecure, s.tlsMode());
+    s.configure("http://h.example", "tok", ins, {}, 5);  // http: settings ignored
+    TEST_ASSERT_EQUAL(ha::TlsMode::None, s.tlsMode());
+    s.configure("", "", ha::TlsSettings(), {}, 6);  // NoConfig
+    TEST_ASSERT_EQUAL(ha::TlsMode::None, s.tlsMode());
+}
+
+static void test_tls_only_ca_or_insecure_change_restarts_https() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    s.setNetworkUp(true, 0);
+    const char *url = "https://ha.example.com";
+    s.configure(url, "tok", ha::TlsSettings(), {}, 0);
+    feed(s, kAuthRequired, 1);
+    feed(s, kAuthOk, 2);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    int closes = t.closes;
+    // unchanged -> nothing happens
+    s.configure(url, "tok", ha::TlsSettings(), {}, 3);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(closes, t.closes);
+    TEST_ASSERT_EQUAL(1, t.opens);
+    // only insecure changes
+    ha::TlsSettings ins;
+    ins.insecure = true;
+    uint32_t cc = s.changeCount();
+    s.configure(url, "tok", ins, {}, 4);
+    TEST_ASSERT_EQUAL(closes + 1, t.closes);
+    TEST_ASSERT_EQUAL(2, t.opens);
+    TEST_ASSERT_TRUE(t.lastTls.insecure);
+    TEST_ASSERT_TRUE(s.changeCount() > cc);
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    // only the CA changes (insecure off again)
+    ha::TlsSettings ca;
+    ca.caPem = "pem-A";
+    s.configure(url, "tok", ca, {}, 5);
+    TEST_ASSERT_EQUAL(closes + 2, t.closes);
+    TEST_ASSERT_EQUAL(3, t.opens);
+    TEST_ASSERT_EQUAL_STRING("pem-A", t.lastTls.caPem.c_str());
+    // other CA text
+    ca.caPem = "pem-B";
+    s.configure(url, "tok", ca, {}, 6);
+    TEST_ASSERT_EQUAL(closes + 3, t.closes);
+    TEST_ASSERT_EQUAL(4, t.opens);
+    // same again keeps
+    s.configure(url, "tok", ca, {}, 7);
+    TEST_ASSERT_EQUAL(closes + 3, t.closes);
+    TEST_ASSERT_EQUAL(4, t.opens);
+    // CA removed -> back to bundle, restarts
+    s.configure(url, "tok", ha::TlsSettings(), {}, 8);
+    TEST_ASSERT_EQUAL(5, t.opens);
+    TEST_ASSERT_EQUAL(ha::TlsMode::Bundle, s.tlsMode());
+}
+
+static void test_tls_mode_change_bumps_change_count_from_backoff() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    s.setNetworkUp(true, 0);
+    const char *url = "https://ha.example.com";
+    s.configure(url, "tok", ha::TlsSettings(), {}, 0);
+    s.onClosed("tls_cert_rejected", 1);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    const uint32_t cc = s.changeCount();
+    ha::TlsSettings ins;
+    ins.insecure = true;
+    s.configure(url, "tok", ins, {}, 2);
+    TEST_ASSERT_TRUE(s.changeCount() > cc);
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    TEST_ASSERT_EQUAL_STRING("", s.lastError().c_str());
+}
+
+static void test_tls_unchanged_keeps_auth_failed_https() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    s.setNetworkUp(true, 0);
+    const char *url = "https://ha.example.com";
+    ha::TlsSettings ca;
+    ca.caPem = "pem";
+    s.configure(url, "bad", ca, {}, 0);
+    feed(s, kAuthRequired, 1);
+    feed(s, kAuthInvalid, 2);
+    TEST_ASSERT_EQUAL(S::AuthFailed, s.state());
+    const uint32_t cc = s.changeCount();
+    s.configure(url, "bad", ca, {}, 50);
+    s.tick(200000);
+    TEST_ASSERT_EQUAL(S::AuthFailed, s.state());
+    TEST_ASSERT_EQUAL(1, t.opens);
+    TEST_ASSERT_EQUAL_UINT32(cc, s.changeCount());
+    // a CA change alone leaves AuthFailed and reconnects
+    ha::TlsSettings ca2;
+    ca2.caPem = "pem2";
+    s.configure(url, "bad", ca2, {}, 60);
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    TEST_ASSERT_EQUAL(2, t.opens);
+}
+
+static void test_tls_close_reasons_reach_last_error_and_backoff() {
+    const char *reasons[] = {"tls_cert_rejected", "tls_ca_invalid", "tls_handshake_failed", "tls_timeout"};
+    for (const char *reason : reasons) {
+        FakeTransport t;
+        ha::HaSession s(t);
+        s.setNetworkUp(true, 0);
+        ha::TlsSettings ca;
+        ca.caPem = "pem";
+        s.configure("https://ha.example.com", "tok", ca, {}, 0);
+        TEST_ASSERT_EQUAL(S::Connecting, s.state());
+        s.onClosed(reason, 100);
+        TEST_ASSERT_EQUAL_MESSAGE(S::Backoff, s.state(), reason);
+        TEST_ASSERT_EQUAL_STRING(reason, s.lastError().c_str());
+        TEST_ASSERT_EQUAL_UINT32(1, s.failures());
+        TEST_ASSERT_EQUAL_UINT32(100 + 1000, s.nextAttemptMs());
+        // not terminal: the session retries by itself after the backoff
+        s.tick(1099);
+        TEST_ASSERT_EQUAL(1, t.opens);
+        s.tick(1100);
+        TEST_ASSERT_EQUAL_MESSAGE(S::Connecting, s.state(), reason);
+        TEST_ASSERT_EQUAL(2, t.opens);
+        TEST_ASSERT_TRUE(t.lastEndpoint.tls);
+        TEST_ASSERT_EQUAL_STRING("pem", t.lastTls.caPem.c_str());
+        // second failure -> longer backoff (2 s), Backoff and not AuthFailed
+        s.onClosed(reason, 1200);
+        TEST_ASSERT_EQUAL(S::Backoff, s.state());
+        TEST_ASSERT_EQUAL_UINT32(1200 + 2000, s.nextAttemptMs());
+    }
 }
 
 static void test_dropped_counted_only_while_open_and_active() {
@@ -538,11 +724,19 @@ static void test_dropped_counted_only_while_open_and_active() {
 static void test_https_while_network_down_no_open() {
     FakeTransport t;
     ha::HaSession s(t);
-    s.configure("https://h", "tok", ha::TlsSettings(), {}, 0);
-    s.setNetworkUp(true, 5);
+    ha::TlsSettings ca;
+    ca.caPem = "pem";
+    s.configure("https://h", "tok", ca, {}, 0);
+    TEST_ASSERT_EQUAL(0, t.opens);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
     s.tick(10);
     TEST_ASSERT_EQUAL(0, t.opens);
-    TEST_ASSERT_EQUAL_STRING("tls_not_supported", s.lastError().c_str());
+    s.setNetworkUp(true, 5);
+    TEST_ASSERT_EQUAL(1, t.opens);  // opens once the network is up, with the TLS settings
+    TEST_ASSERT_TRUE(t.lastEndpoint.tls);
+    TEST_ASSERT_EQUAL_STRING("pem", t.lastTls.caPem.c_str());
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    TEST_ASSERT_NOT_EQUAL(0, strcmp("tls_not_supported", s.lastError().c_str()));
 }
 
 static void test_query_fragment_url_invalid() {
@@ -721,7 +915,7 @@ int main(int, char **) {
     RUN_TEST(test_connect_and_auth_timeouts);
     RUN_TEST(test_subscribe_expiry);
     RUN_TEST(test_unknown_result_id_ignored);
-    RUN_TEST(test_https_not_supported);
+    RUN_TEST(test_https_opens_with_tls);
     RUN_TEST(test_https_while_network_down_no_open);
     RUN_TEST(test_query_fragment_url_invalid);
     RUN_TEST(test_unparsable_url_invalid);
@@ -739,7 +933,13 @@ int main(int, char **) {
     RUN_TEST(test_tls_settings_reach_transport_open);
     RUN_TEST(test_tls_settings_change_alone_restarts);
     RUN_TEST(test_tls_settings_in_auth_failed);
-    RUN_TEST(test_https_still_refused_with_tls_settings_zero_opens);
+    RUN_TEST(test_https_with_tls_settings_opens_with_them);
+    RUN_TEST(test_tls_mode_for_and_name);
+    RUN_TEST(test_tls_mode_getter);
+    RUN_TEST(test_tls_only_ca_or_insecure_change_restarts_https);
+    RUN_TEST(test_tls_mode_change_bumps_change_count_from_backoff);
+    RUN_TEST(test_tls_unchanged_keeps_auth_failed_https);
+    RUN_TEST(test_tls_close_reasons_reach_last_error_and_backoff);
     RUN_TEST(test_dropped_counted_only_while_open_and_active);
     return UNITY_END();
 }
