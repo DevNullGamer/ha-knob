@@ -23,12 +23,14 @@ struct FakeTransport : ha::Transport {
     int closes = 0;
     std::vector<std::string> sent;
     ha::HaUrl lastEndpoint;
+    ha::TlsSettings lastTls;
     bool sendResult = true;
     std::function<void()> onSend;  // runs inside sendText (before returning)
 
-    void open(const ha::HaUrl &endpoint) override {
+    void open(const ha::HaUrl &endpoint, const ha::TlsSettings &tls) override {
         ++opens;
         lastEndpoint = endpoint;
+        lastTls = tls;
     }
     void close() override { ++closes; }
     bool sendText(const std::string &text) override {
@@ -48,7 +50,7 @@ void feed(ha::HaSession &s, const std::string &text, uint32_t now) { s.onText(te
 // Connects (network up first) and answers auth_required / auth_ok. Returns the time used.
 void toAuthenticated(ha::HaSession &s, FakeTransport &t, uint32_t now, const std::vector<std::string> &ids = {}) {
     s.setNetworkUp(true, now);
-    s.configure(kUrl, "tok", ids, now);
+    s.configure(kUrl, "tok", ha::TlsSettings(), ids, now);
     TEST_ASSERT_EQUAL(S::Connecting, s.state());
     feed(s, kAuthRequired, now);
     TEST_ASSERT_EQUAL(S::Authenticating, s.state());
@@ -77,11 +79,11 @@ static void test_initial_and_empty_config() {
     ha::HaSession s(t);
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
     s.setNetworkUp(true, 0);
-    s.configure("", "", {}, 0);
+    s.configure("", "", ha::TlsSettings(), {}, 0);
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
-    s.configure(kUrl, "", {}, 0);  // token missing
+    s.configure(kUrl, "", ha::TlsSettings(), {}, 0);  // token missing
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
-    s.configure("", "tok", {}, 0);  // url missing
+    s.configure("", "tok", ha::TlsSettings(), {}, 0);  // url missing
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
     s.tick(100000);
     TEST_ASSERT_EQUAL(0, t.opens);
@@ -127,7 +129,7 @@ static void test_ignores_irrelevant_messages() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     feed(s, "garbage", 1);
     feed(s, kAuthOk, 1);  // not valid before auth_required
     TEST_ASSERT_EQUAL(S::Connecting, s.state());
@@ -140,7 +142,7 @@ static void test_auth_invalid_terminal() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "bad", {"light.a"}, 0);
+    s.configure(kUrl, "bad", ha::TlsSettings(), {"light.a"}, 0);
     feed(s, kAuthRequired, 0);
     feed(s, kAuthInvalid, 5);
     TEST_ASSERT_EQUAL(S::AuthFailed, s.state());
@@ -158,8 +160,8 @@ static void test_auth_invalid_terminal() {
     s.tick(50);
     TEST_ASSERT_EQUAL(S::AuthFailed, s.state());
     // unchanged configure
-    s.configure(kUrl, "bad", {"light.a"}, 60);
-    s.configure(kUrl, "bad", {"light.a", "light.b"}, 61);  // entity change only
+    s.configure(kUrl, "bad", ha::TlsSettings(), {"light.a"}, 60);
+    s.configure(kUrl, "bad", ha::TlsSettings(), {"light.a", "light.b"}, 61);  // entity change only
     TEST_ASSERT_EQUAL(S::AuthFailed, s.state());
     // long time
     for (uint32_t now = 1000; now < 10 * 60 * 1000; now += 997) s.tick(now);
@@ -172,7 +174,7 @@ static void test_retry_leaves_auth_failed() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "bad", {}, 0);
+    s.configure(kUrl, "bad", ha::TlsSettings(), {}, 0);
     feed(s, kAuthRequired, 0);
     feed(s, kAuthInvalid, 0);
     TEST_ASSERT_EQUAL(S::AuthFailed, s.state());
@@ -196,7 +198,7 @@ static void test_retry_ends_backoff_early() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     s.onClosed("x", 10);
     s.onClosed("x", 10);  // ignored while in Backoff
     TEST_ASSERT_EQUAL(S::Backoff, s.state());
@@ -209,11 +211,11 @@ static void test_new_token_leaves_auth_failed() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "bad", {}, 0);
+    s.configure(kUrl, "bad", ha::TlsSettings(), {}, 0);
     feed(s, kAuthRequired, 0);
     feed(s, kAuthInvalid, 0);
     TEST_ASSERT_EQUAL(S::AuthFailed, s.state());
-    s.configure(kUrl, "good", {}, 50);
+    s.configure(kUrl, "good", ha::TlsSettings(), {}, 50);
     TEST_ASSERT_EQUAL(S::Connecting, s.state());
     TEST_ASSERT_EQUAL(2, t.opens);
     feed(s, kAuthRequired, 51);
@@ -224,10 +226,10 @@ static void test_new_url_leaves_auth_failed() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "bad", {}, 0);
+    s.configure(kUrl, "bad", ha::TlsSettings(), {}, 0);
     feed(s, kAuthRequired, 0);
     feed(s, kAuthInvalid, 0);
-    s.configure("http://192.168.1.11:8123", "bad", {}, 50);
+    s.configure("http://192.168.1.11:8123", "bad", ha::TlsSettings(), {}, 50);
     TEST_ASSERT_EQUAL(S::Connecting, s.state());
     TEST_ASSERT_EQUAL(2, t.opens);
 }
@@ -283,7 +285,7 @@ static void test_backoff_sequence() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     const uint32_t expected[] = {1000, 2000, 4000, 8000, 16000, 30000, 30000};
     uint32_t now = 0;
     for (size_t i = 0; i < 7; ++i) {
@@ -307,7 +309,7 @@ static void test_backoff_resets_after_ready() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     s.onClosed("x", 0);
     s.tick(1000);
     s.onClosed("x", 1000);
@@ -340,7 +342,7 @@ static void test_connect_and_auth_timeouts() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     s.tick(19999);
     TEST_ASSERT_EQUAL(S::Connecting, s.state());
     s.tick(20000);
@@ -379,7 +381,7 @@ static void test_https_not_supported() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure("https://x.ui.nabu.casa", "tok", {}, 0);
+    s.configure("https://x.ui.nabu.casa", "tok", ha::TlsSettings(), {}, 0);
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
     TEST_ASSERT_EQUAL_STRING("tls_not_supported", s.lastError().c_str());
     s.setNetworkUp(false, 10);
@@ -391,16 +393,152 @@ static void test_https_not_supported() {
     TEST_ASSERT_EQUAL(0, (int)t.sent.size());
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
     // switching to http connects
-    s.configure(kUrl, "tok", {}, 300000);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 300000);
     TEST_ASSERT_EQUAL(S::Connecting, s.state());
     TEST_ASSERT_EQUAL(1, t.opens);
     TEST_ASSERT_EQUAL_STRING("", s.lastError().c_str());
 }
 
+static void test_tls_settings_reach_transport_open() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    s.setNetworkUp(true, 0);
+    ha::TlsSettings tls;
+    tls.insecure = true;
+    s.configure(kUrl, "tok", tls, {}, 0);
+    TEST_ASSERT_EQUAL(1, t.opens);
+    TEST_ASSERT_TRUE(t.lastTls.insecure);
+    TEST_ASSERT_TRUE(s.tlsSettings() == tls);
+    ha::TlsSettings ca;
+    ca.caPem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    s.configure(kUrl, "tok", ca, {}, 10);
+    TEST_ASSERT_EQUAL(2, t.opens);
+    TEST_ASSERT_FALSE(t.lastTls.insecure);
+    TEST_ASSERT_EQUAL_STRING(ca.caPem.c_str(), t.lastTls.caPem.c_str());
+}
+
+static void test_tls_settings_change_alone_restarts() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toAuthenticated(s, t, 0);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(1, t.opens);
+    const int closes = t.closes;
+    const uint32_t before = s.changeCount();
+    // unchanged TLS settings keep the connection
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 5);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(1, t.opens);
+    TEST_ASSERT_EQUAL(closes, t.closes);
+    TEST_ASSERT_EQUAL_UINT32(before, s.changeCount());
+    // insecure flag alone restarts: close + open
+    ha::TlsSettings ins;
+    ins.insecure = true;
+    s.configure(kUrl, "tok", ins, {}, 6);
+    TEST_ASSERT_EQUAL(closes + 1, t.closes);
+    TEST_ASSERT_EQUAL(2, t.opens);
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    TEST_ASSERT_TRUE(t.lastTls.insecure);
+    // CA text alone restarts
+    ha::TlsSettings ca;
+    ca.caPem = "pem";
+    s.configure(kUrl, "tok", ca, {}, 7);
+    TEST_ASSERT_EQUAL(closes + 2, t.closes);
+    TEST_ASSERT_EQUAL(3, t.opens);
+    // same again keeps
+    s.configure(kUrl, "tok", ca, {}, 8);
+    TEST_ASSERT_EQUAL(3, t.opens);
+    TEST_ASSERT_EQUAL(closes + 2, t.closes);
+}
+
+static void test_tls_settings_in_auth_failed() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, "bad", ha::TlsSettings(), {}, 0);
+    feed(s, kAuthRequired, 1);
+    feed(s, kAuthInvalid, 2);
+    TEST_ASSERT_EQUAL(S::AuthFailed, s.state());
+    TEST_ASSERT_EQUAL(1, t.opens);
+    // unchanged TLS settings: stay AuthFailed, no new connection
+    s.configure(kUrl, "bad", ha::TlsSettings(), {}, 50);
+    s.tick(100000);
+    TEST_ASSERT_EQUAL(S::AuthFailed, s.state());
+    TEST_ASSERT_EQUAL(1, t.opens);
+    // a TLS change alone leaves AuthFailed
+    ha::TlsSettings ins;
+    ins.insecure = true;
+    s.configure(kUrl, "bad", ins, {}, 60);
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    TEST_ASSERT_EQUAL(2, t.opens);
+}
+
+static void test_https_still_refused_with_tls_settings_zero_opens() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    s.setNetworkUp(true, 0);
+    ha::TlsSettings ins;
+    ins.insecure = true;
+    s.configure("https://ha.example.com", "tok", ins, {}, 0);
+    TEST_ASSERT_EQUAL(S::NoConfig, s.state());
+    TEST_ASSERT_EQUAL_STRING("tls_not_supported", s.lastError().c_str());
+    ha::TlsSettings ca;
+    ca.caPem = "pem";
+    s.configure("https://ha.example.com", "tok", ca, {}, 5);
+    s.tick(100000);
+    TEST_ASSERT_EQUAL(0, t.opens);
+    TEST_ASSERT_EQUAL(S::NoConfig, s.state());
+    TEST_ASSERT_EQUAL_STRING("tls_not_supported", s.lastError().c_str());
+}
+
+static void test_dropped_counted_only_while_open_and_active() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    TEST_ASSERT_EQUAL_UINT32(0, s.droppedMessages());
+    s.onMessageDropped(10, "too_large", 0);  // NoConfig
+    TEST_ASSERT_EQUAL_UINT32(0, s.droppedMessages());
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
+    s.onMessageDropped(10, "too_large", 1);  // Connecting, transport open
+    TEST_ASSERT_EQUAL_UINT32(1, s.droppedMessages());
+    feed(s, kAuthRequired, 2);
+    s.onMessageDropped(5u * 1024u * 1024u, "too_large", 3);  // Authenticating
+    TEST_ASSERT_EQUAL_UINT32(2, s.droppedMessages());
+    feed(s, kAuthOk, 4);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    s.onMessageDropped(1, "no_memory", 5);
+    s.onMessageDropped(1, "binary", 6);
+    TEST_ASSERT_EQUAL_UINT32(4, s.droppedMessages());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());  // the connection stays up
+    TEST_ASSERT_EQUAL_STRING("", s.lastError().c_str());
+    // Backoff: not counted
+    s.onClosed("closed_by_server", 10);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    s.onMessageDropped(10, "too_large", 11);
+    TEST_ASSERT_EQUAL_UINT32(4, s.droppedMessages());
+    // AuthFailed: not counted
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    s2.setNetworkUp(true, 0);
+    s2.configure(kUrl, "bad", ha::TlsSettings(), {}, 0);
+    feed(s2, kAuthRequired, 1);
+    feed(s2, kAuthInvalid, 2);
+    s2.onMessageDropped(10, "too_large", 3);
+    TEST_ASSERT_EQUAL_UINT32(0, s2.droppedMessages());
+    // Network down closes the connection: not counted
+    FakeTransport t3;
+    ha::HaSession s3(t3);
+    s3.setNetworkUp(true, 0);
+    s3.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
+    s3.setNetworkUp(false, 5);
+    s3.onMessageDropped(10, "too_large", 6);
+    TEST_ASSERT_EQUAL_UINT32(0, s3.droppedMessages());
+}
+
 static void test_https_while_network_down_no_open() {
     FakeTransport t;
     ha::HaSession s(t);
-    s.configure("https://h", "tok", {}, 0);
+    s.configure("https://h", "tok", ha::TlsSettings(), {}, 0);
     s.setNetworkUp(true, 5);
     s.tick(10);
     TEST_ASSERT_EQUAL(0, t.opens);
@@ -411,10 +549,10 @@ static void test_query_fragment_url_invalid() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure("http://h/x?y", "tok", {}, 0);
+    s.configure("http://h/x?y", "tok", ha::TlsSettings(), {}, 0);
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
     TEST_ASSERT_EQUAL_STRING("invalid_url", s.lastError().c_str());
-    s.configure("http://h/#a", "tok", {}, 1);
+    s.configure("http://h/#a", "tok", ha::TlsSettings(), {}, 1);
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
     TEST_ASSERT_EQUAL_STRING("invalid_url", s.lastError().c_str());
     s.tick(100000);
@@ -426,7 +564,7 @@ static void test_unparsable_url_invalid() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure("ftp://h", "tok", {}, 0);
+    s.configure("ftp://h", "tok", ha::TlsSettings(), {}, 0);
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
     TEST_ASSERT_EQUAL_STRING("invalid_url", s.lastError().c_str());
     TEST_ASSERT_EQUAL(0, t.opens);
@@ -436,7 +574,7 @@ static void test_send_failure_reporting_close() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     t.sendResult = false;
     t.onSend = [&]() { s.onClosed("socket_closed", 100); };
     feed(s, kAuthRequired, 100);
@@ -450,7 +588,7 @@ static void test_send_failure_plain() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     t.sendResult = false;
     feed(s, kAuthRequired, 100);
     TEST_ASSERT_EQUAL(S::Backoff, s.state());
@@ -477,7 +615,7 @@ static void test_wifi_loss_during_connecting() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     s.setNetworkUp(false, 10);
     TEST_ASSERT_EQUAL(S::Backoff, s.state());
 }
@@ -485,7 +623,7 @@ static void test_wifi_loss_during_connecting() {
 static void test_configure_while_network_down_waits() {
     FakeTransport t;
     ha::HaSession s(t);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     TEST_ASSERT_EQUAL(S::Backoff, s.state());
     TEST_ASSERT_EQUAL(0, t.opens);
     s.tick(5000);
@@ -498,11 +636,11 @@ static void test_config_change_reconnects_and_clears() {
     FakeTransport t;
     ha::HaSession s(t);
     toAuthenticated(s, t, 0);
-    s.configure(kUrl, "other", {}, 100);
+    s.configure(kUrl, "other", ha::TlsSettings(), {}, 100);
     TEST_ASSERT_EQUAL(S::Connecting, s.state());
     TEST_ASSERT_EQUAL(2, t.opens);
     TEST_ASSERT_EQUAL_STRING("", s.haVersion().c_str());
-    s.configure("", "", {}, 200);
+    s.configure("", "", ha::TlsSettings(), {}, 200);
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
     TEST_ASSERT_EQUAL(2, t.opens);
 }
@@ -511,7 +649,7 @@ static void test_close_event_after_local_close_ignored() {
     FakeTransport t;
     ha::HaSession s(t);
     toAuthenticated(s, t, 0);
-    s.configure("", "", {}, 10);
+    s.configure("", "", ha::TlsSettings(), {}, 10);
     s.onClosed("late", 11);
     TEST_ASSERT_EQUAL(S::NoConfig, s.state());
     TEST_ASSERT_EQUAL(0, (int)s.failures());
@@ -521,7 +659,7 @@ static void test_error_cut_to_max_len() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     s.onClosed(std::string(500, 'x'), 1);
     TEST_ASSERT_EQUAL((int)ha::HaSession::kMaxErrorLen, (int)s.lastError().size());
 }
@@ -530,7 +668,7 @@ static void test_token_not_in_status() {
     FakeTransport t;
     ha::HaSession s(t);
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "SECRETTOKEN123", {}, 0);
+    s.configure(kUrl, "SECRETTOKEN123", ha::TlsSettings(), {}, 0);
     feed(s, kAuthRequired, 0);
     feed(s, kAuthInvalid, 0);
     TEST_ASSERT_TRUE(s.lastError().find("SECRETTOKEN123") == std::string::npos);
@@ -542,7 +680,7 @@ static void test_change_count_increments() {
     ha::HaSession s(t);
     const uint32_t c0 = s.changeCount();
     s.setNetworkUp(true, 0);
-    s.configure(kUrl, "tok", {}, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
     TEST_ASSERT_TRUE(s.changeCount() > c0);
     const uint32_t c1 = s.changeCount();
     s.tick(1);
@@ -598,5 +736,10 @@ int main(int, char **) {
     RUN_TEST(test_token_not_in_status);
     RUN_TEST(test_change_count_increments);
     RUN_TEST(test_tick_wraparound);
+    RUN_TEST(test_tls_settings_reach_transport_open);
+    RUN_TEST(test_tls_settings_change_alone_restarts);
+    RUN_TEST(test_tls_settings_in_auth_failed);
+    RUN_TEST(test_https_still_refused_with_tls_settings_zero_opens);
+    RUN_TEST(test_dropped_counted_only_while_open_and_active);
     return UNITY_END();
 }

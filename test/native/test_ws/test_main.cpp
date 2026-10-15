@@ -382,6 +382,7 @@ static void test_encode_close_1000() {
 struct ProviderCfg {
     int failCall = 0;              // 1-based grow() call that returns nullptr (0 = none)
     size_t failAbove = SIZE_MAX;   // grow() with total above this returns nullptr
+    size_t failEqual = 0;          // grow() with exactly this total returns nullptr (0 = none)
     bool moveAlways = true;        // always return a different pointer (copy), like a worst realloc
 };
 
@@ -397,7 +398,8 @@ public:
         requests.push_back(total);
         if (current != nullptr && live.count(current) == 0) misuse = true;
         if (total == 0) misuse = true;
-        if (growCalls == cfg.failCall || total > cfg.failAbove) return nullptr;  // current stays valid
+        if (growCalls == cfg.failCall || total > cfg.failAbove || (cfg.failEqual != 0 && total == cfg.failEqual))
+            return nullptr;  // current stays valid
         uint8_t *nb;
         if (current == nullptr || cfg.moveAlways) {
             nb = (uint8_t *)malloc(total);
@@ -753,6 +755,87 @@ static void test_provider_first_grow_has_null_current_and_release_after_next_fee
     assertBalanced(p);
 }
 
+static void test_release_delivered_frees_text_buffer() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    Bytes in = text("hello");
+    Event e;
+    rx.feed(in.data(), in.size(), e);
+    TEST_ASSERT_TRUE(e.type == EventType::Text);
+    TEST_ASSERT_EQUAL_UINT32(1, (uint32_t)p.live.size());
+    rx.releaseDelivered();
+    TEST_ASSERT_EQUAL_INT(1, p.releases);
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)p.live.size());
+    assertBalanced(p);
+}
+
+static void test_release_delivered_noop_cases() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    rx.releaseDelivered();  // nothing delivered yet
+    TEST_ASSERT_EQUAL_INT(0, p.releases);
+    Bytes in = text("abc");
+    Event e;
+    rx.feed(in.data(), in.size(), e);
+    rx.releaseDelivered();
+    rx.releaseDelivered();  // second call: no double free
+    TEST_ASSERT_EQUAL_INT(1, p.releases);
+    // a control event holds no buffer: nothing to release
+    Bytes ping = frame(true, 0x9, S("pp"));
+    rx.feed(ping.data(), ping.size(), e);
+    TEST_ASSERT_TRUE(e.type == EventType::Ping);
+    rx.releaseDelivered();
+    TEST_ASSERT_EQUAL_INT(1, p.releases);
+    assertBalanced(p);
+}
+
+static void test_release_delivered_then_feed_and_reset_are_fine() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    Bytes in = cat({text("one"), text("two"), text("three")});
+    size_t off = 0;
+    Event e;
+    off += rx.feed(in.data() + off, in.size() - off, e);
+    TEST_ASSERT_TRUE(e.type == EventType::Text);
+    rx.releaseDelivered();
+    off += rx.feed(in.data() + off, in.size() - off, e);  // continues cleanly
+    TEST_ASSERT_TRUE(e.type == EventType::Text);
+    TEST_ASSERT_EQUAL_STRING("two", (const char *)e.data);
+    rx.releaseDelivered();
+    off += rx.feed(in.data() + off, in.size() - off, e);
+    TEST_ASSERT_EQUAL_STRING("three", (const char *)e.data);
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)in.size(), (uint32_t)off);
+    rx.releaseDelivered();
+    rx.reset();  // nothing left to free, no double release
+    TEST_ASSERT_EQUAL_INT(3, p.releases);
+    TEST_ASSERT_EQUAL_INT(3, p.growCalls);
+    assertBalanced(p);
+    // delivered buffer, then reset() frees it exactly once
+    Bytes one = text("again");
+    rx.feed(one.data(), one.size(), e);
+    rx.reset();
+    rx.releaseDelivered();
+    TEST_ASSERT_EQUAL_INT(4, p.releases);
+    assertBalanced(p);
+}
+
+static void test_release_delivered_does_not_touch_partial_message() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    // a message in progress (fragment 1 stored, not delivered) must survive releaseDelivered()
+    Bytes in = cat({frame(false, 0x1, S("abc")), frame(true, 0x0, S("def"))});
+    Event e;
+    size_t used = rx.feed(in.data(), 5, e);  // partial header+payload of fragment 1 (5 of 5 bytes)
+    TEST_ASSERT_TRUE(e.type == EventType::None);
+    rx.releaseDelivered();
+    TEST_ASSERT_EQUAL_INT(0, p.releases);
+    rx.feed(in.data() + used, in.size() - used, e);
+    TEST_ASSERT_TRUE(e.type == EventType::Text);
+    TEST_ASSERT_EQUAL_STRING("abcdef", (const char *)e.data);
+    rx.releaseDelivered();
+    assertBalanced(p);
+}
+
 static void test_provider_balanced_after_many_messages() {
     Bytes in;
     for (int i = 0; i < 50; ++i) in = cat({in, text(pattern((size_t)i * 3))});
@@ -898,14 +981,39 @@ static void test_no_memory_on_first_fragment() {
 }
 
 static void test_no_memory_on_later_fragment() {
+    // Fragment 2 needs 9 bytes (doubled request 10). Everything above 8 fails, so both the
+    // doubled request and the exact-size retry fail -> no_memory on the later fragment.
     ProviderCfg pc;
-    pc.failCall = 2;
+    pc.failAbove = 8;
     Bytes in = cat({frame(false, 0x1, S("abcd")), frame(false, 0x0, S("efgh")), frame(true, 0x0, S("ij")),
                     text("ok")});
     Outcome o = both(in, Limits(), pc);  // balanced check inside: the first buffer is released
     TEST_ASSERT_EQUAL_UINT32(2, (uint32_t)o.ev.size());
     expectDropped(o.ev[0], 10, "no_memory");
     expectText(o.ev[1], "ok");
+    // 5 (first fragment), 10 (doubled, fails), 9 (exact retry, fails), then "ok" = 3
+    TEST_ASSERT_EQUAL_UINT32(4, (uint32_t)o.requests.size());
+    TEST_ASSERT_EQUAL_UINT32(5, (uint32_t)o.requests[0]);
+    TEST_ASSERT_EQUAL_UINT32(10, (uint32_t)o.requests[1]);
+    TEST_ASSERT_EQUAL_UINT32(9, (uint32_t)o.requests[2]);
+    TEST_ASSERT_EQUAL_UINT32(3, (uint32_t)o.requests[3]);
+}
+
+static void test_exact_size_retry_when_only_doubled_grow_fails() {
+    // Only the doubled request (10) fails; the exact-size retry (9) succeeds, so the
+    // fragmented message is still delivered.
+    ProviderCfg pc;
+    pc.failEqual = 10;
+    Bytes in = cat({frame(false, 0x1, S("abcd")), frame(false, 0x0, S("efgh")), frame(true, 0x0, S("ij")),
+                    text("ok")});
+    Outcome o = both(in, Limits(), pc);
+    TEST_ASSERT_EQUAL_UINT32(2, (uint32_t)o.ev.size());
+    expectText(o.ev[0], "abcdefghij");
+    expectText(o.ev[1], "ok");
+    TEST_ASSERT_TRUE(o.requests.size() >= 3);
+    TEST_ASSERT_EQUAL_UINT32(5, (uint32_t)o.requests[0]);
+    TEST_ASSERT_EQUAL_UINT32(10, (uint32_t)o.requests[1]);  // refused
+    TEST_ASSERT_EQUAL_UINT32(9, (uint32_t)o.requests[2]);   // exact retry
 }
 
 static void test_no_memory_threshold() {
@@ -1243,6 +1351,10 @@ int main(int, char **) {
     RUN_TEST(test_provider_single_frame_requests_len_plus_one);
     RUN_TEST(test_provider_first_grow_has_null_current_and_release_after_next_feed);
     RUN_TEST(test_provider_balanced_after_many_messages);
+    RUN_TEST(test_release_delivered_frees_text_buffer);
+    RUN_TEST(test_release_delivered_noop_cases);
+    RUN_TEST(test_release_delivered_then_feed_and_reset_are_fine);
+    RUN_TEST(test_release_delivered_does_not_touch_partial_message);
     RUN_TEST(test_provider_geometric_growth_for_tiny_fragments);
     RUN_TEST(test_provider_zero_length_continuations_do_not_grow);
     RUN_TEST(test_provider_null_provider_drops_with_no_memory);
@@ -1257,6 +1369,7 @@ int main(int, char **) {
     RUN_TEST(test_no_memory_on_first_grow);
     RUN_TEST(test_no_memory_on_first_fragment);
     RUN_TEST(test_no_memory_on_later_fragment);
+    RUN_TEST(test_exact_size_retry_when_only_doubled_grow_fails);
     RUN_TEST(test_no_memory_threshold);
     RUN_TEST(test_binary_single_dropped);
     RUN_TEST(test_binary_empty_and_fragmented_with_ping);

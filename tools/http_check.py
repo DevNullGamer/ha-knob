@@ -6,6 +6,7 @@ Usage:
                                [--web-password-test]
                                [--ha-test --mock-python PY --mock-host PC_IP
                                 [--mock-port 8765] [--serial-log FILE]]
+                               [--ws-test --mock-python PY --mock-host PC_IP --serial-log FILE]
 
 Only uses the Python standard library. Every request uses the device IP as the Host
 header unless stated otherwise, like a browser opening http://<ip>/.
@@ -21,7 +22,16 @@ backoff -> recovery, and that no token value reaches /api/config, /api/status or
 serial log. --serial-log FILE is a file a background serial logger appends to (lines of
 "<epoch> <text>"); it is used to count "HA connect attempt" lines and to grep for tokens.
 
-Safety: without --ha-test never touches the wifi or ha sections. The only state-changing requests are
+--ws-test (Step 5b.2; same ha restore as --ha-test; needs --serial-log): runs mockha.py
+scenarios against the own WebSocket transport: ready + heap numbers, HB heap_min=/loopmax=
+and /api/status heap_min_free, 1 MB and 3 MB messages after auth (HA rx len= ms=, state stays
+ready, HB continues, >= 300 KB/s, PSRAM recovers), 5 MB dropped (reason=too_large) and still
+ready ~40 s later, fragmented auth_ok, ws PING answered with the same payload, Close 1001 ->
+closed_by_server + reconnect, Close without code, upgrade 502 -> handshake_failed: http 502,
+coalesced handshake, close before 101 -> handshake_failed: closed, mock killed / stalled
+mid-3 MB (connection_lost, PSRAM freed, no reboot). Prints the measured numbers at the end.
+
+Safety: without --ha-test/--ws-test never touches the wifi or ha sections. The only state-changing requests are
  - a device patch with an invalid hostname (must be rejected with 400),
  - with --web-password-test: setting a random web password and clearing it again
    (always cleared in a finally block),
@@ -361,6 +371,290 @@ def run_ha_test(c, args):
             c.check("access_token" not in text, "serial log never contains access_token")
 
 
+def hb_samples(slog, mark):
+    """Parses HB lines appended since mark: [(epoch, dict of key=int)]."""
+    out = []
+    for l in slog.since(mark):
+        if " HB " not in l:
+            continue
+        parts = l.split()
+        try:
+            ts = float(parts[0])
+        except ValueError:
+            continue
+        kv = {}
+        for p in parts[2:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                kv[k] = int(v) if v.lstrip("-").isdigit() else v
+        out.append((ts, kv))
+    return out
+
+
+def run_ws_test(c, args):
+    """Step 5b.2 scenarios: own WebSocket transport, large messages, ws PING, Close, handshake."""
+    print("\n--- Step 5b.2 on-device WebSocket transport tests (ha section is restored at the end) ---")
+    if not args.serial_log:
+        c.check(False, "--ws-test needs --serial-log")
+        return
+    slog = SerialLog(args.serial_log)
+    root = os.path.dirname(os.path.abspath(__file__))
+    mock_path = os.path.join(root, "mockha.py")
+    good = "ws-test-token-" + secrets.token_hex(4)
+    mock_url = f"http://{args.mock_host}:{args.mock_port}"
+    mock = {"proc": None, "log": None}
+
+    def stop_mock():
+        if mock["proc"] is not None:
+            mock["proc"].kill()
+            mock["proc"].wait()
+            mock["proc"] = None
+            time.sleep(0.3)
+
+    tokens = [good]
+
+    def start_mock(*extra):
+        stop_mock()
+        mock["log"] = tempfile.NamedTemporaryFile("w+", suffix=".log", delete=False)
+        mock["proc"] = subprocess.Popen(
+            [args.mock_python, mock_path, "--port", str(args.mock_port), "--token", tokens[-1],
+             "--seconds", "900", *map(str, extra)], stdout=mock["log"], stderr=subprocess.STDOUT)
+        time.sleep(1.5)
+
+    def mock_lines():
+        mock["log"].flush()
+        with open(mock["log"].name, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+
+    def status():
+        st, _, raw = c.request("GET", "/api/status")
+        return c.json_of(raw) or {}
+
+    def safe_status():
+        try:
+            return status()
+        except (OSError, http.client.HTTPException):
+            return None
+
+    def serial_since(mark, needle):
+        return [l for l in slog.since(mark) if needle in l]
+
+    def connect(*extra, expect="ready", timeout=30):
+        tokens.append(f"{good}-{len(tokens)}")
+        start_mock(*extra)
+        mark = slog.mark()
+        st, _, raw = set_ha(c, mock_url, tokens[-1])
+        c.expect_status("set mock url + token 200", st, 200, raw)
+        h, took = wait_ha(c, expect, timeout)
+        return mark, h, took
+
+    def psram_wait(base, timeout=10):
+        t0 = time.time()
+        free = None
+        while time.time() - t0 < timeout:
+            s = safe_status()
+            if s:
+                free = s.get("psram_free")
+                if free is not None and free >= base - 64 * 1024:
+                    return free, time.time() - t0
+            time.sleep(0.5)
+        return free, None
+
+    results = []
+
+    def record(name, **kw):
+        results.append((name, kw))
+
+    try:
+        # --- S0: ready, heap numbers, status/HB fields
+        mark, h, took = connect()
+        c.check(h.get("state") == "ready", "S0: ready over the own transport", h)
+        time.sleep(8)
+        s = status()
+        c.check(isinstance(s.get("heap_min_free"), int) and s["heap_min_free"] > 0,
+                "S0: /api/status has heap_min_free", s.get("heap_min_free"))
+        c.check(s.get("heap_min_free", 0) <= s.get("heap_free", 0),
+                "S0: heap_min_free <= heap_free", (s.get("heap_min_free"), s.get("heap_free")))
+        hb = hb_samples(slog, mark)
+        c.check(len(hb) > 0 and all("heap_min" in kv and "loopmax" in kv for _, kv in hb),
+                "S0: HB lines carry heap_min= and loopmax=", hb[-1:] )
+        base_psram = s.get("psram_free")
+        base_heap = s.get("heap_free")
+        base_loop = max([kv.get("loopmax", 0) for _, kv in hb] or [0])
+        record("S0 ready", ready_ms=int((took or 0) * 1000), heap_free=base_heap,
+               heap_min=s.get("heap_min_free"), psram_free=base_psram, loopmax_base=base_loop)
+        print(f"      baseline: heap_free={base_heap} heap_min={s.get('heap_min_free')} "
+              f"psram_free={base_psram} loopmax={base_loop}")
+
+        # --- S1: 1 MB and 3 MB after auth
+        mark, h, _ = connect("--big-after-auth", 1048576, 3145728, "--after-auth-delay", 3)
+        c.check(h.get("state") == "ready", "S1: ready before the big messages", h)
+        t0 = time.time()
+        states, fails = [], 0
+        psram_min = None
+        while time.time() - t0 < 24:
+            s = safe_status()
+            if s is None:
+                fails += 1
+            else:
+                states.append(s.get("ha", {}).get("state"))
+                pf = s.get("psram_free")
+                if pf is not None:
+                    psram_min = pf if psram_min is None else min(psram_min, pf)
+            time.sleep(0.4)
+        c.check(fails <= 1, "S1: /api/status answered throughout the transfers", fails)
+        c.check(all(x == "ready" for x in states), "S1: state stays ready", sorted(set(states)))
+        rx = serial_since(mark, "HA rx len=")
+        got = {}
+        for l in rx:
+            try:
+                ln = int(l.split("len=")[1].split()[0])
+                ms = int(l.split("ms=")[1].split()[0])
+                got[ln] = ms
+            except (IndexError, ValueError):
+                pass
+        for want in (1048576, 3145728):
+            c.check(want in got, f"S1: 'HA rx len={want} ms=' logged", rx[-4:])
+            if want in got:
+                kbs = want / 1024.0 / max(got[want], 1) * 1000.0
+                c.check(kbs >= 300, f"S1: throughput {want} >= 300 KB/s", f"{kbs:.0f} KB/s ({got[want]} ms)")
+                record(f"S1 {want // 1048576} MB rx", ms=got[want], kb_per_s=int(kbs))
+        hb = hb_samples(slog, mark)
+        tsl = [t for t, _ in hb]
+        gaps = [b - a for a, b in zip(tsl, tsl[1:])]
+        c.check(len(hb) >= 4 and (not gaps or max(gaps) < 8.5), "S1: HB continued (max gap < 8.5 s)",
+                f"n={len(hb)} max_gap={max(gaps) if gaps else None}")
+        lm = [kv.get("loopmax", 0) for _, kv in hb]
+        hm = [kv.get("heap_min", 0) for _, kv in hb]
+        print(f"      loopmax samples during/after: {lm}  (baseline {base_loop})  heap_min last {hm[-1:]}")
+        record("S1 loopmax", values=lm, baseline=base_loop, heap_min_last=(hm[-1] if hm else None))
+        free, rec = psram_wait(base_psram)
+        c.check(rec is not None, "S1: psram_free back within 64 KB of baseline within 10 s",
+                f"free={free} base={base_psram}")
+        print(f"      psram min during transfers={psram_min} (drop {None if psram_min is None else base_psram - psram_min}), "
+              f"recovered after {rec}")
+        record("S1 psram", min_free=psram_min, recovered_s=rec)
+        c.check(not serial_since(mark, "reason=too_large") and not serial_since(mark, "reason=no_memory"),
+                "S1: nothing dropped")
+
+        # --- S2: 5 MB dropped, still ready 40 s later
+        mark, h, _ = connect("--big-after-auth", 5242880, "--after-auth-delay", 2)
+        time.sleep(14)
+        dropped = serial_since(mark, "HA frame dropped")
+        c.check(any("reason=too_large" in l for l in dropped), "S2: 'HA frame dropped ... reason=too_large'",
+                dropped[-2:])
+        c.check(ha_status(c).get("state") == "ready", "S2: ready right after the drop")
+        time.sleep(40)
+        h = ha_status(c)
+        c.check(h.get("state") == "ready", "S2: still ready ~40 s later (ping/pong worked)", h)
+        free, rec = psram_wait(base_psram)
+        c.check(rec is not None, "S2: psram back to baseline after drop", f"free={free} base={base_psram}")
+        record("S2 5 MB drop", ready_after=h.get("state"), dropped_line=(dropped[-1][:100] if dropped else None))
+
+        # --- S3: fragmented auth_ok (+ ws PING in between), S4: ws PING answered
+        mark, h, _ = connect("--fragment-auth-ok", "--ws-ping-after-auth", "--after-auth-delay", 2)
+        c.check(h.get("state") == "ready", "S3: fragmented auth_ok (with PING between fragments) -> ready", h)
+        c.check(h.get("ha_version") == "2099.1.0-mock", "S3: ha_version parsed from the fragmented auth_ok", h)
+        time.sleep(4)
+        ml = mock_lines()
+        c.check(any("RX PONG payload=b'mid'" in l for l in ml), "S3: PONG for the PING inside the fragments (mid)")
+        c.check(any("RX PONG payload=b'hb-123'" in l for l in ml), "S4: PONG echoes the PING payload hb-123", ml[-4:])
+        c.check(not any("not masked" in l for l in ml), "S4: all client frames masked")
+        c.check(ha_status(c).get("state") == "ready", "S4: still ready after PING/PONG")
+
+        # --- S5: Close 1001 -> closed_by_server, reconnect
+        mark, h, _ = connect("--close-after-auth", 1001, "--after-auth-delay", 2)
+        h2, _ = wait_ha(c, "backoff", 15, "closed_by_server")
+        c.check(h2.get("state") == "backoff" and "closed_by_server" in h2.get("last_error", ""),
+                "S5: Close 1001 -> backoff + closed_by_server", h2)
+        time.sleep(3)
+        ml = mock_lines()
+        c.check(any("RX CLOSE code=1001" in l for l in ml) or any("RX CLOSE code=" in l for l in ml),
+                "S5: device replied with a Close frame", [l for l in ml if "CLOSE" in l][:2])
+        h3, _ = wait_ha(c, "ready", 20)
+        c.check(h3.get("state") == "ready", "S5: reconnects and reaches ready again", h3)
+        c.check(len([l for l in ml if "REQ GET" in l]) >= 1 and
+                len([l for l in mock_lines() if "REQ GET" in l]) >= 2, "S5: second connection attempt seen by the mock")
+
+        # --- S6: Close without code -> empty Close reply
+        mark, h, _ = connect("--close-after-auth-nocode", "--after-auth-delay", 2)
+        h2, _ = wait_ha(c, "backoff", 15, "closed_by_server")
+        c.check(h2.get("state") == "backoff" and "closed_by_server" in h2.get("last_error", ""),
+                "S6: Close without code -> closed_by_server", h2)
+        time.sleep(2)
+        cl = [l for l in mock_lines() if "RX CLOSE" in l]
+        c.check(len(cl) >= 1 and "code=None len=0" in cl[0], "S6: Close reply has an empty body", cl[:2])
+
+        # --- S7: upgrade 502
+        mark, h, _ = connect("--upgrade-status", 502, expect="backoff", timeout=20)
+        h, _ = wait_ha(c, "backoff", 20, "handshake_failed: http 502")
+        c.check("handshake_failed: http 502" in h.get("last_error", ""), "S7: upgrade 502 -> handshake_failed: http 502", h)
+
+        # --- S8: coalesced handshake
+        mark, h, _ = connect("--coalesce-handshake")
+        c.check(h.get("state") == "ready", "S8: 101 + auth_required in one segment -> ready", h)
+
+        # --- S9: server closes before 101
+        mark, h, _ = connect("--close-before-101", expect="backoff", timeout=20)
+        h, _ = wait_ha(c, "backoff", 20, "handshake_failed: closed")
+        c.check("handshake_failed: closed" in h.get("last_error", ""), "S9: close before 101 -> handshake_failed: closed", h)
+
+        # --- S10: kill mid 3 MB
+        mark, h, _ = connect("--kill-mid-transfer", 3145728, "--after-auth-delay", 3)
+        c.check(h.get("state") == "ready", "S10: ready before the kill", h)
+        h2, _ = wait_ha(c, "backoff", 25, "connection_lost")
+        c.check(h2.get("state") == "backoff" and "connection_lost" in h2.get("last_error", ""),
+                "S10: killed mid-transfer -> connection_lost", h2)
+        up = status().get("uptime_s", 0)
+        c.check(up > 60, "S10: device did not reboot (uptime)", up)
+        c.check(not serial_since(mark, "BOOT") and not serial_since(mark, "Guru Meditation"),
+                "S10: no reboot / panic on serial")
+        hb = hb_samples(slog, mark)
+        stop_mock()  # no reconnect storms while measuring
+        time.sleep(3)
+        free, rec = psram_wait(base_psram)
+        c.check(rec is not None, "S10: PSRAM freed after the killed transfer", f"free={free} base={base_psram}")
+        record("S10 kill mid", psram_recovered_s=rec, psram_free=free)
+
+        # --- S11: stall mid 3 MB (record only)
+        mark, h, _ = connect("--stall-mid-transfer", 3145728, "--after-auth-delay", 3)
+        c.check(h.get("state") == "ready", "S11: ready before the stall", h)
+        t0 = time.time()
+        seen = None
+        while time.time() - t0 < 70:
+            hh = safe_status()
+            if hh and hh.get("ha", {}).get("state") != "ready":
+                seen = (hh["ha"]["state"], hh["ha"].get("last_error"), round(time.time() - t0, 1))
+                break
+            time.sleep(1)
+        print(f"      stall mid-transfer outcome: {seen}")
+        c.check(seen is not None, "S11: a stalled transfer is detected (ping/pong timeout) within 70 s", seen)
+        record("S11 stall", outcome=seen)
+        stop_mock()
+        time.sleep(3)
+        free, rec = psram_wait(base_psram)
+        c.check(rec is not None, "S11: PSRAM freed after the stall ends", f"free={free} base={base_psram}")
+    finally:
+        stop_mock()
+        st, _, raw = set_ha(c, "", None)
+        c.expect_status("restore: ha url '' + token null 200", st, 200, raw)
+        h, _ = wait_ha(c, "no_config", 15)
+        c.check(h.get("state") == "no_config", "restore: ha.state no_config", h)
+        st, _, raw = c.request("GET", "/api/config")
+        hc = (c.json_of(raw) or {}).get("ha", {})
+        c.check(hc.get("url") == "" and hc.get("token_set") is False, "restore: ha url '' and token_set false", hc)
+        text = "\n".join(slog.since(0))
+        for tok in tokens:
+            c.check(tok not in text, f"serial log never contains the token value ({tok[-6:]})")
+        c.check("access_token" not in text, "serial log never contains access_token")
+        st, _, raw = c.request("GET", "/api/status")
+        c.check(not any(t in raw.decode("utf-8", "replace") for t in tokens),
+                "/api/status does not contain a token")
+        print("\n      --- scenario numbers ---")
+        for name, kw in results:
+            print(f"      {name}: {kw}")
+
+
 def run(args):
     c = Checker(args.ip)
     hostname = args.hostname
@@ -620,6 +914,8 @@ def run(args):
 
     if args.ha_test:
         run_ha_test(c, args)
+    if args.ws_test:
+        run_ws_test(c, args)
 
     print(f"\n{c.passes} passed, {len(c.failures)} failed")
     for f in c.failures:
@@ -638,13 +934,17 @@ def main():
                    help="set a random web password, test 401/200, then clear it")
     p.add_argument("--ha-test", action="store_true",
                    help="Step 5 on-device tests against tools/mockha.py (restores the ha section)")
+    p.add_argument("--ws-test", action="store_true",
+                   help="Step 5b.2 on-device WebSocket transport tests (needs --serial-log; restores the ha section)")
     p.add_argument("--mock-python", help="Python executable that may accept LAN connections")
     p.add_argument("--mock-host", help="LAN IP of this PC as seen from the device")
     p.add_argument("--mock-port", type=int, default=8765)
     p.add_argument("--serial-log", help="file appended to by a background serial logger")
     args = p.parse_args()
-    if args.ha_test and not (args.mock_python and args.mock_host):
-        p.error("--ha-test needs --mock-python and --mock-host")
+    if (args.ha_test or args.ws_test) and not (args.mock_python and args.mock_host):
+        p.error("--ha-test / --ws-test need --mock-python and --mock-host")
+    if args.ws_test and not args.serial_log:
+        p.error("--ws-test needs --serial-log")
     socket.setdefaulttimeout(TIMEOUT)
     sys.exit(run(args))
 
