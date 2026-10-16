@@ -71,6 +71,12 @@ line, not only on `BOOT`.
   other attributes. `EntityStore` (Step 6.2) applies compressed `subscribe_entities` a/c/r
   events (max 64 entities). `parseMessage` always uses a filter (unneeded attributes are
   never stored) and `NestingLimit(kMaxNesting = 20)`; use `kMaxNesting` for every HA parse.
+- `lib/core/src/util/JsonScan` (Step 6.3): iterative, allocation-free structural scanner
+  (strings, escapes, bracket matching). `ha/EntityCatalog`: `peekEnvelope` (first 1 KB of
+  top-level scalars), `EntityCatalogBuilder` (get_states text in budgeted `step(maxBytes)`
+  slices, each `result` element parsed alone with a filter; output identical for any
+  budget), `EntityCatalog` (compact records + one text buffer on the caller's allocator),
+  `catalogToJson`. Never parse a whole get_states result with ArduinoJson.
 - **Web callbacks run in the `async_tcp` task**: never call LVGL, `WiFi.*` or main-loop state
   from them. They read the snapshot published by `net::web::publishNetwork` (mutex), write
   config **only via `ConfigStore::applyPatch()`** (never `save()`, which bypasses the token

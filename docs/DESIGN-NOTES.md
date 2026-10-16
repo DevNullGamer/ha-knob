@@ -301,3 +301,53 @@ Spec: `plan-step6.md` §3.3, §3.4. Core only; nothing on the device uses it yet
   the unfiltered parse of small messages used ArduinoJson's default limit of 10.
 - The filter document is built per call with the caller's allocator (~70 nodes, cheap
   next to the parse), like the old envelope filter.
+
+## Step 6.3 (2026-10-16)
+
+Spec: `plan-step6.md` §3.1 (points 3-5, 7), §3.5 (200 body). Core only; the session uses it
+from 6.4.
+
+- `util::json_scan` checks structure only: strings (a backslash skips the next byte),
+  bracket kinds for the first 64 levels (a `uint64_t` bit stack; deeper levels are only
+  counted), scalars as runs of `[A-Za-z0-9+-.]`. Content is validated by ArduinoJson when
+  an element is parsed. No recursion, no allocation, every read bounds-checked.
+- `EntityCatalogBuilder` units: `{`, one top-level member (key + whole value), `"result":[`,
+  one element with its leading `,`, `]`, trailing whitespace + finish. `step(maxBytes)`
+  runs whole units until >= maxBytes (0 = 1) were consumed in this call, so the state
+  between steps is just phase + position and the output cannot depend on the budget.
+  A big non-`result` member is one unit (not seen from HA).
+- Envelope (any key order): `id` must equal the expected id (checked when seen, so in HA
+  order a mismatch fails before the result is scanned), `type` must be `"result"` (raw
+  compare), `success` a bool literal, `error.message` is parsed with a filter. Finish:
+  missing id / type / success -> `states_unexpected`; `success:false` ->
+  `states_failed: <message>` (`states_failed` without one); no `result` array ->
+  `states_unexpected`. Truncated or structurally malformed text and trailing garbage are
+  also `states_unexpected` (no separate error code, the §3.1 list has none).
+  `NoMemory` from ArduinoJson or the buffers -> `states_no_memory`, except that
+  ArduinoJson also reports a kept string > 65535 bytes as `NoMemory`: for a parsed text
+  longer than that (`kMaxKeptStringBytes`) it is treated as that string (element skipped;
+  an oversized `error.message` gives plain `states_failed`). Failed clears the list.
+- Elements: > 256 KB skipped unparsed; parse errors (too deep, kept string > 65535, not an
+  object), missing / empty / > 255-byte `entity_id` -> `skipped`. Unsupported domains are
+  neither listed nor skipped. `total` counts every element. Beyond 1500 supported entities
+  `truncated` is set (later elements are still parsed for `total` / `skipped`).
+- Name: `friendly_name`, else the entity id, cut to 96 bytes; state cut to 255 bytes; both
+  UTF-8 safe. `step_default` is `stepDefaultFor(actions[0])` (0 for `none`); actions are
+  stored as a bitmask over the DomainActions table (no copy of the table).
+- Storage: 16-byte records (x86-64 and xtensa; 1500 entries ~ 24 KB) and a NUL-separated text buffer, both `CatalogBuffer`s on the
+  caller's allocator (min. 4 KB, doubling; on the device PSRAM), so 1500 entries never
+  land in internal RAM as small `std::string` allocations. `CatalogEntry` is a view.
+- `catalogToJson` writes the header by hand and serialises one entry at a time with a
+  reused JsonDocument (no document for the whole list). The output `std::string` uses the
+  default heap: PSRAM on the device only via the SPIRAM malloc threshold (>= 4 KB), and
+  growth past the initial reserve can need ~2x its size transiently.
+- Known limits: an element > 256 KB is skipped unparsed but still scanned in one step, so
+  a multi-MB single entity makes one long main-loop step (may exceed the 6.5 `loopmax`
+  gate; a resumable `skipValue` is the remedy if it is measured). A big non-`result`
+  top-level member is likewise one unit (HA sends none).
+- `peekEnvelope` reads top-level scalar members within the first 1 KB and stops at the
+  first object / array value; `hasId` means conclusive. A member counts only if the `,` /
+  `}` after its value is within the limit (`{"id":7` cut from `{"id":70..` is inconclusive,
+  so is an unterminated `{"id":7`).
+- Host measurement (MinGW, -O1): 1 MB synthetic result (7506 lights) in 32 KB slices,
+  31 steps, ~23 ms total.
