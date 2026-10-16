@@ -836,6 +836,192 @@ static void test_release_delivered_does_not_touch_partial_message() {
     assertBalanced(p);
 }
 
+// ---- detachDelivered (Step 6.4) ------------------------------------------------------------
+
+static void test_detach_returns_nul_terminated_buffer_and_length() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    const std::string msg = pattern(300);
+    Bytes in = text(msg);
+    Event e;
+    rx.feed(in.data(), in.size(), e);
+    TEST_ASSERT_TRUE(e.type == EventType::Text);
+    size_t len = 99;
+    uint8_t *buf = rx.detachDelivered(len);
+    TEST_ASSERT_NOT_NULL(buf);
+    TEST_ASSERT_EQUAL_UINT32(300, (uint32_t)len);
+    TEST_ASSERT_EQUAL_UINT8(0, buf[len]);
+    TEST_ASSERT_TRUE(std::string((const char *)buf, len) == msg);
+    TEST_ASSERT_EQUAL_INT(0, p.releases);  // the receiver did not release it
+    p.release(buf);                        // the caller does
+    assertBalanced(p);
+}
+
+static void test_detach_fragmented_message() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    Bytes in = cat({frame(false, 0x1, S("Hel")), frame(true, 0x9, S("p")), frame(false, 0x0, S("lo ")),
+                    frame(true, 0x0, S("world"))});
+    Event e;
+    size_t off = 0;
+    do {
+        off += rx.feed(in.data() + off, in.size() - off, e);
+    } while (e.type != EventType::Text && off < in.size());
+    TEST_ASSERT_TRUE(e.type == EventType::Text);
+    size_t len = 0;
+    uint8_t *buf = rx.detachDelivered(len);
+    TEST_ASSERT_NOT_NULL(buf);
+    TEST_ASSERT_EQUAL_UINT32(11, (uint32_t)len);
+    TEST_ASSERT_EQUAL_UINT8(0, buf[len]);
+    TEST_ASSERT_EQUAL_STRING("Hello world", (const char *)buf);
+    p.release(buf);
+    assertBalanced(p);
+}
+
+static void test_detach_empty_text_message() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    Bytes in = text("");
+    Event e;
+    rx.feed(in.data(), in.size(), e);
+    TEST_ASSERT_TRUE(e.type == EventType::Text);
+    size_t len = 99;
+    uint8_t *buf = rx.detachDelivered(len);
+    TEST_ASSERT_NOT_NULL(buf);
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)len);
+    TEST_ASSERT_EQUAL_UINT8(0, buf[0]);
+    p.release(buf);
+    assertBalanced(p);
+}
+
+static void test_detach_without_text_event_returns_null() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    size_t len = 77;
+    TEST_ASSERT_NULL(rx.detachDelivered(len));  // nothing received yet
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)len);
+    Event e;
+    Bytes ping = frame(true, 0x9, S("pp"));
+    rx.feed(ping.data(), ping.size(), e);
+    TEST_ASSERT_TRUE(e.type == EventType::Ping);
+    len = 77;
+    TEST_ASSERT_NULL(rx.detachDelivered(len));
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)len);
+    // Dropped (binary)
+    Bytes bin = frame(true, 0x2, S("xyz"));
+    rx.feed(bin.data(), bin.size(), e);
+    TEST_ASSERT_TRUE(e.type == EventType::Dropped);
+    len = 77;
+    TEST_ASSERT_NULL(rx.detachDelivered(len));
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)len);
+    // after reset()
+    Bytes in = text("abc");
+    rx.feed(in.data(), in.size(), e);
+    TEST_ASSERT_TRUE(e.type == EventType::Text);
+    rx.reset();
+    len = 77;
+    TEST_ASSERT_NULL(rx.detachDelivered(len));
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)len);
+    // after releaseDelivered()
+    rx.feed(in.data(), in.size(), e);
+    rx.releaseDelivered();
+    len = 77;
+    TEST_ASSERT_NULL(rx.detachDelivered(len));
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)len);
+    assertBalanced(p);
+}
+
+static void test_detach_twice_second_is_null() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    Bytes in = text("abc");
+    Event e;
+    rx.feed(in.data(), in.size(), e);
+    size_t len = 0;
+    uint8_t *buf = rx.detachDelivered(len);
+    TEST_ASSERT_NOT_NULL(buf);
+    len = 55;
+    TEST_ASSERT_NULL(rx.detachDelivered(len));
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)len);
+    p.release(buf);
+    assertBalanced(p);
+}
+
+static void test_detach_next_message_gets_fresh_buffer() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    Bytes in = cat({text("first message"), text("second")});
+    Event e;
+    size_t off = rx.feed(in.data(), in.size(), e);
+    TEST_ASSERT_TRUE(e.type == EventType::Text);
+    size_t len = 0;
+    uint8_t *first = rx.detachDelivered(len);
+    TEST_ASSERT_NOT_NULL(first);
+    TEST_ASSERT_EQUAL_INT(1, p.growCalls);
+    const size_t before = p.requests.size();
+    off += rx.feed(in.data() + off, in.size() - off, e);
+    TEST_ASSERT_TRUE(e.type == EventType::Text);
+    TEST_ASSERT_EQUAL_STRING("second", (const char *)e.data);
+    TEST_ASSERT_EQUAL_INT(2, p.growCalls);
+    TEST_ASSERT_TRUE(p.requests.size() > before);
+    TEST_ASSERT_TRUE((const void *)e.data != (const void *)first);
+    // the detached text is untouched by the next message
+    TEST_ASSERT_EQUAL_STRING("first message", (const char *)first);
+    TEST_ASSERT_EQUAL_INT(0, p.releases);  // the next feed did not release the detached buffer
+    rx.releaseDelivered();
+    TEST_ASSERT_EQUAL_INT(1, p.releases);
+    p.release(first);
+    assertBalanced(p);
+}
+
+static void test_release_delivered_after_detach_is_noop() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    Bytes in = text("abc");
+    Event e;
+    rx.feed(in.data(), in.size(), e);
+    size_t len = 0;
+    uint8_t *buf = rx.detachDelivered(len);
+    rx.releaseDelivered();
+    TEST_ASSERT_EQUAL_INT(0, p.releases);
+    TEST_ASSERT_EQUAL_STRING("abc", (const char *)buf);  // still valid
+    p.release(buf);
+    assertBalanced(p);
+}
+
+static void test_destroy_receiver_after_detach_keeps_buffer() {
+    CountingProvider p;
+    uint8_t *buf = nullptr;
+    {
+        WsReceiver rx(&p);
+        Bytes in = text("keep me");
+        Event e;
+        rx.feed(in.data(), in.size(), e);
+        size_t len = 0;
+        buf = rx.detachDelivered(len);
+        TEST_ASSERT_NOT_NULL(buf);
+    }
+    TEST_ASSERT_EQUAL_INT(0, p.releases);
+    TEST_ASSERT_EQUAL_UINT32(1, (uint32_t)p.live.size());
+    TEST_ASSERT_EQUAL_STRING("keep me", (const char *)buf);
+    p.release(buf);
+    assertBalanced(p);
+}
+
+static void test_reset_after_detach_does_not_release() {
+    CountingProvider p;
+    WsReceiver rx(&p);
+    Bytes in = text("abc");
+    Event e;
+    rx.feed(in.data(), in.size(), e);
+    size_t len = 0;
+    uint8_t *buf = rx.detachDelivered(len);
+    rx.reset();
+    TEST_ASSERT_EQUAL_INT(0, p.releases);
+    p.release(buf);
+    assertBalanced(p);
+}
+
 static void test_provider_balanced_after_many_messages() {
     Bytes in;
     for (int i = 0; i < 50; ++i) in = cat({in, text(pattern((size_t)i * 3))});
@@ -1355,6 +1541,15 @@ int main(int, char **) {
     RUN_TEST(test_release_delivered_noop_cases);
     RUN_TEST(test_release_delivered_then_feed_and_reset_are_fine);
     RUN_TEST(test_release_delivered_does_not_touch_partial_message);
+    RUN_TEST(test_detach_returns_nul_terminated_buffer_and_length);
+    RUN_TEST(test_detach_fragmented_message);
+    RUN_TEST(test_detach_empty_text_message);
+    RUN_TEST(test_detach_without_text_event_returns_null);
+    RUN_TEST(test_detach_twice_second_is_null);
+    RUN_TEST(test_detach_next_message_gets_fresh_buffer);
+    RUN_TEST(test_release_delivered_after_detach_is_noop);
+    RUN_TEST(test_destroy_receiver_after_detach_keeps_buffer);
+    RUN_TEST(test_reset_after_detach_does_not_release);
     RUN_TEST(test_provider_geometric_growth_for_tiny_fragments);
     RUN_TEST(test_provider_zero_length_continuations_do_not_grow);
     RUN_TEST(test_provider_null_provider_drops_with_no_memory);

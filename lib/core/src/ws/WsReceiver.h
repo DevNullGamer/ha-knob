@@ -76,6 +76,13 @@ public:
     // pointer is invalid afterwards. No-op if no Text buffer is held.
     void releaseDelivered();
 
+    // Hands the buffer of the last Text event over to the caller instead of releasing it
+    // (no copy): returns it (NUL-terminated at len) and sets len to the message length, or
+    // returns nullptr with len = 0 if no Text buffer is held. The caller frees it with the
+    // provider's release(); the receiver forgets it and takes a fresh buffer for the next
+    // message.
+    uint8_t *detachDelivered(size_t &len);
+
     // Payload bytes of the data message in progress (0 if none), including bytes that are
     // being discarded.
     size_t messageBytesSoFar() const;
@@ -115,6 +122,7 @@ private:
     uint8_t *buf_ = nullptr;
     size_t bufCap_ = 0;             // capacity granted by the provider for buf_
     bool delivered_ = false;        // buf_ belongs to the last Text event
+    size_t deliveredLen_ = 0;       // its length (excluding the NUL)
 
     // control frame payload (+1 for a terminating NUL after a Close reason)
     uint8_t ctrl_[126] = {0};

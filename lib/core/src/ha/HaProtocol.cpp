@@ -132,6 +132,7 @@ Message parseMessage(const char *json, size_t length, ArduinoJson::Allocator *al
                               DeserializationOption::NestingLimit(kMaxNesting));
     }
     if (err != DeserializationError::Ok || !msg.doc.is<JsonObjectConst>()) {
+        msg.parseError = (err != DeserializationError::Ok) ? err.c_str() : "not_object";
         msg.doc.clear();
         msg.type = MessageType::Error;
         return msg;
@@ -139,6 +140,7 @@ Message parseMessage(const char *json, size_t length, ArduinoJson::Allocator *al
     JsonObjectConst root = msg.doc.as<JsonObjectConst>();
     JsonVariantConst typeValue = root["type"];
     if (!typeValue.is<const char *>()) {
+        msg.parseError = "no_type";
         msg.type = MessageType::Error;
         return msg;
     }

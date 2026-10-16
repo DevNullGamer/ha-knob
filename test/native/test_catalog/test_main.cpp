@@ -204,6 +204,12 @@ static ha::EnvelopePeek peek(const std::string &s, size_t maxBytes = ha::kEnvelo
     return ha::peekEnvelope(s.data(), s.size(), maxBytes);
 }
 
+// String literals outlive the returned EnvelopePeek (its type is a view into the text); a
+// temporary std::string would dangle.
+static ha::EnvelopePeek peek(const char *literal, size_t maxBytes = ha::kEnvelopePeekBytes) {
+    return ha::peekEnvelope(literal, strlen(literal), maxBytes);
+}
+
 static void test_peek_ha_order() {
     const std::string s = fixtureText();
     ha::EnvelopePeek p = peek(s);

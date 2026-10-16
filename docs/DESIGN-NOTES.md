@@ -351,3 +351,62 @@ from 6.4.
   so is an unterminated `{"id":7`).
 - Host measurement (MinGW, -O1): 1 MB synthetic result (7506 lights) in 32 KB slices,
   31 steps, ~23 ms total.
+
+## Step 6.4 (2026-10-16)
+
+Spec: `plan-step6.md` §3.1-3.3, §3.8. Core only; the device glue (WsTransport
+`retainText` / `onRxProgress`, HaClient ids and logs) is Step 6.5.
+
+- Subscription: the session tracks `subscriptionId_` (result success) and
+  `pendingSubscribeId_` (sent, no result); at most one of them is non-zero. An id-set change
+  (compared as a set, so reordering controls does not resubscribe) while Subscribing /
+  Ready: drop the pending subscribe from the map, send `unsubscribe_events` for whichever
+  id is set (tracked as Unsubscribe; a failure or expiry is only logged), clear the store,
+  send `subscribe_entities` if ids are left. Ready stays Ready; Subscribing with no ids
+  left becomes Ready. HA handles messages in order, so unsubscribing a still pending
+  subscribe works; its late result is then an unknown id. In other states the ids are
+  used at the next auth_ok. Only the current pending subscribe's expiry means Backoff
+  (`subscribe_timeout`, also after a resubscribe while Ready).
+- Events: applied only if `msg.id` equals the active or pending subscribe id (A2: the
+  snapshot may come before the result). An envelope-only (> 256 KB) event of ours logs
+  `event dropped error=too_large`; an unparsable message whose `peekEnvelope` shows
+  `type:"event"` with our id logs `event dropped error=<ArduinoJson error>` (new
+  `Message::parseError`). The snapshot is then lost until the next resubscribe /
+  reconnect (no automatic recovery). Store cleared on connect(), an id change, a URL /
+  token / TLS change and a failed subscribe result; kept during Backoff.
+- get_states: `requestStates()` (Ready only; Fetching / Building coalesce) is not in the
+  pending map. While Fetching, `onText` peeks first: peeked id == states id, or no id and
+  > 64 KB -> `Transport::retainText(data, len)`; a small result whose id is not first is
+  recognised after the normal parse and retained the same way. The builder
+  (`EntityCatalogBuilder` on the retained text) runs one `step(statesBytesPerTick)` per
+  `tick()` before the state switch, so it finishes in any session state.
+  `Transport::retainText` defaults to "cannot" (empty) -> `states_no_memory`; the device
+  transport overrides it in 6.5 (`WsReceiver::detachDelivered`), test fakes copy.
+- Failures: transport drop while Fetching (`too_large` / `no_memory`; `binary` is not
+  taken to be it), `states_timeout`, builder errors, `connection_lost` (fail() or connect()
+  while Fetching; a failed get_states send too). Building survives a disconnect; a URL /
+  token / TLS change aborts (None, catalog dropped). Failed drops an untaken catalog.
+- Liveness: `lastRxMs_` (onRxProgress, reset at connect()). Pong timeout when
+  `min(now - ping, now - lastRx) >= 10 s`, or `now - ping >= 90 s` regardless of rx
+  (`kPongHardTimeoutMs`; extension of §3.2 approved in the 6.4 audit, so a peer that keeps
+  streaming but never answers pings is still dropped); get_states expiry when
+  `min(now - sent, now - lastRx) >= 15 s` or `now - sent >= 90 s`. Tests that never call
+  onRxProgress keep the Step 5 behaviour.
+- Late results: a fetch of the current connection that ends without a catalog (timeout,
+  a drop taken to be it, a wrong retained message, a builder failure; not a config abort, which closes the transport first)
+  leaves its id in `staleStatesId_` (cleared by connect() and once used). A later message
+  > 64 KB whose peeked id matches is dropped unparsed (`states late result dropped len=`)
+  instead of costing an envelope-only parse (~450 ms for 3 MB). Smaller ones go the
+  normal way (unknown result id).
+- Pending map: when it is full, a new subscribe evicts the oldest Unsubscribe entry so it
+  keeps its expiry. `Purpose::GetStates` was removed (get_states has its own tracking).
+  Ids -> empty always calls `becomeReady()`, which also clears an old
+  `subscribe_failed: ..`. The logger must not call back into the session.
+- Logs: `setLogger(std::function)` gets lines without the "HA " prefix (`subscribe id= ids=`,
+  `unsubscribe id= subscription=`, `unsubscribe failed: ..`, `snapshot entities=`,
+  `event dropped error=`, `states request id=`, `states retained len=`,
+  `catalog failed error=`). `catalog done ... json=` is HaClient's (6.5), with
+  `catalogBuildMs()`. `statesChangeCount()` is separate from `changeCount()` so catalog
+  progress does not trigger the `HA state=` line.
+- `WsReceiver::detachDelivered(len)` hands over the last Text buffer (NUL-terminated); the
+  receiver forgets it and grows a fresh one for the next message.

@@ -422,6 +422,20 @@ static void test_result_payload_still_kept_small() {
     TEST_ASSERT_EQUAL_INT(2, m.result()["a"]["b"][1]["c"].as<int>());
 }
 
+static void test_parse_error_reasons() {
+    TEST_ASSERT_EQUAL_STRING("IncompleteInput", parse("{\"id\":1,\"type\":\"event\",\"event\":{\"a\":").parseError);
+    TEST_ASSERT_EQUAL_STRING("InvalidInput", parse("{]").parseError);
+    TEST_ASSERT_EQUAL_STRING("not_object", parse("garbage").parseError);
+    TEST_ASSERT_TRUE(parse("").parseError[0] != 0);  // some ArduinoJson error name
+    TEST_ASSERT_EQUAL_STRING("not_object", parse("[1,2]").parseError);
+    TEST_ASSERT_EQUAL_STRING("no_type", parse("{\"id\":1}").parseError);
+    TEST_ASSERT_EQUAL_STRING("no_type", parse("{\"type\":5}").parseError);
+    TEST_ASSERT_EQUAL(MT::Error, parse("{\"id\":1}").type);
+    // valid messages (also Ignored) carry no parse error
+    TEST_ASSERT_EQUAL_STRING("", parse("{\"id\":1,\"type\":\"pong\"}").parseError);
+    TEST_ASSERT_EQUAL_STRING("", parse("{\"type\":\"other\"}").parseError);
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_event_filter_keeps_needed_drops_unneeded);
@@ -458,5 +472,6 @@ int main(int, char **) {
     RUN_TEST(test_big_other_types_keep_envelope);
     RUN_TEST(test_big_event_is_envelope_only_without_payload_flags);
     RUN_TEST(test_big_invalid_json_is_error);
+    RUN_TEST(test_parse_error_reasons);
     return UNITY_END();
 }

@@ -165,6 +165,13 @@ Binding rules distilled from the step history. Reasons, measurements and edge ca
   404; paths are compared with their full length (decoded NUL -> 404).
 - HA session: states, backoff and timeouts in DESIGN-NOTES "Step 5". `auth_failed` never
   reconnects by itself (only a new URL/token or `POST /api/ha/retry`).
+- HaSession (Step 6.4, DESIGN-NOTES "Step 6.4"): an id-set change while Subscribing/Ready
+  unsubscribes + resubscribes on the same connection (stays Ready); only events of the
+  active or pending subscribe id reach `entities()`. The get_states result is taken over
+  via `Transport::retainText` (never parsed whole) and built in `tick()` slices;
+  `takeCatalog()` hands the `EntityCatalog` over once. The transport must call
+  `onRxProgress` for every read (pong / get_states liveness). Session log lines go
+  through `setLogger` (no "HA " prefix).
 - `WsTransport`: one blocking step per poll; `WiFiClient::connect` timeout is in
   milliseconds; read only when `available() > 0`; detect a closed peer with
   `recv(MSG_PEEK | MSG_DONTWAIT)`. Messages are assembled in PSRAM (limit 4 MB, larger /

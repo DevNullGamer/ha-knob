@@ -4,6 +4,8 @@
 #include <ArduinoJson.h>
 
 #include <cstring>
+#include <optional>
+#include <utility>
 #include <functional>
 #include <string>
 #include <vector>
@@ -38,6 +40,25 @@ struct FakeTransport : ha::Transport {
         sent.push_back(text);
         if (onSend) onSend();
         return sendResult;
+    }
+
+    // retainText (Step 6.4): copies the text; allocs / frees count the copies.
+    int retainCalls = 0;
+    int allocs = 0;
+    int frees = 0;
+    bool retainFails = false;
+    static void releaseCopy(void *context, char *data) {
+        ++static_cast<FakeTransport *>(context)->frees;
+        delete[] data;
+    }
+    ha::RetainedText retainText(const char *data, size_t length) override {
+        ++retainCalls;
+        if (retainFails) return ha::RetainedText();
+        char *copy = new char[length + 1];
+        memcpy(copy, data, length);
+        copy[length] = '\0';
+        ++allocs;
+        return ha::RetainedText(copy, length, &releaseCopy, this);
     }
 };
 
@@ -892,6 +913,1439 @@ static void test_tick_wraparound() {
     TEST_ASSERT_EQUAL(S::Backoff, s.state());
 }
 
+// ============================================================================================
+// Step 6.4: resubscribe, events, get_states, liveness (plan-step6.md sections 3.1-3.3, 3.8)
+// ============================================================================================
+
+namespace {
+
+struct Logs {
+    std::vector<std::string> lines;
+};
+
+void attachLogs(ha::HaSession &s, Logs &logs) {
+    s.setLogger([&logs](const std::string &line) { logs.lines.push_back(line); });
+}
+
+int countLog(const Logs &logs, const std::string &prefix) {
+    int n = 0;
+    for (const std::string &l : logs.lines) {
+        if (l.compare(0, prefix.size(), prefix) == 0) ++n;
+    }
+    return n;
+}
+
+bool hasLog(const Logs &logs, const std::string &line) {
+    for (const std::string &l : logs.lines) {
+        if (l == line) return true;
+    }
+    return false;
+}
+
+// Connected, authenticated and (when ids are given) subscribed with the result of id 1.
+void toReady(ha::HaSession &s, FakeTransport &t, uint32_t now, const std::vector<std::string> &ids = {}) {
+    toAuthenticated(s, t, now, ids);
+    if (!ids.empty()) {
+        TEST_ASSERT_EQUAL(S::Subscribing, s.state());
+        feed(s, resultOk(1), now);
+    }
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+}
+
+void reconfigure(ha::HaSession &s, const std::vector<std::string> &ids, uint32_t now) {
+    s.configure(kUrl, "tok", ha::TlsSettings(), ids, now);
+}
+
+std::string subMsg(uint32_t id, const std::string &entityIdsJson) {
+    return "{\"id\":" + std::to_string(id) + ",\"type\":\"subscribe_entities\",\"entity_ids\":[" + entityIdsJson + "]}";
+}
+
+std::string unsubMsg(uint32_t id, uint32_t subscription) {
+    return "{\"id\":" + std::to_string(id) + ",\"type\":\"unsubscribe_events\",\"subscription\":" +
+           std::to_string(subscription) + "}";
+}
+
+std::string getStatesMsg(uint32_t id) { return "{\"id\":" + std::to_string(id) + ",\"type\":\"get_states\"}"; }
+
+std::string resultFail(uint32_t id, const std::string &message) {
+    return "{\"id\":" + std::to_string(id) + ",\"type\":\"result\",\"success\":false,\"error\":{\"code\":\"x\",\"message\":\"" +
+           message + "\"}}";
+}
+
+// Snapshot event of subscription `id` with the given (entity, state) pairs.
+std::string eventA(uint32_t id, const std::vector<std::pair<std::string, std::string>> &entities) {
+    std::string a;
+    for (const auto &e : entities) {
+        if (!a.empty()) a += ",";
+        a += "\"" + e.first + "\":{\"s\":\"" + e.second + "\",\"a\":{}}";
+    }
+    return "{\"id\":" + std::to_string(id) + ",\"type\":\"event\",\"event\":{\"a\":{" + a + "}}}";
+}
+
+std::string entityJson(int i, size_t pad = 0) {
+    std::string j = "{\"entity_id\":\"light.k" + std::to_string(i) + "\",\"state\":\"on\",\"attributes\":{";
+    if (pad != 0) j += "\"junk\":\"" + std::string(pad, 'x') + "\",";
+    j += "\"friendly_name\":\"K" + std::to_string(i) + "\"}}";
+    return j;
+}
+
+// get_states result with n light entities; pad bytes of ignored attribute in the first one.
+std::string statesResult(uint32_t id, int n, size_t pad = 0, bool resultFirst = false) {
+    std::string arr = "[";
+    for (int i = 0; i < n; ++i) {
+        if (i != 0) arr += ",";
+        arr += entityJson(i, i == 0 ? pad : 0);
+    }
+    arr += "]";
+    const std::string sid = std::to_string(id);
+    if (resultFirst) return "{\"result\":" + arr + ",\"id\":" + sid + ",\"type\":\"result\",\"success\":true}";
+    return "{\"id\":" + sid + ",\"type\":\"result\",\"success\":true,\"result\":" + arr + "}";
+}
+
+const size_t kBig = 70000;  // > 64 KB (kStatesRetainMinBytes)
+
+void balanced(const FakeTransport &t) {
+    TEST_ASSERT_EQUAL_INT_MESSAGE(t.allocs, t.frees, "retained texts: allocs != frees");
+}
+
+void expectCatalog(ha::HaSession &s, int n) {
+    TEST_ASSERT_EQUAL(ha::StatesState::Ready, s.statesState());
+    std::optional<ha::EntityCatalog> c = s.takeCatalog();
+    TEST_ASSERT_TRUE(c.has_value());
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)n, (uint32_t)c->size());
+    for (int i = 0; i < n; ++i) {
+        const ha::CatalogEntry e = c->entry((size_t)i);
+        TEST_ASSERT_TRUE(std::string(e.id) == "light.k" + std::to_string(i));
+        TEST_ASSERT_TRUE(std::string(e.name) == "K" + std::to_string(i));
+        TEST_ASSERT_TRUE(std::string(e.state) == "on");
+    }
+}
+
+// Runs tick() until the entity list build ends (statesState != Building).
+void finishBuild(ha::HaSession &s, uint32_t &now) {
+    for (int i = 0; i < 100000 && s.statesState() == ha::StatesState::Building; ++i) s.tick(now);
+    TEST_ASSERT_NOT_EQUAL((int)ha::StatesState::Building, (int)s.statesState());
+}
+
+// Answers every ping sent since `seen` with its pong.
+void answerPings(ha::HaSession &s, FakeTransport &t, size_t &seen, uint32_t now) {
+    while (seen < t.sent.size()) {
+        const std::string m = t.sent[seen++];
+        if (m.find("\"type\":\"ping\"") != std::string::npos) {
+            feed(s, "{\"id\":" + m.substr(6, m.find(',') - 6) + ",\"type\":\"pong\"}", now);
+        }
+    }
+}
+
+uint32_t lastId(const FakeTransport &t) {
+    const std::string &m = t.sent.back();
+    return (uint32_t)std::stoul(m.substr(6, m.find(',') - 6));
+}
+
+}  // namespace
+
+// ---- Resubscribe ---------------------------------------------------------------------------
+
+static void test_resub_ready_new_ids() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0, {"light.a"});
+    feed(s, eventA(1, {{"light.a", "on"}}), 1);
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    const uint32_t cc = s.changeCount();
+    const size_t sent = t.sent.size();
+    reconfigure(s, {"light.b"}, 100);
+    TEST_ASSERT_EQUAL((int)sent + 2, (int)t.sent.size());
+    TEST_ASSERT_EQUAL_STRING(unsubMsg(2, 1).c_str(), t.sent[sent].c_str());
+    TEST_ASSERT_EQUAL_STRING(subMsg(3, "\"light.b\"").c_str(), t.sent[sent + 1].c_str());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL_UINT32(cc, s.changeCount());
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    TEST_ASSERT_FALSE(s.entities().snapshotSeen());
+    TEST_ASSERT_EQUAL(1, t.opens);
+    TEST_ASSERT_EQUAL(0, t.closes);
+    TEST_ASSERT_TRUE(hasLog(logs, "unsubscribe id=2 subscription=1"));
+    TEST_ASSERT_TRUE(hasLog(logs, "subscribe id=3 ids=1"));
+    // old subscription's events ignored, the new one's applied (before its result too)
+    feed(s, eventA(1, {{"light.a", "off"}}), 101);
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    feed(s, eventA(3, {{"light.b", "on"}}), 102);
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    feed(s, resultOk(2), 103);
+    feed(s, resultOk(3), 103);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(0, (int)s.pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(cc, s.changeCount());
+    feed(s, eventA(3, {{"light.c", "on"}}), 104);  // still the active subscription
+    TEST_ASSERT_EQUAL(2, (int)s.entities().size());
+}
+
+static void test_resub_ids_to_empty_from_ready() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    feed(s, eventA(1, {{"light.a", "on"}}), 1);
+    const size_t sent = t.sent.size();
+    reconfigure(s, {}, 100);
+    TEST_ASSERT_EQUAL((int)sent + 1, (int)t.sent.size());  // unsubscribe only
+    TEST_ASSERT_EQUAL_STRING(unsubMsg(2, 1).c_str(), t.sent.back().c_str());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    feed(s, eventA(1, {{"light.a", "on"}}), 101);  // ignored
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+}
+
+static void test_resub_ids_to_empty_from_subscribing() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toAuthenticated(s, t, 0, {"light.a"});
+    TEST_ASSERT_EQUAL(S::Subscribing, s.state());
+    const size_t sent = t.sent.size();
+    reconfigure(s, {}, 100);
+    TEST_ASSERT_EQUAL((int)sent + 1, (int)t.sent.size());
+    TEST_ASSERT_EQUAL_STRING(unsubMsg(2, 1).c_str(), t.sent.back().c_str());  // the pending id
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    feed(s, resultOk(1), 101);  // late result of the dropped subscribe: nothing
+    feed(s, eventA(1, {{"light.a", "on"}}), 101);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+}
+
+static void test_resub_ids_to_empty_clears_subscribe_failed() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toAuthenticated(s, t, 0, {"light.a"});
+    feed(s, resultFail(1, "bad"), 10);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL_STRING("subscribe_failed: bad", s.lastError().c_str());
+    const size_t sent = t.sent.size();
+    reconfigure(s, {}, 20);
+    TEST_ASSERT_EQUAL((int)sent, (int)t.sent.size());  // no active subscription: nothing to send
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL_STRING("", s.lastError().c_str());
+}
+
+static void test_resub_same_set_other_order_does_nothing() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a", "light.b"});
+    feed(s, eventA(1, {{"light.a", "on"}}), 1);
+    const size_t sent = t.sent.size();
+    const uint32_t cc = s.changeCount();
+    reconfigure(s, {"light.b", "light.a"}, 100);
+    reconfigure(s, {"light.b", "light.a", "light.b"}, 101);  // duplicate dropped, still the same set
+    TEST_ASSERT_EQUAL((int)sent, (int)t.sent.size());
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    TEST_ASSERT_TRUE(s.entities().snapshotSeen());
+    TEST_ASSERT_EQUAL_UINT32(cc, s.changeCount());
+    TEST_ASSERT_EQUAL_STRING("light.b", s.entityIds()[0].c_str());  // the new order is the configured one
+}
+
+static void test_resub_while_subscribing() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toAuthenticated(s, t, 0, {"light.a"});
+    feed(s, eventA(1, {{"light.a", "on"}}), 1);  // snapshot before the result
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    const size_t sent = t.sent.size();
+    reconfigure(s, {"light.b"}, 100);
+    TEST_ASSERT_EQUAL((int)sent + 2, (int)t.sent.size());
+    TEST_ASSERT_EQUAL_STRING(unsubMsg(2, 1).c_str(), t.sent[sent].c_str());
+    TEST_ASSERT_EQUAL_STRING(subMsg(3, "\"light.b\"").c_str(), t.sent[sent + 1].c_str());
+    TEST_ASSERT_EQUAL(S::Subscribing, s.state());
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    TEST_ASSERT_EQUAL(2, (int)s.pendingCount());  // unsubscribe + new subscribe
+    // the old subscribe's late result and events are ignored
+    feed(s, resultOk(1), 101);
+    TEST_ASSERT_EQUAL(S::Subscribing, s.state());
+    feed(s, eventA(1, {{"light.a", "off"}}), 101);
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    // the new id's snapshot before its result is applied
+    feed(s, eventA(3, {{"light.b", "on"}}), 102);
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    feed(s, resultOk(3), 103);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+}
+
+static void test_resub_in_connecting_authenticating_backoff() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {"light.a"}, 0);
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    reconfigure(s, {"light.b"}, 1);  // Connecting: nothing sent
+    TEST_ASSERT_EQUAL(0, (int)t.sent.size());
+    feed(s, kAuthRequired, 2);
+    TEST_ASSERT_EQUAL(S::Authenticating, s.state());
+    const size_t sent = t.sent.size();
+    reconfigure(s, {"light.c"}, 3);  // Authenticating: nothing sent
+    TEST_ASSERT_EQUAL((int)sent, (int)t.sent.size());
+    TEST_ASSERT_EQUAL(1, t.opens);
+    feed(s, kAuthOk, 4);  // the new ids are used
+    TEST_ASSERT_EQUAL_STRING(subMsg(1, "\"light.c\"").c_str(), t.sent.back().c_str());
+    feed(s, resultOk(1), 5);
+    feed(s, eventA(1, {{"light.c", "on"}}), 6);
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    // Backoff keeps the last values; an id change then clears them and sends nothing
+    s.onClosed("lost", 100);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    const size_t sent2 = t.sent.size();
+    const int closes = t.closes;
+    reconfigure(s, {"light.d"}, 200);
+    TEST_ASSERT_EQUAL((int)sent2, (int)t.sent.size());
+    TEST_ASSERT_EQUAL(closes, t.closes);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    s.tick(1100);
+    feed(s, kAuthRequired, 1100);
+    feed(s, kAuthOk, 1100);
+    TEST_ASSERT_EQUAL_STRING(subMsg(1, "\"light.d\"").c_str(), t.sent.back().c_str());
+}
+
+static void test_resub_full_pending_map_evicts_oldest_unsubscribe() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0, {"light.0"});
+    // every change leaves one unanswered Unsubscribe entry in the map
+    for (int i = 1; i <= 20; ++i) {
+        const size_t sent = t.sent.size();
+        reconfigure(s, {"light." + std::to_string(i)}, 1000);
+        TEST_ASSERT_EQUAL((int)sent + 2, (int)t.sent.size());
+        TEST_ASSERT_TRUE(t.sent[sent].find("\"type\":\"unsubscribe_events\"") != std::string::npos);
+        TEST_ASSERT_TRUE(t.sent[sent + 1].find("\"type\":\"subscribe_entities\"") != std::string::npos);
+        TEST_ASSERT_TRUE((int)s.pendingCount() <= (int)ha::HaSession::kMaxPending);
+        if (i < 20) feed(s, resultOk(lastId(t)), 1000);  // the subscribe result
+    }
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL((int)ha::HaSession::kMaxPending, (int)s.pendingCount());
+    // the last subscribe is tracked: it expires and ends the connection
+    s.tick(1000 + 14999);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    s.tick(1000 + 15000);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("subscribe_timeout", s.lastError().c_str());
+    TEST_ASSERT_TRUE(countLog(logs, "unsubscribe failed: timeout") >= 1);
+}
+
+// ---- Subscribe results ---------------------------------------------------------------------
+
+static void test_resub_failure_in_ready() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    reconfigure(s, {"light.b"}, 100);
+    feed(s, resultOk(2), 101);
+    const uint32_t cc = s.changeCount();
+    feed(s, resultFail(3, "nope"), 102);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL_STRING("subscribe_failed: nope", s.lastError().c_str());
+    TEST_ASSERT_TRUE(s.changeCount() > cc);
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    feed(s, eventA(3, {{"light.b", "on"}}), 103);  // its events are ignored
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    feed(s, eventA(1, {{"light.a", "on"}}), 103);
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+}
+
+static void test_resub_subscribe_failure_clears_store() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toAuthenticated(s, t, 0, {"light.a"});
+    feed(s, eventA(1, {{"light.a", "on"}}), 1);
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    feed(s, resultFail(1, "bad"), 2);
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+}
+
+static void test_resub_expiry_in_ready() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    reconfigure(s, {"light.b"}, 1000);
+    s.tick(1000 + 14999);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    s.tick(1000 + 15000);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("subscribe_timeout", s.lastError().c_str());
+}
+
+static void test_unsubscribe_expiry_and_failure_only_log() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0, {"light.a"});
+    reconfigure(s, {}, 1000);  // unsubscribe id 2
+    s.tick(1000 + 14999);
+    TEST_ASSERT_EQUAL(0, countLog(logs, "unsubscribe failed"));
+    s.tick(1000 + 15000);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_TRUE(hasLog(logs, "unsubscribe failed: timeout"));
+    TEST_ASSERT_EQUAL(1, countLog(logs, "unsubscribe failed"));
+    TEST_ASSERT_EQUAL(0, (int)s.pendingCount());
+    // success:false logs the message, the state does not change
+    reconfigure(s, {"light.b"}, 17000);  // unsubscribe: none active (ids were empty) -> subscribe only
+    TEST_ASSERT_EQUAL_STRING(subMsg(3, "\"light.b\"").c_str(), t.sent.back().c_str());
+    feed(s, resultOk(3), 17001);
+    reconfigure(s, {"light.c"}, 17002);  // unsubscribe id 4, subscribe id 5
+    feed(s, resultFail(4, "boom"), 17003);
+    TEST_ASSERT_TRUE(hasLog(logs, "unsubscribe failed: boom"));
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL_STRING("", s.lastError().c_str());
+}
+
+static void test_send_failure_during_unsubscribe() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    const size_t sent = t.sent.size();
+    t.sendResult = false;
+    reconfigure(s, {"light.b"}, 100);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("send_failed", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(1, (int)s.failures());
+    TEST_ASSERT_EQUAL((int)sent + 1, (int)t.sent.size());  // no subscribe after the failed unsubscribe
+    TEST_ASSERT_EQUAL(1, t.closes);
+}
+
+static void test_send_failure_during_subscribe_of_resubscribe() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    int n = 0;
+    t.onSend = [&]() { t.sendResult = (++n != 2); };  // the unsubscribe goes, the subscribe fails
+    reconfigure(s, {"light.b"}, 100);
+    TEST_ASSERT_EQUAL(2, n);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("send_failed", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(1, (int)s.failures());
+    TEST_ASSERT_EQUAL(1, t.closes);
+    TEST_ASSERT_EQUAL(0, (int)s.pendingCount());
+}
+
+static void test_send_failure_reporting_close_during_resubscribe_counts_once() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    t.sendResult = false;
+    t.onSend = [&]() { s.onClosed("socket_closed", 100); };
+    reconfigure(s, {"light.b"}, 100);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("socket_closed", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(1, (int)s.failures());
+}
+
+// ---- Events --------------------------------------------------------------------------------
+
+static void test_event_stale_and_zero_id_ignored() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    feed(s, eventA(99, {{"light.a", "on"}}), 1);
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    feed(s, eventA(0, {{"light.a", "on"}}), 1);
+    feed(s, "{\"type\":\"event\",\"event\":{\"a\":{\"light.a\":{\"s\":\"on\",\"a\":{}}}}}", 1);  // no id
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    feed(s, eventA(1, {{"light.a", "on"}}), 2);
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    const ha::EntityState *e = s.entities().find("light.a");
+    TEST_ASSERT_NOT_NULL(e);
+    TEST_ASSERT_EQUAL_STRING("on", e->state.c_str());
+}
+
+static void test_event_too_large_logged_store_unchanged() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0, {"light.a"});
+    feed(s, eventA(1, {{"light.a", "on"}}), 1);
+    const uint32_t v = s.entities().version();
+    std::string big = "{\"id\":1,\"type\":\"event\",\"event\":{\"a\":{\"light.a\":{\"s\":\"off\",\"a\":{\"junk\":\"" +
+                      std::string(300 * 1024, 'x') + "\"}}}}}";
+    feed(s, big, 2);
+    TEST_ASSERT_TRUE(hasLog(logs, "event dropped error=too_large"));
+    TEST_ASSERT_EQUAL_UINT32(v, s.entities().version());
+    TEST_ASSERT_EQUAL_STRING("on", s.entities().find("light.a")->state.c_str());
+    // other subscription id: silent
+    logs.lines.clear();
+    std::string other = big;
+    other[6] = '9';  // id 9
+    feed(s, other, 3);
+    TEST_ASSERT_EQUAL(0, (int)logs.lines.size());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+}
+
+static void test_event_unparsable_logged_only_for_own_event() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0, {"light.a"});
+    logs.lines.clear();
+    feed(s, "{\"id\":1,\"type\":\"event\",\"event\":{\"a\":", 1);  // truncated
+    TEST_ASSERT_EQUAL(1, (int)logs.lines.size());
+    TEST_ASSERT_EQUAL_STRING("event dropped error=IncompleteInput", logs.lines[0].c_str());
+    logs.lines.clear();
+    feed(s, "{\"id\":7,\"type\":\"event\",\"event\":{\"a\":", 2);  // other id
+    feed(s, "{\"id\":1,\"type\":\"result\",\"success\":tr", 3);    // not an event
+    feed(s, "garbage", 4);
+    feed(s, "{\"event\":{\"a\":", 5);
+    TEST_ASSERT_EQUAL(0, (int)logs.lines.size());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+}
+
+static void test_snapshot_log_once_per_subscription() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0, {"light.a", "light.b"});
+    feed(s, eventA(1, {{"light.a", "on"}, {"light.b", "off"}}), 1);
+    TEST_ASSERT_TRUE(hasLog(logs, "snapshot entities=2"));
+    feed(s, eventA(1, {{"light.a", "off"}}), 2);
+    feed(s, "{\"id\":1,\"type\":\"event\",\"event\":{\"c\":{\"light.a\":{\"+\":{\"s\":\"on\"}}}}}", 3);
+    TEST_ASSERT_EQUAL(1, countLog(logs, "snapshot"));
+    // a new subscription gets its own snapshot line, also an empty one
+    reconfigure(s, {"light.c"}, 10);  // unsubscribe 2, subscribe 3
+    feed(s, "{\"id\":3,\"type\":\"event\",\"event\":{\"a\":{}}}", 11);
+    TEST_ASSERT_TRUE(hasLog(logs, "snapshot entities=0"));
+    TEST_ASSERT_EQUAL(2, countLog(logs, "snapshot"));
+    feed(s, eventA(3, {{"light.c", "on"}}), 12);
+    TEST_ASSERT_EQUAL(2, countLog(logs, "snapshot"));
+}
+
+static void test_store_cleared_on_connect_kept_in_backoff() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    feed(s, eventA(1, {{"light.a", "on"}}), 1);
+    s.onClosed("lost", 100);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    s.tick(500);
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    s.tick(1100);  // reconnect
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    TEST_ASSERT_EQUAL(0, (int)s.entities().size());
+    TEST_ASSERT_FALSE(s.entities().snapshotSeen());
+    // network loss: kept, too
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    toReady(s2, t2, 0, {"light.a"});
+    feed(s2, eventA(1, {{"light.a", "on"}}), 1);
+    s2.setNetworkUp(false, 10);
+    TEST_ASSERT_EQUAL(1, (int)s2.entities().size());
+}
+
+// ---- requestStates -------------------------------------------------------------------------
+
+static void test_request_states_false_outside_ready() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    TEST_ASSERT_FALSE(s.requestStates(0));  // NoConfig
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {"light.a"}, 0);
+    TEST_ASSERT_FALSE(s.requestStates(1));  // Connecting
+    feed(s, kAuthRequired, 2);
+    TEST_ASSERT_FALSE(s.requestStates(3));  // Authenticating
+    feed(s, kAuthOk, 4);
+    TEST_ASSERT_EQUAL(S::Subscribing, s.state());
+    TEST_ASSERT_FALSE(s.requestStates(5));  // Subscribing
+    s.onClosed("lost", 6);
+    TEST_ASSERT_FALSE(s.requestStates(7));  // Backoff
+    TEST_ASSERT_EQUAL(ha::StatesState::None, s.statesState());
+    for (const std::string &m : t.sent) TEST_ASSERT_TRUE(m.find("get_states") == std::string::npos);
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    s2.setNetworkUp(true, 0);
+    s2.configure(kUrl, "bad", ha::TlsSettings(), {}, 0);
+    feed(s2, kAuthRequired, 1);
+    feed(s2, kAuthInvalid, 2);
+    TEST_ASSERT_FALSE(s2.requestStates(3));  // AuthFailed
+    TEST_ASSERT_EQUAL(0, t.retainCalls + t2.retainCalls);
+}
+
+static void test_request_states_coalesces_and_restarts() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    TEST_ASSERT_TRUE(s.requestStates(100));
+    TEST_ASSERT_EQUAL_STRING(getStatesMsg(1).c_str(), t.sent.back().c_str());
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    TEST_ASSERT_TRUE(hasLog(logs, "states request id=1"));
+    const size_t sent = t.sent.size();
+    TEST_ASSERT_TRUE(s.requestStates(200));  // coalesced
+    TEST_ASSERT_EQUAL((int)sent, (int)t.sent.size());
+    feed(s, statesResult(1, 3), 300);
+    TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+    TEST_ASSERT_TRUE(s.requestStates(301));  // coalesced while Building
+    TEST_ASSERT_EQUAL((int)sent, (int)t.sent.size());
+    TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+    uint32_t now = 302;
+    finishBuild(s, now);
+    TEST_ASSERT_EQUAL(ha::StatesState::Ready, s.statesState());
+    // from Ready (catalog not taken): a new fetch drops the old catalog
+    TEST_ASSERT_TRUE(s.requestStates(400));
+    TEST_ASSERT_EQUAL_STRING(getStatesMsg(2).c_str(), t.sent.back().c_str());
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    TEST_ASSERT_FALSE(s.takeCatalog().has_value());
+    // from Failed: the error is dropped
+    s.onMessageDropped(5000000, "too_large", 401);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("states_too_large", s.statesError().c_str());
+    TEST_ASSERT_TRUE(s.requestStates(500));
+    TEST_ASSERT_EQUAL_STRING("", s.statesError().c_str());
+    TEST_ASSERT_EQUAL_STRING(getStatesMsg(3).c_str(), t.sent.back().c_str());
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    balanced(t);
+}
+
+static void test_request_states_send_failure_inside_onclosed() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    t.sendResult = false;
+    t.onSend = [&]() { s.onClosed("socket_closed", 2000); };
+    TEST_ASSERT_FALSE(s.requestStates(2000));
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("socket_closed", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(1, (int)s.failures());
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("connection_lost", s.statesError().c_str());
+    TEST_ASSERT_EQUAL(1, countLog(logs, "catalog failed error=connection_lost"));
+}
+
+static void test_request_states_plain_send_failure() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    t.sendResult = false;
+    TEST_ASSERT_FALSE(s.requestStates(2000));
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("send_failed", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("connection_lost", s.statesError().c_str());
+    TEST_ASSERT_EQUAL(1, countLog(logs, "catalog failed error=connection_lost"));
+}
+
+// ---- Retain / build ------------------------------------------------------------------------
+
+static void test_retain_id_first_result_builds_catalog() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    const std::string r = statesResult(1, 5);
+    feed(s, r, 200);
+    TEST_ASSERT_EQUAL(1, t.retainCalls);
+    TEST_ASSERT_EQUAL(1, t.allocs);
+    TEST_ASSERT_EQUAL(0, t.frees);  // the text lives while Building
+    TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+    TEST_ASSERT_TRUE(hasLog(logs, "states retained len=" + std::to_string(r.size())));
+    uint32_t now = 201;
+    finishBuild(s, now);
+    TEST_ASSERT_EQUAL(1, t.frees);
+    TEST_ASSERT_EQUAL(0, countLog(logs, "catalog failed"));
+    expectCatalog(s, 5);
+    TEST_ASSERT_FALSE(s.takeCatalog().has_value());
+    TEST_ASSERT_EQUAL(ha::StatesState::Ready, s.statesState());  // stays Ready after take
+    balanced(t);
+}
+
+static void test_retain_small_result_first() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    const std::string r = statesResult(1, 4, 0, true);
+    TEST_ASSERT_TRUE(r.size() < 64u * 1024u);
+    feed(s, r, 200);
+    TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+    TEST_ASSERT_EQUAL(1, t.allocs);
+    uint32_t now = 201;
+    finishBuild(s, now);
+    expectCatalog(s, 4);
+    balanced(t);
+}
+
+static void test_retain_big_result_first_inconclusive_peek() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    const std::string r = statesResult(1, 4, kBig, true);
+    TEST_ASSERT_TRUE(r.size() > 64u * 1024u);
+    feed(s, r, 200);
+    TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+    TEST_ASSERT_EQUAL(1, t.allocs);
+    uint32_t now = 201;
+    finishBuild(s, now);
+    expectCatalog(s, 4);
+    balanced(t);
+}
+
+static void test_retain_big_id_first_result() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    feed(s, statesResult(1, 3, kBig), 200);
+    TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+    uint32_t now = 201;
+    finishBuild(s, now);
+    expectCatalog(s, 3);
+    balanced(t);
+}
+
+static void test_fetching_other_message_handled_normally() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    s.tick(30000);  // ping (id 2)
+    const uint32_t pingId = lastId(t);
+    TEST_ASSERT_TRUE(t.sent.back().find("ping") != std::string::npos);
+    s.requestStates(30001);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    feed(s, "{\"id\":" + std::to_string(pingId) + ",\"type\":\"pong\"}", 30002);  // not retained
+    feed(s, eventA(1, {{"light.a", "on"}}), 30003);                              // not retained
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    // the pong cleared the ping: no pong_timeout 10 s later
+    s.onRxProgress(1, 40000);
+    s.tick(40001);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+}
+
+static void test_retain_fails_gives_states_no_memory() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    t.retainFails = true;
+    feed(s, statesResult(1, 3), 200);
+    TEST_ASSERT_EQUAL(1, t.retainCalls);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("states_no_memory", s.statesError().c_str());
+    TEST_ASSERT_TRUE(hasLog(logs, "catalog failed error=states_no_memory"));
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    balanced(t);
+}
+
+static void test_default_transport_retain_is_empty() {
+    // The base Transport cannot retain: the session reports states_no_memory.
+    struct Bare : ha::Transport {
+        void open(const ha::HaUrl &, const ha::TlsSettings &) override {}
+        void close() override {}
+        bool sendText(const std::string &) override { return true; }
+    } bare;
+    ha::HaSession s(bare);
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
+    feed(s, kAuthRequired, 0);
+    feed(s, kAuthOk, 0);
+    TEST_ASSERT_TRUE(s.requestStates(1));
+    feed(s, statesResult(1, 2), 2);
+    TEST_ASSERT_EQUAL_STRING("states_no_memory", s.statesError().c_str());
+}
+
+static std::string catalogDump(const ha::EntityCatalog &c) {
+    std::string out = std::to_string(c.total()) + "/" + std::to_string(c.skipped()) + "/" + (c.truncated() ? "t" : "f") + ":";
+    for (size_t i = 0; i < c.size(); ++i) {
+        const ha::CatalogEntry e = c.entry(i);
+        out += std::string(e.id) + "|" + std::string(e.name) + "|" + std::string(e.state) + "|" +
+               std::to_string(e.actionMask) + ";";
+    }
+    return out;
+}
+
+static void test_build_budget_does_not_change_catalog() {
+    std::string text = "{\"id\":1,\"type\":\"result\",\"success\":true,\"result\":[";
+    for (int i = 0; i < 10; ++i) text += entityJson(i) + ",";
+    text += "{\"entity_id\":\"sun.sun\",\"state\":\"above_horizon\",\"attributes\":{}},";
+    text += "{\"entity_id\":\"switch.s\",\"state\":\"off\",\"attributes\":{\"friendly_name\":\"S\"}}]}";
+    const size_t budgets[] = {1, 200, (size_t)-1};
+    std::string first;
+    for (size_t budget : budgets) {
+        FakeTransport t;
+        ha::SessionOptions opt;
+        opt.statesBytesPerTick = budget;
+        ha::HaSession s(t, nullptr, opt);
+        toReady(s, t, 0);
+        const uint32_t cc = s.changeCount();
+        s.requestStates(100);
+        const uint32_t sc = s.statesChangeCount();
+        feed(s, text, 200);
+        TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+        const uint32_t sc2 = s.statesChangeCount();
+        TEST_ASSERT_TRUE(sc2 > sc);
+        int ticks = 0;
+        while (s.statesState() == ha::StatesState::Building && ticks < 100000) {
+            s.tick(300);
+            ++ticks;
+        }
+        TEST_ASSERT_EQUAL(ha::StatesState::Ready, s.statesState());
+        if (budget == 1) TEST_ASSERT_TRUE(ticks > 10);
+        if (budget == (size_t)-1) TEST_ASSERT_EQUAL(1, ticks);
+        TEST_ASSERT_TRUE(s.statesChangeCount() > sc2);  // a catalog became available
+        TEST_ASSERT_EQUAL_UINT32(cc, s.changeCount());  // the connection status did not change
+        std::optional<ha::EntityCatalog> c = s.takeCatalog();
+        TEST_ASSERT_TRUE(c.has_value());
+        TEST_ASSERT_FALSE(s.takeCatalog().has_value());
+        const std::string dump = catalogDump(*c);
+        if (first.empty()) {
+            first = dump;
+            TEST_ASSERT_TRUE(dump.find("light.k9|K9|on") != std::string::npos);
+            TEST_ASSERT_TRUE(dump.find("switch.s|S|off") != std::string::npos);
+        }
+        TEST_ASSERT_EQUAL_STRING(first.c_str(), dump.c_str());
+        TEST_ASSERT_EQUAL_INT(1, t.frees);
+        balanced(t);
+    }
+}
+
+static void test_states_result_failure_and_wrong_id() {
+    {
+        FakeTransport t;
+        ha::HaSession s(t);
+        toReady(s, t, 0);
+        s.requestStates(100);
+        feed(s, resultFail(1, "denied"), 200);
+        uint32_t now = 201;
+        finishBuild(s, now);
+        TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+        TEST_ASSERT_EQUAL_STRING("states_failed: denied", s.statesError().c_str());
+        TEST_ASSERT_FALSE(s.takeCatalog().has_value());
+        balanced(t);
+    }
+    {
+        // a large message without an id in front whose id is another one: retained, rejected
+        FakeTransport t;
+        ha::HaSession s(t);
+        toReady(s, t, 0);
+        s.requestStates(100);
+        std::string wrong = statesResult(999, 3, kBig, true);
+        feed(s, wrong, 200);
+        TEST_ASSERT_EQUAL(1, t.allocs);
+        uint32_t now = 201;
+        finishBuild(s, now);
+        TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+        TEST_ASSERT_EQUAL_STRING("states_unexpected", s.statesError().c_str());
+        balanced(t);
+        TEST_ASSERT_EQUAL(1, t.frees);
+        TEST_ASSERT_EQUAL(S::Ready, s.state());
+    }
+}
+
+static void test_build_survives_close_network_loss_reconnect() {
+    ha::SessionOptions opt;
+    opt.statesBytesPerTick = 1;
+    {
+        FakeTransport t;
+        ha::HaSession s(t, nullptr, opt);
+        toReady(s, t, 0);
+        s.requestStates(100);
+        feed(s, statesResult(1, 10), 200);
+        s.tick(201);
+        TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+        s.onClosed("lost", 202);
+        TEST_ASSERT_EQUAL(S::Backoff, s.state());
+        s.tick(203);
+        TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+        s.tick(1202);  // reconnect
+        TEST_ASSERT_EQUAL(S::Connecting, s.state());
+        TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+        TEST_ASSERT_EQUAL(0, t.frees);
+        uint32_t now = 1203;
+        finishBuild(s, now);
+        expectCatalog(s, 10);
+        balanced(t);
+        TEST_ASSERT_EQUAL(1, t.frees);
+    }
+    {
+        FakeTransport t;
+        ha::HaSession s(t, nullptr, opt);
+        toReady(s, t, 0);
+        s.requestStates(100);
+        feed(s, statesResult(1, 10), 200);
+        s.tick(201);
+        s.setNetworkUp(false, 202);
+        TEST_ASSERT_EQUAL(S::Backoff, s.state());
+        s.tick(203);
+        TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+        s.setNetworkUp(true, 5000);
+        TEST_ASSERT_EQUAL(S::Connecting, s.state());
+        TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+        uint32_t now = 5001;
+        finishBuild(s, now);
+        expectCatalog(s, 10);
+        balanced(t);
+    }
+}
+
+static void test_config_change_mid_build_drops_everything() {
+    struct Change {
+        const char *url;
+        const char *token;
+        bool insecure;
+    };
+    const Change changes[] = {{"http://192.168.1.11:8123", "tok", false},
+                              {"http://192.168.1.10:8123", "other", false},
+                              {"http://192.168.1.10:8123", "tok", true}};
+    ha::SessionOptions opt;
+    opt.statesBytesPerTick = 1;
+    for (const Change &c : changes) {
+        FakeTransport t;
+        ha::HaSession s(t, nullptr, opt);
+        toReady(s, t, 0);
+        s.requestStates(100);
+        feed(s, statesResult(1, 6), 200);
+        s.tick(201);
+        TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+        ha::TlsSettings tls;
+        tls.insecure = c.insecure;
+        s.configure(c.url, c.token, tls, {}, 300);
+        TEST_ASSERT_EQUAL(ha::StatesState::None, s.statesState());
+        TEST_ASSERT_EQUAL_STRING("", s.statesError().c_str());
+        TEST_ASSERT_FALSE(s.takeCatalog().has_value());
+        TEST_ASSERT_EQUAL(1, t.allocs);
+        TEST_ASSERT_EQUAL(1, t.frees);
+        s.tick(301);  // nothing left to build
+        TEST_ASSERT_EQUAL(ha::StatesState::None, s.statesState());
+    }
+    // a finished, untaken catalog is dropped too
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    feed(s, statesResult(1, 6), 200);
+    uint32_t now = 201;
+    finishBuild(s, now);
+    TEST_ASSERT_EQUAL(ha::StatesState::Ready, s.statesState());
+    s.configure(kUrl, "newtoken", ha::TlsSettings(), {}, 300);
+    TEST_ASSERT_EQUAL(ha::StatesState::None, s.statesState());
+    TEST_ASSERT_FALSE(s.takeCatalog().has_value());
+    balanced(t);
+    // and a running fetch
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    toReady(s2, t2, 0);
+    s2.requestStates(100);
+    s2.configure(kUrl, "newtoken", ha::TlsSettings(), {}, 300);
+    TEST_ASSERT_EQUAL(ha::StatesState::None, s2.statesState());
+    TEST_ASSERT_EQUAL(0, t2.allocs);
+}
+
+static void test_destroying_session_mid_build_frees_text_once() {
+    ha::SessionOptions opt;
+    opt.statesBytesPerTick = 1;
+    FakeTransport t;
+    {
+        ha::HaSession s(t, nullptr, opt);
+        toReady(s, t, 0);
+        s.requestStates(100);
+        feed(s, statesResult(1, 6), 200);
+        s.tick(201);
+        TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+        TEST_ASSERT_EQUAL(1, t.allocs);
+        TEST_ASSERT_EQUAL(0, t.frees);
+    }
+    TEST_ASSERT_EQUAL(1, t.allocs);
+    TEST_ASSERT_EQUAL(1, t.frees);
+}
+
+static void test_failed_fetch_drops_untaken_catalog() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    feed(s, statesResult(1, 3), 200);
+    uint32_t now = 201;
+    finishBuild(s, now);
+    TEST_ASSERT_EQUAL(ha::StatesState::Ready, s.statesState());
+    TEST_ASSERT_TRUE(s.requestStates(300));
+    s.onMessageDropped(10, "too_large", 301);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_FALSE(s.takeCatalog().has_value());
+    balanced(t);
+}
+
+static void test_drops_while_fetching() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    s.onMessageDropped(5u << 20, "binary", 200);  // not a result
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    s.onMessageDropped(5u << 20, "too_large", 201);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("states_too_large", s.statesError().c_str());
+    TEST_ASSERT_TRUE(hasLog(logs, "catalog failed error=states_too_large"));
+    s.requestStates(300);
+    s.onMessageDropped(5u << 20, "no_memory", 301);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("states_no_memory", s.statesError().c_str());
+    TEST_ASSERT_EQUAL_UINT32(3, s.droppedMessages());
+    // not Fetching: only counted
+    const uint32_t sc = s.statesChangeCount();
+    s.onMessageDropped(5u << 20, "too_large", 400);
+    TEST_ASSERT_EQUAL_UINT32(4, s.droppedMessages());
+    TEST_ASSERT_EQUAL_UINT32(sc, s.statesChangeCount());
+    TEST_ASSERT_EQUAL_STRING("states_no_memory", s.statesError().c_str());
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    toReady(s2, t2, 0);
+    s2.onMessageDropped(10, "too_large", 1);
+    TEST_ASSERT_EQUAL(ha::StatesState::None, s2.statesState());
+    TEST_ASSERT_EQUAL_UINT32(1, s2.droppedMessages());
+    // a binary drop does not end the fetch: the real result still arrives
+    s2.requestStates(2);
+    s2.onMessageDropped(10, "binary", 3);
+    feed(s2, statesResult(1, 2), 4);
+    TEST_ASSERT_EQUAL(ha::StatesState::Building, s2.statesState());
+}
+
+static void test_connection_lost_while_fetching() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    s.onClosed("lost", 200);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("connection_lost", s.statesError().c_str());
+    TEST_ASSERT_EQUAL(1, countLog(logs, "catalog failed error=connection_lost"));
+    // connect() while Fetching (retry from Backoff cannot be Fetching; network loss can)
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    toReady(s2, t2, 0);
+    s2.requestStates(100);
+    s2.setNetworkUp(false, 200);
+    TEST_ASSERT_EQUAL_STRING("connection_lost", s2.statesError().c_str());
+}
+
+// ---- Late results --------------------------------------------------------------------------
+
+static void test_late_big_result_after_timeout_dropped() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    s.requestStates(1000);
+    s.tick(1000 + 14999);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    s.tick(1000 + 15000);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("states_timeout", s.statesError().c_str());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    const std::string big = statesResult(1, 3, kBig);
+    feed(s, big, 17000);
+    TEST_ASSERT_TRUE(hasLog(logs, "states late result dropped len=" + std::to_string(big.size())));
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("states_timeout", s.statesError().c_str());
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+    // used once: a second copy takes the normal way (unknown result id)
+    feed(s, big, 17001);
+    TEST_ASSERT_EQUAL(1, countLog(logs, "states late result dropped"));
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+}
+
+static void test_late_small_result_parsed_normally() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    s.requestStates(1000);
+    s.tick(16000);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    const std::string small = statesResult(1, 3);
+    feed(s, small, 17000);
+    TEST_ASSERT_EQUAL(0, countLog(logs, "states late result"));
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+}
+
+static void test_late_result_with_new_fetch() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    s.requestStates(1000);  // id 1
+    s.tick(16000);          // timeout
+    TEST_ASSERT_TRUE(s.requestStates(16100));
+    TEST_ASSERT_EQUAL_STRING(getStatesMsg(2).c_str(), t.sent.back().c_str());
+    feed(s, statesResult(1, 3, kBig), 16200);  // the late old one: dropped, the fetch goes on
+    TEST_ASSERT_EQUAL(1, countLog(logs, "states late result dropped"));
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+    feed(s, statesResult(2, 3, kBig), 16300);  // the new one: retained
+    TEST_ASSERT_EQUAL(1, t.retainCalls);
+    uint32_t now = 16301;
+    finishBuild(s, now);
+    expectCatalog(s, 3);
+    balanced(t);
+}
+
+static void test_late_result_not_across_connections() {
+    // via fail() / reconnect
+    {
+        FakeTransport t;
+        ha::HaSession s(t);
+        Logs logs;
+        attachLogs(s, logs);
+        toReady(s, t, 0);
+        s.requestStates(1000);  // id 1 on connection A
+        s.tick(16000);
+        TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+        s.onClosed("lost", 16100);
+        s.tick(17100);
+        TEST_ASSERT_EQUAL(S::Connecting, s.state());
+        feed(s, kAuthRequired, 17100);
+        feed(s, kAuthOk, 17100);
+        TEST_ASSERT_EQUAL(S::Ready, s.state());
+        feed(s, statesResult(1, 3, kBig), 17200);  // same id on connection B, no fetch running
+        TEST_ASSERT_EQUAL(0, countLog(logs, "states late result"));
+        TEST_ASSERT_TRUE(s.requestStates(17300));  // id 1 again
+        TEST_ASSERT_EQUAL_STRING(getStatesMsg(1).c_str(), t.sent.back().c_str());
+        feed(s, statesResult(1, 3, kBig), 17400);
+        TEST_ASSERT_EQUAL(0, countLog(logs, "states late result"));
+        TEST_ASSERT_EQUAL(1, t.retainCalls);
+        uint32_t now = 17401;
+        finishBuild(s, now);
+        expectCatalog(s, 3);
+        balanced(t);
+    }
+    // via configure() with another URL
+    {
+        FakeTransport t;
+        ha::HaSession s(t);
+        Logs logs;
+        attachLogs(s, logs);
+        toReady(s, t, 0);
+        s.requestStates(1000);
+        s.tick(16000);
+        s.configure("http://192.168.1.11:8123", "tok", ha::TlsSettings(), {}, 16100);
+        TEST_ASSERT_EQUAL(S::Connecting, s.state());
+        feed(s, kAuthRequired, 16100);
+        feed(s, kAuthOk, 16100);
+        TEST_ASSERT_EQUAL(S::Ready, s.state());
+        feed(s, statesResult(1, 3, kBig), 16200);
+        TEST_ASSERT_EQUAL(0, countLog(logs, "states late result"));
+        TEST_ASSERT_TRUE(s.requestStates(16300));
+        feed(s, statesResult(1, 3, kBig), 16400);
+        TEST_ASSERT_EQUAL(1, t.retainCalls);
+        TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+    }
+}
+
+static void test_late_result_after_too_large_and_no_memory() {
+    {
+        FakeTransport t;
+        ha::HaSession s(t);
+        Logs logs;
+        attachLogs(s, logs);
+        toReady(s, t, 0);
+        s.requestStates(1000);
+        s.onMessageDropped(5u << 20, "too_large", 1100);
+        TEST_ASSERT_EQUAL_STRING("states_too_large", s.statesError().c_str());
+        feed(s, statesResult(1, 3, kBig), 1200);
+        TEST_ASSERT_EQUAL(1, countLog(logs, "states late result dropped"));
+        TEST_ASSERT_EQUAL(0, t.retainCalls);
+    }
+    {
+        FakeTransport t;
+        ha::HaSession s(t);
+        Logs logs;
+        attachLogs(s, logs);
+        toReady(s, t, 0);
+        s.requestStates(1000);
+        t.retainFails = true;
+        feed(s, statesResult(1, 3, kBig), 1100);
+        TEST_ASSERT_EQUAL_STRING("states_no_memory", s.statesError().c_str());
+        TEST_ASSERT_EQUAL(1, t.retainCalls);
+        feed(s, statesResult(1, 3, kBig), 1200);  // the same id once more
+        TEST_ASSERT_EQUAL(1, countLog(logs, "states late result dropped"));
+        TEST_ASSERT_EQUAL(1, t.retainCalls);
+    }
+}
+
+static void test_late_result_after_builder_failure() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    s.requestStates(1000);
+    feed(s, resultFail(1, "denied"), 1100);
+    uint32_t now = 1101;
+    finishBuild(s, now);
+    TEST_ASSERT_EQUAL_STRING("states_failed: denied", s.statesError().c_str());
+    feed(s, statesResult(1, 3, kBig), 1200);
+    TEST_ASSERT_EQUAL(1, countLog(logs, "states late result dropped"));
+}
+
+// ---- Timeouts ------------------------------------------------------------------------------
+
+static void runStatesTimeoutNoRx(uint32_t base) {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, base);
+    s.requestStates(base + 1000);
+    s.tick(base + 1000 + 14999);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    s.tick(base + 1000 + 15000);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("states_timeout", s.statesError().c_str());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+}
+
+static void test_states_timeout_without_rx() {
+    runStatesTimeoutNoRx(0);
+    runStatesTimeoutNoRx(0xFFFFFFFFu - 5000u);  // across the uint32 wrap
+}
+
+static void test_pong_timeout_without_rx_as_step5() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.tick(30000);
+    s.tick(39999);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    s.tick(40000);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("pong_timeout", s.lastError().c_str());
+}
+
+static void runStatesHardCap(uint32_t base) {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, base);
+    const uint32_t sent = base + 1000;
+    s.requestStates(sent);
+    size_t seen = t.sent.size();
+    for (uint32_t d = 1000; d <= 89000; d += 1000) {
+        const uint32_t now = sent + d;
+        if (d % 5000 == 0) s.onRxProgress(100, now);  // a trickle every 5 s
+        s.tick(now);
+        answerPings(s, t, seen, now);
+        TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+        TEST_ASSERT_EQUAL(S::Ready, s.state());
+    }
+    s.onRxProgress(100, sent + 89500);
+    s.tick(sent + 89999);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    s.onRxProgress(100, sent + 90000);
+    s.tick(sent + 90000);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("states_timeout", s.statesError().c_str());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+}
+
+static void test_states_hard_cap_with_trickle() {
+    runStatesHardCap(0);
+    runStatesHardCap(0xFFFFFFFFu - 40000u);
+}
+
+static void test_states_timeout_counts_from_later_of_sent_and_rx() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.requestStates(1000);
+    s.onRxProgress(10, 10000);
+    s.tick(24999);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    s.tick(25000);  // 15 s after the last byte
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+}
+
+static void runPongWithRx(uint32_t base) {
+    {
+        // rx after the ping keeps it alive until 10 s after that rx
+        FakeTransport t;
+        ha::HaSession s(t);
+        toReady(s, t, base);
+        s.tick(base + 30000);  // ping
+        s.onRxProgress(10, base + 35000);
+        s.tick(base + 44999);
+        TEST_ASSERT_EQUAL(S::Ready, s.state());
+        s.tick(base + 45000);
+        TEST_ASSERT_EQUAL(S::Backoff, s.state());
+        TEST_ASSERT_EQUAL_STRING("pong_timeout", s.lastError().c_str());
+    }
+    {
+        // rx before the ping does not extend: counts from the ping
+        FakeTransport t;
+        ha::HaSession s(t);
+        toReady(s, t, base);
+        s.onRxProgress(10, base + 25000);
+        s.tick(base + 30000);
+        s.tick(base + 39999);
+        TEST_ASSERT_EQUAL(S::Ready, s.state());
+        s.tick(base + 40000);
+        TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    }
+    {
+        // repeated rx keeps it alive
+        FakeTransport t;
+        ha::HaSession s(t);
+        toReady(s, t, base);
+        s.tick(base + 30000);
+        for (uint32_t d = 35000; d <= 80000; d += 5000) {
+            s.onRxProgress(10, base + d);
+            s.tick(base + d);
+            TEST_ASSERT_EQUAL(S::Ready, s.state());
+        }
+        s.tick(base + 89999);
+        TEST_ASSERT_EQUAL(S::Ready, s.state());
+        s.tick(base + 90000);  // 10 s after the last rx
+        TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    }
+}
+
+static void test_pong_timeout_counts_from_later_of_ping_and_rx() {
+    runPongWithRx(0);
+    runPongWithRx(0xFFFFFFFFu - 20000u);
+}
+
+static void runPongHardCap(uint32_t base) {
+    {
+        FakeTransport t;
+        ha::HaSession s(t);
+        toReady(s, t, base);
+        for (uint32_t d = 1000; d <= 119000; d += 1000) {
+            s.onRxProgress(10, base + d);
+            s.tick(base + d);
+            TEST_ASSERT_EQUAL(S::Ready, s.state());
+        }
+        s.onRxProgress(10, base + 119999);
+        s.tick(base + 119999);  // ping at 30000 + 89999
+        TEST_ASSERT_EQUAL(S::Ready, s.state());
+        s.onRxProgress(10, base + 120000);
+        s.tick(base + 120000);
+        TEST_ASSERT_EQUAL(S::Backoff, s.state());
+        TEST_ASSERT_EQUAL_STRING("pong_timeout", s.lastError().c_str());
+    }
+    {
+        // a pong before the cap clears it (the next ping starts a new one)
+        FakeTransport t;
+        ha::HaSession s(t);
+        toReady(s, t, base);
+        for (uint32_t d = 1000; d <= 130000; d += 1000) {
+            if (d == 100000) feed(s, "{\"id\":1,\"type\":\"pong\"}", base + d);
+            s.onRxProgress(10, base + d);
+            s.tick(base + d);
+            TEST_ASSERT_EQUAL(S::Ready, s.state());
+        }
+        TEST_ASSERT_TRUE(t.sent.back().find("\"id\":2,\"type\":\"ping\"") != std::string::npos);
+    }
+}
+
+static void test_pong_hard_cap() {
+    runPongHardCap(0);
+    runPongHardCap(0xFFFFFFFFu - 50000u);
+}
+
+static void test_rx_progress_ignored_cases() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.tick(30000);
+    s.onRxProgress(0, 39000);  // zero bytes: no liveness
+    s.tick(40000);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    // not active: ignored, and the next connection starts with its own last-rx time
+    s.onRxProgress(5, 41000);
+    s.tick(41000);  // reconnect (1 s backoff after 40000)
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    feed(s, kAuthRequired, 41000);
+    feed(s, kAuthOk, 41000);
+    s.tick(71000);  // ping
+    s.tick(80999);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    s.tick(81000);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    // NoConfig / AuthFailed ignore it as well
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    s2.onRxProgress(5, 1);
+    s2.setNetworkUp(true, 0);
+    s2.configure(kUrl, "bad", ha::TlsSettings(), {}, 0);
+    feed(s2, kAuthRequired, 1);
+    feed(s2, kAuthInvalid, 2);
+    s2.onRxProgress(5, 3);
+    TEST_ASSERT_EQUAL(S::AuthFailed, s2.state());
+}
+
+static void test_rx_progress_during_connect_phase_does_not_extend_timeouts() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {}, 0);
+    s.onRxProgress(10, 15000);
+    s.tick(20000);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("connect_timeout", s.lastError().c_str());
+}
+
+// ---- Logs ----------------------------------------------------------------------------------
+
+static void test_logs_never_contain_token() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    const std::string token = "SECRETTOKEN123";
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, token, ha::TlsSettings(), {"light.a"}, 0);
+    feed(s, kAuthRequired, 0);
+    feed(s, kAuthOk, 0);
+    feed(s, resultOk(1), 1);
+    feed(s, eventA(1, {{"light.a", "on"}}), 2);
+    feed(s, "{\"id\":1,\"type\":\"event\",\"event\":{\"a\":", 3);
+    s.configure(kUrl, token, ha::TlsSettings(), {"light.b"}, 4);
+    feed(s, resultFail(3, "denied"), 5);
+    s.requestStates(6);
+    s.onMessageDropped(5u << 20, "too_large", 7);
+    s.requestStates(8);
+    feed(s, statesResult(3, 2), 9);
+    uint32_t now = 10;
+    finishBuild(s, now);
+    s.onClosed("lost", 11);
+    s.tick(2000);
+    feed(s, kAuthRequired, 2000);
+    feed(s, kAuthInvalid, 2001);
+    TEST_ASSERT_TRUE(logs.lines.size() > 5);
+    for (const std::string &l : logs.lines) TEST_ASSERT_TRUE(l.find(token) == std::string::npos);
+    TEST_ASSERT_TRUE(s.lastError().find(token) == std::string::npos);
+    TEST_ASSERT_TRUE(s.statesError().find(token) == std::string::npos);
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_state_names);
@@ -941,5 +2395,59 @@ int main(int, char **) {
     RUN_TEST(test_tls_unchanged_keeps_auth_failed_https);
     RUN_TEST(test_tls_close_reasons_reach_last_error_and_backoff);
     RUN_TEST(test_dropped_counted_only_while_open_and_active);
+    RUN_TEST(test_resub_ready_new_ids);
+    RUN_TEST(test_resub_ids_to_empty_from_ready);
+    RUN_TEST(test_resub_ids_to_empty_from_subscribing);
+    RUN_TEST(test_resub_ids_to_empty_clears_subscribe_failed);
+    RUN_TEST(test_resub_same_set_other_order_does_nothing);
+    RUN_TEST(test_resub_while_subscribing);
+    RUN_TEST(test_resub_in_connecting_authenticating_backoff);
+    RUN_TEST(test_resub_full_pending_map_evicts_oldest_unsubscribe);
+    RUN_TEST(test_resub_failure_in_ready);
+    RUN_TEST(test_resub_subscribe_failure_clears_store);
+    RUN_TEST(test_resub_expiry_in_ready);
+    RUN_TEST(test_unsubscribe_expiry_and_failure_only_log);
+    RUN_TEST(test_send_failure_during_unsubscribe);
+    RUN_TEST(test_send_failure_during_subscribe_of_resubscribe);
+    RUN_TEST(test_send_failure_reporting_close_during_resubscribe_counts_once);
+    RUN_TEST(test_event_stale_and_zero_id_ignored);
+    RUN_TEST(test_event_too_large_logged_store_unchanged);
+    RUN_TEST(test_event_unparsable_logged_only_for_own_event);
+    RUN_TEST(test_snapshot_log_once_per_subscription);
+    RUN_TEST(test_store_cleared_on_connect_kept_in_backoff);
+    RUN_TEST(test_request_states_false_outside_ready);
+    RUN_TEST(test_request_states_coalesces_and_restarts);
+    RUN_TEST(test_request_states_send_failure_inside_onclosed);
+    RUN_TEST(test_request_states_plain_send_failure);
+    RUN_TEST(test_retain_id_first_result_builds_catalog);
+    RUN_TEST(test_retain_small_result_first);
+    RUN_TEST(test_retain_big_result_first_inconclusive_peek);
+    RUN_TEST(test_retain_big_id_first_result);
+    RUN_TEST(test_fetching_other_message_handled_normally);
+    RUN_TEST(test_retain_fails_gives_states_no_memory);
+    RUN_TEST(test_default_transport_retain_is_empty);
+    RUN_TEST(test_build_budget_does_not_change_catalog);
+    RUN_TEST(test_states_result_failure_and_wrong_id);
+    RUN_TEST(test_build_survives_close_network_loss_reconnect);
+    RUN_TEST(test_config_change_mid_build_drops_everything);
+    RUN_TEST(test_destroying_session_mid_build_frees_text_once);
+    RUN_TEST(test_failed_fetch_drops_untaken_catalog);
+    RUN_TEST(test_drops_while_fetching);
+    RUN_TEST(test_connection_lost_while_fetching);
+    RUN_TEST(test_late_big_result_after_timeout_dropped);
+    RUN_TEST(test_late_small_result_parsed_normally);
+    RUN_TEST(test_late_result_with_new_fetch);
+    RUN_TEST(test_late_result_not_across_connections);
+    RUN_TEST(test_late_result_after_too_large_and_no_memory);
+    RUN_TEST(test_late_result_after_builder_failure);
+    RUN_TEST(test_states_timeout_without_rx);
+    RUN_TEST(test_pong_timeout_without_rx_as_step5);
+    RUN_TEST(test_states_hard_cap_with_trickle);
+    RUN_TEST(test_states_timeout_counts_from_later_of_sent_and_rx);
+    RUN_TEST(test_pong_timeout_counts_from_later_of_ping_and_rx);
+    RUN_TEST(test_pong_hard_cap);
+    RUN_TEST(test_rx_progress_ignored_cases);
+    RUN_TEST(test_rx_progress_during_connect_phase_does_not_extend_timeouts);
+    RUN_TEST(test_logs_never_contain_token);
     return UNITY_END();
 }

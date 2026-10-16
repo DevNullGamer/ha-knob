@@ -87,6 +87,9 @@ struct Message {
     bool hasChanged = false;
     bool hasRemoved = false;
     bool envelopeOnly = false;  // parsed with the envelope filter (length > kEnvelopeOnlyBytes)
+    // Error only: ArduinoJson's error ("IncompleteInput", "InvalidInput", "NoMemory",
+    // "TooDeep", "EmptyInput"), "not_object" or "no_type". "" otherwise. Static string.
+    const char *parseError = "";
 
     JsonDocument doc;  // the parsed message (null for Error)
 

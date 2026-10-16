@@ -34,6 +34,7 @@ void WsReceiver::releaseBuffer() {
     if (buf_ != nullptr && provider_ != nullptr) provider_->release(buf_);
     buf_ = nullptr;
     delivered_ = false;
+    deliveredLen_ = 0;
     stored_ = 0;
     bufCap_ = 0;
 }
@@ -56,6 +57,16 @@ void WsReceiver::reset() {
 
 void WsReceiver::releaseDelivered() {
     if (delivered_) releaseBuffer();
+}
+
+uint8_t *WsReceiver::detachDelivered(size_t &len) {
+    len = 0;
+    if (!delivered_) return nullptr;
+    uint8_t *buffer = buf_;
+    len = deliveredLen_;
+    buf_ = nullptr;  // not released: the caller owns it now
+    releaseBuffer();
+    return buffer;
 }
 
 size_t WsReceiver::messageBytesSoFar() const { return clampSize(msgTotal_); }
@@ -196,6 +207,7 @@ bool WsReceiver::completeFrame(Event &ev) {
         ev.type = EventType::Text;
         ev.data = buf_;
         ev.length = stored_;
+        deliveredLen_ = stored_;
         delivered_ = true;  // released on the next feed()/reset()
     }
     msgTotal_ = 0;
