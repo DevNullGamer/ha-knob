@@ -305,8 +305,134 @@ static void test_big_invalid_json_is_error() {
     TEST_ASSERT_EQUAL(MT::Error, m.type);
 }
 
+// ---- Step 6.2: message filter and nesting limit (plan-step6.md section 3.3) ----
+
+static bool hasKey(JsonVariantConst v, const char *k) {
+    for (JsonPairConst kv : v.as<JsonObjectConst>()) if (std::string(kv.key().c_str()) == k) return true;
+    return false;
+}
+
+static std::string nested(int levels) {
+    return std::string(levels, '[') + std::string(levels, ']');
+}
+
+static std::string aEvent(const std::string &extraAttr) {
+    return "{\"id\":2,\"type\":\"event\",\"event\":{\"a\":{\"light.x\":{\"s\":\"on\",\"a\":{"
+           "\"brightness\":100,\"friendly_name\":\"X\"," + extraAttr + "}}}}}";
+}
+
+static std::string cEvent(const std::string &extraAttr) {
+    return "{\"id\":2,\"type\":\"event\",\"event\":{\"c\":{\"light.x\":{\"+\":{\"s\":\"off\",\"a\":{"
+           "\"brightness\":50," + extraAttr + "}}}}}}";
+}
+
+static void test_event_filter_keeps_needed_drops_unneeded() {
+    ha::Message m = parse(aEvent("\"entity_picture\":\"/local/x.png\",\"source_list\":[\"a\",\"b\"],\"foo\":{\"bar\":1}"));
+    TEST_ASSERT_EQUAL(MT::Event, m.type);
+    TEST_ASSERT_TRUE(m.hasAdded);
+    JsonVariantConst e = m.event()["a"]["light.x"];
+    TEST_ASSERT_EQUAL_STRING("on", e["s"].as<const char *>());
+    TEST_ASSERT_EQUAL_INT(100, e["a"]["brightness"].as<int>());
+    TEST_ASSERT_EQUAL_STRING("X", e["a"]["friendly_name"].as<const char *>());
+    TEST_ASSERT_TRUE(e["a"]["entity_picture"].isNull());
+    TEST_ASSERT_TRUE(e["a"]["source_list"].isNull());
+    TEST_ASSERT_TRUE(e["a"]["foo"].isNull());
+    TEST_ASSERT_FALSE(hasKey(m.doc["event"]["a"]["light.x"]["a"], "entity_picture"));
+}
+
+static void test_event_context_and_timestamps_dropped() {
+    ha::Message m = parse("{\"id\":2,\"type\":\"event\",\"event\":{\"a\":{\"light.x\":{\"s\":\"on\",\"a\":{},"
+                          "\"c\":{\"id\":\"1\",\"parent_id\":null,\"user_id\":null},\"lc\":1.5,\"lu\":2.5}}}}");
+    TEST_ASSERT_EQUAL(MT::Event, m.type);
+    JsonVariantConst e = m.event()["a"]["light.x"];
+    TEST_ASSERT_EQUAL_STRING("on", e["s"].as<const char *>());
+    TEST_ASSERT_TRUE(e["c"].isNull());
+    TEST_ASSERT_TRUE(e["lc"].isNull());
+}
+
+static void test_change_event_filter_keeps_plus_and_minus() {
+    ha::Message m = parse("{\"id\":2,\"type\":\"event\",\"event\":{\"c\":{\"light.x\":{\"+\":{\"s\":\"off\","
+                          "\"a\":{\"brightness\":null,\"entity_picture\":\"x\"},\"c\":\"01\",\"lc\":1.0},"
+                          "\"-\":{\"a\":[\"hs_color\"]}}}}}");
+    TEST_ASSERT_EQUAL(MT::Event, m.type);
+    TEST_ASSERT_TRUE(m.hasChanged);
+    JsonVariantConst d = m.event()["c"]["light.x"];
+    TEST_ASSERT_EQUAL_STRING("off", d["+"]["s"].as<const char *>());
+    TEST_ASSERT_TRUE(hasKey(d["+"]["a"], "brightness"));
+    TEST_ASSERT_TRUE(d["+"]["a"]["brightness"].isNull());
+    TEST_ASSERT_TRUE(d["+"]["a"]["entity_picture"].isNull());
+    TEST_ASSERT_TRUE(d["+"]["c"].isNull());
+    TEST_ASSERT_TRUE(d["+"]["lc"].isNull());
+    TEST_ASSERT_EQUAL_STRING("hs_color", d["-"]["a"][0].as<const char *>());
+}
+
+static void test_removed_event_filter() {
+    ha::Message m = parse("{\"id\":2,\"type\":\"event\",\"event\":{\"r\":[\"light.x\",\"light.y\"]}}");
+    TEST_ASSERT_TRUE(m.hasRemoved);
+    TEST_ASSERT_EQUAL_INT(2, (int)m.event()["r"].size());
+    TEST_ASSERT_EQUAL_STRING("light.y", m.event()["r"][1].as<const char *>());
+}
+
+static void test_event_unneeded_attr_70000_bytes_parses() {
+    ha::Message m = parse(aEvent("\"entity_picture\":\"" + std::string(70000, 'p') + "\""));
+    TEST_ASSERT_EQUAL(MT::Event, m.type);
+    TEST_ASSERT_TRUE(m.hasAdded);
+    JsonVariantConst a = m.event()["a"]["light.x"]["a"];
+    TEST_ASSERT_EQUAL_INT(100, a["brightness"].as<int>());
+    TEST_ASSERT_EQUAL_STRING("X", a["friendly_name"].as<const char *>());
+    TEST_ASSERT_TRUE(a["entity_picture"].isNull());
+    TEST_ASSERT_FALSE(hasKey(a, "entity_picture"));
+    ha::Message c = parse(cEvent("\"entity_picture\":\"" + std::string(70000, 'p') + "\""));
+    TEST_ASSERT_EQUAL(MT::Event, c.type);
+    TEST_ASSERT_TRUE(c.hasChanged);
+    TEST_ASSERT_FALSE(hasKey(c.event()["c"]["light.x"]["+"]["a"], "entity_picture"));
+}
+
+static void test_nesting_boundaries_a_event() {
+    // an unneeded attribute value nested 15 levels in an "a" event parses
+    ha::Message ok = parse(aEvent("\"foo\":" + nested(15)));
+    TEST_ASSERT_EQUAL(MT::Event, ok.type);
+    TEST_ASSERT_TRUE(ok.hasAdded);
+    TEST_ASSERT_EQUAL_INT(100, ok.event()["a"]["light.x"]["a"]["brightness"].as<int>());
+    TEST_ASSERT_TRUE(ok.event()["a"]["light.x"]["a"]["foo"].isNull());
+    // 25 levels: Error, no crash
+    TEST_ASSERT_EQUAL(MT::Error, parse(aEvent("\"foo\":" + nested(25))).type);
+}
+
+static void test_nesting_boundaries_c_event() {
+    ha::Message ok = parse(cEvent("\"foo\":" + nested(14)));
+    TEST_ASSERT_EQUAL(MT::Event, ok.type);
+    TEST_ASSERT_TRUE(ok.hasChanged);
+    TEST_ASSERT_EQUAL_INT(50, ok.event()["c"]["light.x"]["+"]["a"]["brightness"].as<int>());
+    TEST_ASSERT_EQUAL(MT::Error, parse(cEvent("\"foo\":" + nested(15))).type);
+    TEST_ASSERT_EQUAL(MT::Error, parse(cEvent("\"foo\":" + nested(25))).type);
+}
+
+static void test_deep_nesting_everywhere_is_error_not_crash() {
+    // deep value in an unrelated envelope key and in a result
+    TEST_ASSERT_EQUAL(MT::Error, parse("{\"type\":\"pong\",\"x\":" + nested(100) + "}").type);
+    TEST_ASSERT_EQUAL(MT::Error, parse("{\"id\":1,\"type\":\"result\",\"success\":true,\"result\":" + nested(30) + "}").type);
+    // 5000 levels, unterminated
+    TEST_ASSERT_EQUAL(MT::Error, parse("{\"type\":\"pong\",\"x\":" + std::string(5000, '[')).type);
+}
+
+static void test_result_payload_still_kept_small() {
+    ha::Message m = parse("{\"id\":1,\"type\":\"result\",\"success\":true,\"result\":{\"a\":{\"b\":[1,{\"c\":2}]}}}");
+    TEST_ASSERT_EQUAL(MT::Result, m.type);
+    TEST_ASSERT_EQUAL_INT(2, m.result()["a"]["b"][1]["c"].as<int>());
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
+    RUN_TEST(test_event_filter_keeps_needed_drops_unneeded);
+    RUN_TEST(test_event_context_and_timestamps_dropped);
+    RUN_TEST(test_change_event_filter_keeps_plus_and_minus);
+    RUN_TEST(test_removed_event_filter);
+    RUN_TEST(test_event_unneeded_attr_70000_bytes_parses);
+    RUN_TEST(test_nesting_boundaries_a_event);
+    RUN_TEST(test_nesting_boundaries_c_event);
+    RUN_TEST(test_deep_nesting_everywhere_is_error_not_crash);
+    RUN_TEST(test_result_payload_still_kept_small);
     RUN_TEST(test_build_auth);
     RUN_TEST(test_build_ping);
     RUN_TEST(test_build_subscribe);

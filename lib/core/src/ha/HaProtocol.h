@@ -24,15 +24,28 @@
 // The device never sends supported_features/coalesce_messages, so every frame holds
 // exactly one message (a top-level array is classified as Error).
 //
-// Messages longer than kEnvelopeOnlyBytes are parsed envelope-only: an ArduinoJson filter
-// keeps just "type", "id", "success", "ha_version", "message" and "error.code" /
-// "error.message", so a multi-MB message (e.g. a get_states result) never builds a
-// document of its own size. Such a Message has envelopeOnly set and an empty result() /
-// event() (hasAdded/hasChanged/hasRemoved stay false).
+// Every message is parsed with an ArduinoJson filter and NestingLimit(kMaxNesting). The
+// envelope filter keeps just "type", "id", "success", "ha_version", "message" and
+// "error.code" / "error.message". Messages up to kEnvelopeOnlyBytes additionally keep the
+// whole "result" and the subscribe_entities payload (plan-step6.md §3.3):
+//   event.a.*.{s, a.{kAttributeKeys}}
+//   event.c.*.{"+".{s, a.{kAttributeKeys}}, "-".a}
+//   event.r
+// so unneeded attributes (pictures, source lists, contexts) are skipped and never stored
+// (they hit no string length limit). Nesting counts every object / array including the
+// root, also inside skipped values: an "a" entity attribute may nest 15 levels, a "c" one
+// 14; deeper messages are Error.
+// Messages longer than kEnvelopeOnlyBytes are parsed envelope-only, so a multi-MB message
+// (e.g. a get_states result) never builds a document of its own size. Such a Message has
+// envelopeOnly set and an empty result() / event() (hasAdded/hasChanged/hasRemoved stay
+// false).
 namespace core {
 namespace ha {
 
 constexpr size_t kEnvelopeOnlyBytes = 256u * 1024u;
+// ArduinoJson nesting limit for every HA JSON parse (the loop task stack is 8 KB and the
+// parser recurses).
+constexpr uint8_t kMaxNesting = 20;
 
 std::string buildAuth(const std::string &accessToken, ArduinoJson::Allocator *allocator = nullptr);
 std::string buildPing(uint32_t id, ArduinoJson::Allocator *allocator = nullptr);

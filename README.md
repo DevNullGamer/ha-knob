@@ -584,6 +584,7 @@ lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the h
   src/ws/         WsHandshake, WsFrame, WsReceiver (WebSocket client codec, RFC 6455)
 test/native/      host unit tests (Unity), run with `pio test -e native`
 tools/            serial_check.py, gen_fonts.sh
+docs/             DESIGN-NOTES.md (per-step design decisions and measurements)
 ```
 
 ## Security

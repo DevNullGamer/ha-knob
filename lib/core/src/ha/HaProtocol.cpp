@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "ha/EntityAttrs.h"
+
 namespace core {
 namespace ha {
 
@@ -25,8 +27,9 @@ JsonDocument makeCommand(uint32_t id, const char *type, ArduinoJson::Allocator *
     return doc;
 }
 
-// The fields parseMessage() looks at, for envelope-only parsing of large messages.
-JsonDocument makeEnvelopeFilter(ArduinoJson::Allocator *allocator) {
+// The fields parseMessage() looks at; with payload also the result and the
+// subscribe_entities event (see HaProtocol.h).
+JsonDocument makeMessageFilter(bool withPayload, ArduinoJson::Allocator *allocator) {
     JsonDocument filter = makeDoc(allocator);
     filter["type"] = true;
     filter["id"] = true;
@@ -35,6 +38,18 @@ JsonDocument makeEnvelopeFilter(ArduinoJson::Allocator *allocator) {
     filter["message"] = true;
     filter["error"]["code"] = true;
     filter["error"]["message"] = true;
+    if (withPayload) {
+        filter["result"] = true;
+        JsonObject event = filter["event"].to<JsonObject>();
+        JsonObject added = event["a"]["*"].to<JsonObject>();
+        added["s"] = true;
+        addAttributeFilter(added["a"].to<JsonObject>());
+        JsonObject changed = event["c"]["*"].to<JsonObject>();
+        changed["+"]["s"] = true;
+        addAttributeFilter(changed["+"]["a"].to<JsonObject>());
+        changed["-"]["a"] = true;
+        event["r"] = true;
+    }
     return filter;
 }
 
@@ -111,13 +126,10 @@ Message parseMessage(const char *json, size_t length, ArduinoJson::Allocator *al
     Message msg(allocator);
     DeserializationError err = DeserializationError::InvalidInput;
     if (json != nullptr && length > 0) {
-        if (length > kEnvelopeOnlyBytes) {
-            msg.envelopeOnly = true;
-            const JsonDocument filter = makeEnvelopeFilter(allocator);
-            err = deserializeJson(msg.doc, json, length, DeserializationOption::Filter(filter));
-        } else {
-            err = deserializeJson(msg.doc, json, length);
-        }
+        msg.envelopeOnly = length > kEnvelopeOnlyBytes;
+        const JsonDocument filter = makeMessageFilter(!msg.envelopeOnly, allocator);
+        err = deserializeJson(msg.doc, json, length, DeserializationOption::Filter(filter),
+                              DeserializationOption::NestingLimit(kMaxNesting));
     }
     if (err != DeserializationError::Ok || !msg.doc.is<JsonObjectConst>()) {
         msg.doc.clear();
