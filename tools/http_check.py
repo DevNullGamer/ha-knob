@@ -49,6 +49,12 @@ backoff continues), unparsable CA -> tls_ca_invalid without TCP connect, 3 MB ov
 with a ~4 KB CA bundle, 20 kill/restart cycles (no leak, heap_min >= 70 KB), no maxlength on the
 CA textarea and > 4096 chars -> 400 length. Prints the measured numbers at the end.
 
+--entities-test (Step 6.6; same ha restore, also controls [] and the web password; needs --mock-python,
+--mock-host and --serial-log): GET /api/ha/entities and POST /api/ha/entities/refresh against
+tools/mockha.py (503 / 202 / 200 / 502 rows, refresh, guards, /api/meta/actions equals the native
+test's metaJson, status fields, 20-parallel load with the 4-stream cap, aborts, refresh races).
+Implemented in tools/entities_test.py; prints the measured numbers at the end.
+
 Safety: without --ha-test/--ws-test/--tls-test never touches the wifi or ha sections. The only state-changing requests are
  - a device patch with an invalid hostname (must be rejected with 400),
  - with --web-password-test: setting a random web password and clearing it again
@@ -1447,6 +1453,9 @@ def run(args):
         run_ws_test(c, args)
     if args.tls_test:
         run_tls_test(c, args)
+    if args.entities_test:
+        from entities_test import run_entities_test
+        run_entities_test(c, args)
 
     print(f"\n{c.passes} passed, {len(c.failures)} failed")
     for f in c.failures:
@@ -1471,12 +1480,16 @@ def main():
                    help="Step 5b.2 on-device WebSocket transport tests (needs --serial-log; restores the ha section)")
     p.add_argument("--tls-test", action="store_true",
                    help="Step 5b.4 on-device wss matrix (needs --cert-dir, --serial-log; restores the ha section)")
+    p.add_argument("--entities-test", action="store_true",
+                   help="Step 6.6 entity-list web API tests (needs --mock-python, --mock-host, --serial-log)")
     p.add_argument("--cert-dir", help="directory written by tools/gen_test_certs.sh (never commit it)")
     p.add_argument("--mock-python", help="Python executable that may accept LAN connections")
     p.add_argument("--mock-host", help="LAN IP of this PC as seen from the device")
     p.add_argument("--mock-port", type=int, default=8765)
     p.add_argument("--serial-log", help="file appended to by a background serial logger")
     args = p.parse_args()
+    if args.entities_test and not (args.mock_python and args.mock_host and args.serial_log):
+        p.error("--entities-test needs --mock-python, --mock-host and --serial-log")
     if (args.ha_test or args.ws_test or args.tls_test) and not (args.mock_python and args.mock_host):
         p.error("--ha-test / --ws-test need --mock-python and --mock-host")
     if args.ws_test and not args.serial_log:

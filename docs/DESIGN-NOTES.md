@@ -514,3 +514,57 @@ Spec: `plan-step6.md` §3.1-3.3, §3.8, §4 Step 6.5. Device glue for 6.1-6.4; v
   Ready, so the get_states path can be tested on the device before the web API (6.6).
 - Build (v0.6.0): RAM 54472 bytes (16.6 %), flash 1789921 bytes (27.6 %); after the R8
   fix RAM 54672 bytes (16.7 %), flash ~1790849 bytes (27.6 %).
+
+## Step 6.6 (2026-10-16)
+
+Spec: `plan-step6.md` §3.5, §3.8, §4 Step 6.6. Web API for the entity list; no version bump.
+
+- Routes `GET /api/meta/actions` (`metaJson(PsramAllocator)` built once in `web::begin`),
+  `GET /api/ha/entities`, `POST /api/ha/entities/refresh`, registered with
+  `AsyncURIMatcher::exact`: the library's default matcher for a plain string also takes
+  `<path>/...`, so `GET /api/ha/entities/refresh` would otherwise reach the GET handler.
+  The older routes keep the default (unchanged behaviour).
+- Snapshot (under `snapshotMutex`): catalog state, the `shared_ptr<const std::string>` body,
+  count, error, entity / subscribed counts and the pending `CatalogRequest`
+  (`None|Fetch|Refresh`). Deviation from §3.5 ("`std::atomic<bool>` request flags"): the
+  request lives under the mutex, because a refresh must clear the published catalog in the
+  same step. `publishCatalog()` is ignored while a Refresh is not taken yet, so a publish
+  that races the handler (e.g. a build finishing in the same pass) cannot bring the old
+  list back before the main loop handled the refresh. The refresh handler sets the state
+  to `fetching` (unless `building`) and drops body / count / error; the main loop
+  republishes the true state after every taken request (`catalogRepublish`), which also
+  corrects the snapshot when `requestStates()` did not start (HA left Ready meanwhile).
+- GET rows exactly as §3.5 (first match wins): `fetching`/`building` -> 202 (no new
+  request), body -> 200, `failed` -> 502, HA not Ready -> 503, else set `Fetch` -> 202.
+  A Ready catalog is still served while HA is offline (row order). Main loop: a request is
+  never acted on while `catalogState()` is `fetching`/`building` (also not while the JSON
+  is written); `Fetch` calls `ha::requestStates()` only when the state is still `none`
+  (a GET must never replace an existing list), `Refresh` in `none`/`ready`/`failed`.
+  `requestStates()` itself drops the old catalog / error.
+- 200 streaming: `beginResponse(kJson, len, filler)`; the filler lambda captures the body
+  `shared_ptr` (refcount copy under the mutex, nothing copied per request) and copies at
+  most `maxLen` bytes per call into the library's send buffer, so the body stays alive
+  until the library deletes the response even if a new catalog is published meanwhile.
+  Internal heap per streaming connection: a `2 x MSS` (2872 B) send buffer (internal,
+  below the 4 KB SPIRAM threshold) plus up to a 5760 B TCP send window of pbufs, about 9 KB;
+  lwIP allows 16 active TCP connections. A cap of 4 concurrent 200 streams
+  (`kMaxCatalogStreams`; an atomic counter, decremented by a `CatalogStreamSlot` owned by
+  the filler, i.e. when the response is deleted: sent, aborted or never sent) bounds that
+  to ~36 KB; further GETs get `503 {"error":"busy"}` + `Retry-After: 1` (small response).
+  Not in §3.5; the web UI's single request never hits it.
+- `/api/status` `ha` gains `subscribed`, `entities`, `catalog:{state,count,error}`
+  (published by `main.cpp` `publishCatalog()` on `ha::catalogChangeCount()` changes and on
+  entity / id count changes).
+- `WEB entities refresh requested` is logged in the handler (like the other `WEB` request
+  lines). The `-DHAKNOB_STATES_ON_READY` test hook is kept (the spec does not remove it).
+- Round 2 (audit hardening): (1) a taken Refresh whose `requestStates()` did not start
+  (HA left Ready between the handler's check and the main loop; state not `fetching`
+  afterwards) sets `catalogHidden` in `main.cpp`: the snapshot is then published as
+  `none` without body, count or error until `ha::catalogChangeCount()` differs from its
+  value at hiding (new fetch, failure, URL change). A polling client gets 503
+  `ha_not_connected` (or, once HA is Ready again, 202 + a new fetch), never the stale list
+  or the old 502. A send failure inside `requestStates()` is a real change
+  (`failed: connection_lost`) and is published as such. (2) `Fetch` also starts a fetch
+  when the list is hidden or `catalogState()` is `ready` without a body (the GET handler
+  already treats that like `none`), so a GET cannot get 202 forever.
+- Build: RAM 54776 bytes (16.7 %), flash 1797733 bytes (27.7 %); round 2 flash 1797977 bytes.

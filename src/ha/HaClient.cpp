@@ -74,7 +74,7 @@ void refreshStatus() {
 
 #if defined(HAKNOB_STATES_ON_READY)
     // Test builds only (-DHAKNOB_STATES_ON_READY): fetch the entity list on every Ready,
-    // so the get_states path can be exercised before the web API exists (Step 6.6).
+    // so the get_states path can be exercised without a web request (GET /api/ha/entities).
     if (becameReady) {
         session.requestStates(millis());
     }

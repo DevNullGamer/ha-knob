@@ -54,6 +54,10 @@ Entity/state options (Step 6.5)
   --rm-add-every S    every S seconds remove ("r") and then re-add ("a") the last entity of each
                       subscription, so the device's ent= count moves (c diffs alone do not)
   --deep-result N [N ..]  after auth send a small type=result (id 998) nested N levels, 2 s apart
+Step 6.6 option
+  --stdin-commands    read commands from stdin, one per line: "rst" aborts every open connection
+                      with a TCP RST (SO_LINGER 0), "wsclose" sends a ws Close frame (1001) on
+                      every open connection (used to race a refresh against a dropping HA)
 Logs: "RX get_states", "SENT states <bytes> in <s>", "SENT c-diff", "RX unsubscribe_events".
 It answers subscribe_entities with a success result (and, with a fixture, an "a" event). The access token is never printed (only
 its length).
@@ -425,12 +429,38 @@ def tls_conn(c, addr, args, ctx):
     handle_safe(sc, addr, args)
 
 
+ACTIVE = set()
+ACTIVE_LOCK = threading.Lock()
+
+
+def stdin_loop():
+    import sys
+    for line in sys.stdin:
+        cmd = line.strip()
+        with ACTIVE_LOCK:
+            conns = list(ACTIVE)
+        print(f"STDIN {cmd} conns={len(conns)}", flush=True)
+        for c in conns:
+            try:
+                if cmd == "rst":
+                    c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    c.close()
+                elif cmd == "wsclose":
+                    c.sendall(frame(8, struct.pack(">H", 1001) + b"going away"))
+            except Exception as e:
+                print("stdin cmd failed:", e, flush=True)
+
+
 def handle_safe(c, addr, args):
+    with ACTIVE_LOCK:
+        ACTIVE.add(c)
     try:
         handle(c, addr, args)
     except Exception as e:
         print("conn end:", e, flush=True)
     finally:
+        with ACTIVE_LOCK:
+            ACTIVE.discard(c)
         try:
             c.close()
         except Exception:
@@ -471,6 +501,7 @@ def main():
     ap.add_argument("--stall-states", action="store_true")
     ap.add_argument("--change-every", type=float, default=0.0, metavar="S")
     ap.add_argument("--rm-add-every", type=float, default=0.0, metavar="S")
+    ap.add_argument("--stdin-commands", action="store_true")
     ap.add_argument("--deep-result", type=int, nargs="+", default=[], metavar="N")
     args = ap.parse_args()
     args.states_list = load_states(args)
@@ -483,6 +514,8 @@ def main():
             ctx.load_cert_chain(args.tls_cert, args.tls_key)
         elif not args.stall:
             ap.error("--tls13-only needs --tls-cert/--tls-key")
+    if args.stdin_commands:
+        threading.Thread(target=stdin_loop, daemon=True).start()
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", args.port))

@@ -4,7 +4,7 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.6.0, Step 6.5 (live entity state, entity list fetch).** The firmware drives the
+**Status: v0.6.0, Step 6.6 (live entity state, entity list API).** The firmware drives the
 hardware (display, touch swipes, encoder, button, buzzer), loads its configuration from NVS,
 joins Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home Assistant
 and device settings, keeps an authenticated, self-healing WebSocket connection to Home
@@ -151,6 +151,7 @@ HA catalog done total=<n> supported=<n> skipped=<n> build_ms=<n> json=<bytes> js
 HA catalog failed error=<e>              states_too_large / states_no_memory / states_timeout / states_failed: .. / states_unexpected / connection_lost
 HA state=<state>[ ha_version=<v>][ error=<error>][ retry_in_ms=<ms>]   every state change
 HA retry                                 web UI Retry accepted
+WEB entities refresh requested           POST /api/ha/entities/refresh accepted
 SYS reboot | SYS factory reset           performed by the main loop just after the response
 ```
 
@@ -361,10 +362,13 @@ files were never flashed, `/` answers 503 with a hint to run `uploadfs`.
 
 | Method / path | Response |
 |---|---|
-| GET `/api/status` | `{fw, uptime_s, heap_free, heap_min_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state, ha_version, last_error, tls}}` (see Home Assistant; `tls` is `none`, `bundle`, `custom_ca` or `insecure`, the mode of the stored address) |
+| GET `/api/status` | `{fw, uptime_s, heap_free, heap_min_free, psram_free, touch_variant, wifi:{mode, ssid, connected, ip, rssi, ap_active, ap_ssid, ap_ip, hostname}, ha:{state, ha_version, last_error, tls, subscribed, entities, catalog:{state, count, error}}}` (see Home Assistant; `tls` is `none`, `bundle`, `custom_ca` or `insecure`, the mode of the stored address; `subscribed` = unique entity ids of the controls, `entities` = entities with live state, `catalog.state` = `none`, `fetching`, `building`, `ready` or `failed`, `count` = entities in the list) |
 | GET `/api/config` | Redacted config (including `ha.ca_pem` and `ha.tls_insecure`, which are not secret): secrets only as `wifi.password_set`, `ha.token_set`, `web.password_set` |
 | POST `/api/config` | Patch (see Configuration). `200 {ok:true, restart_wifi}`, `400 {error, field}` (validation), `500 {error:"nvs_write_failed", field}` (storage failed; the config may be partly written and is re-read) |
 | GET `/api/wifi/scan` | `{scanning, age_s, failed, networks:[{ssid, rssi, secure}]}`; starts a new scan when there is none yet, the last one failed or it is older than 10 s. Poll until `scanning` is false (a scan takes about 2-5 s; requests during a scan can take up to about 3 s because the radio briefly leaves its channel) |
+| GET `/api/meta/actions` | `{max_controls, max_label_bytes, domains:[{domain, actions:[{name, step:{default, min, max}}], presses:[..]}]}`: per domain the encoder actions (default first, `none` last; actions without a step have no `step`) and the press actions (default first). The web UI takes all actions, presses and ranges from here |
+| GET `/api/ha/entities` | Entity list for the picker; the first matching case wins: a fetch is running -> `202 {pending:true}`; a list exists -> `200 {fetched_at_s, total, skipped, truncated, entities:[{id, name, state, actions, step_default}]}` (supported domains only, Home Assistant's order; the default action is `actions[0]`, `step_default` belongs to it, 0 for `none`; presses come from `/api/meta/actions`); the last fetch failed -> `502 {error:"fetch_failed", detail}` (`detail` e.g. `states_too_large`); Home Assistant not `ready` -> `503 {error:"ha_not_connected"}`; otherwise `202` and a fetch starts. Poll while `202` (a fetch takes a few seconds on large installations). The list stays in RAM until a refresh, a failure or another Home Assistant address. At most 4 lists are sent at the same time; more parallel requests get `503 {error:"busy"}` with `Retry-After: 1` |
+| POST `/api/ha/entities/refresh` | Home Assistant not `ready` -> `503 {error:"ha_not_connected"}`; else drops the list / error and fetches a new one (a fetch already running is kept) -> `202 {pending:true}` |
 | POST `/api/ha/retry` | `200 {ok:true}`; leaves `auth_failed` (or ends a backoff wait) and reconnects. A no-op in other states |
 | POST `/api/reboot` | `200 {ok:true}`, reboots about 0.75 s later |
 | POST `/api/factory-reset` | `200 {ok:true}`, then erases the config and secrets (not `ap_pw`) and reboots |
@@ -392,7 +396,8 @@ are `Cache-Control: no-store`.
 Threading: request callbacks run in the `async_tcp` task. They never touch LVGL or Wi-Fi;
 they read a snapshot the main loop publishes (under a mutex), write the config only via
 `ConfigStore::applyPatch`, and hand Wi-Fi scans, config re-reads, reboot and factory reset
-to the main loop through atomic flags.
+to the main loop through atomic flags (entity list requests through the snapshot). The
+entity list is serialised once by the main loop and streamed from that shared copy.
 
 ## Home Assistant
 
@@ -424,8 +429,8 @@ the long-lived token. REST is not used.
 - Entity list: `get_states` (multi-MB on large installations) is taken over from the
   receive buffer without a copy and turned into a compact list of the supported entities
   in 32 KB slices (about 5 ms each), so the main loop never blocks on it. The list (at most
-  1500 entities, names cut to 96 bytes) is kept in RAM only. The web UI requests it from
-  Step 6.6 on.
+  1500 entities, names cut to 96 bytes) is kept in RAM only. The web UI gets it from
+  `GET /api/ha/entities` (see Web server and API).
 - Message ids start at 1 on every connection.
 - Name resolution (also `.local` names via mDNS) runs in the background. The TCP connect
   itself blocks the main loop for up to 2 s when the host does not answer at all. The

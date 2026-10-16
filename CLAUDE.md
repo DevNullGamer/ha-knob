@@ -6,7 +6,7 @@ Guidance for AI assistants working in this repository.
 
 HA Knob: Home Assistant controller firmware for the LilyGo T-Encoder Pro (ESP32-S3R8,
 16 MB flash, 8 MB OPI PSRAM, 390x390 round AMOLED, touch, rotary encoder, buzzer).
-PlatformIO + Arduino framework. Current version 0.6.0 (Step 6.5: live entities, entity list fetch).
+PlatformIO + Arduino framework. Current version 0.6.0 (Step 6.6: live entities, entity list API).
 
 The approved specification and change log live outside the repo in
 `~/.claude/workspace/chgreq/LilyGo T-encoderPro - HA Controller/chg001/`.
@@ -84,7 +84,9 @@ line, not only on `BOOT`.
   from them. They read the snapshot published by `net::web::publishNetwork` (mutex), write
   config **only via `ConfigStore::applyPatch()`** (never `save()`, which bypasses the token
   and Wi-Fi guards), and request work (config re-read, scan, reboot, factory reset) with
-  atomic flags the main loop takes (`net::web::take*`).
+  atomic flags the main loop takes (`net::web::take*`). Never touch HaClient there: the
+  entity list is a published `shared_ptr` body, streamed (never copied; max 4 streams).
+  New routes use `AsyncURIMatcher::exact` (a plain path also matches `<path>/...`).
 - `lib/core/src/web/RequestGuard`: Host allow-list, captive-portal redirect, method,
   CSRF (`application/json` + `X-HAKnob: 1`), body limit (16 KB), Basic auth check. Every
   request passes it in the server middleware. Never add CORS headers.

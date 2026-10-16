@@ -8,11 +8,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "config/ConfigStore.h"
+#include "control/DomainActions.h"
 #include "ha/HaSession.h"
 #include "hal/PsramAllocator.h"
 #include "version.h"
@@ -30,6 +32,10 @@ constexpr uint16_t kPort = 80;
 constexpr uint32_t kScanFreshMs = 10000;  // GET /api/wifi/scan reuses results this young
 constexpr const char *kRealm = "HA Knob";
 constexpr const char *kJson = "application/json";
+// GET /api/ha/entities 200 bodies streamed at the same time. Each stream holds a send
+// buffer (2 x MSS) and up to a TCP send window of pbufs in internal RAM (~9 KB); more
+// parallel requests get 503 {"error":"busy"} instead of exhausting the internal heap.
+constexpr int kMaxCatalogStreams = 4;
 
 AsyncWebServer server(kPort);
 ConfigStore *store = nullptr;
@@ -50,6 +56,20 @@ bool scanFailed = false;
 bool scanPending = false;  // requested or running
 uint32_t scanAtMs = 0;
 ha::Status haStatus;
+// Entity list (plan-step6.md §3.5): the main loop's catalog state and its prebuilt GET
+// /api/ha/entities body (shared, never copied per request), plus the pending request.
+// A refresh clears the published catalog at once; publishCatalog() leaves it cleared until
+// the main loop has taken the refresh, so no GET in between returns the old list.
+core::ha::StatesState catalogState = core::ha::StatesState::None;
+std::shared_ptr<const std::string> catalogBody;
+size_t catalogCount = 0;
+std::string catalogError;
+size_t entityCount = 0;
+size_t subscribedCount = 0;
+CatalogRequest catalogRequest = CatalogRequest::None;
+std::string metaBody;  // GET /api/meta/actions, built once in begin() (read-only afterwards)
+
+std::atomic<int> catalogStreams{0};  // running 200 streams of GET /api/ha/entities
 
 std::atomic<bool> configDirty{false};
 std::atomic<bool> scanRequested{false};
@@ -193,10 +213,20 @@ void onConfigBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, siz
 void handleStatus(AsyncWebServerRequest *request) {
     wifi::Status net;
     ha::Status haNow;
+    size_t subscribed = 0;
+    size_t entities = 0;
+    core::ha::StatesState catState = core::ha::StatesState::None;
+    size_t catCount = 0;
+    std::string catError;
     {
         std::lock_guard<std::mutex> lock(snapshotMutex);
         net = netStatus;
         haNow = haStatus;
+        subscribed = subscribedCount;
+        entities = entityCount;
+        catState = catalogState;
+        catCount = catalogCount;
+        catError = catalogError;
     }
     JsonDocument doc = makeDoc();
     doc["fw"] = FW_VERSION;
@@ -220,6 +250,12 @@ void handleStatus(AsyncWebServerRequest *request) {
     h["ha_version"] = haNow.haVersion;
     h["last_error"] = haNow.lastError;
     h["tls"] = core::ha::tlsModeName(haNow.tls);
+    h["subscribed"] = subscribed;
+    h["entities"] = entities;
+    JsonObject c = h["catalog"].to<JsonObject>();
+    c["state"] = core::ha::statesStateName(catState);
+    c["count"] = catCount;
+    c["error"] = catError;
     sendJson(request, 200, doc);
 }
 
@@ -311,6 +347,113 @@ void requestSystem(AsyncWebServerRequest *request, SystemRequest what) {
     sendJson(request, 200, doc);
 }
 
+void sendPending(AsyncWebServerRequest *request) {
+    JsonDocument doc = makeDoc();
+    doc["pending"] = true;
+    sendJson(request, 202, doc);
+}
+
+// One running catalog stream. The response's filler owns it, so the count drops when the
+// library deletes the response (sent, aborted by the client, or never sent).
+struct CatalogStreamSlot {
+    ~CatalogStreamSlot() { --catalogStreams; }
+};
+
+// 200: streams the shared catalog body. The filler keeps the body alive and copies only
+// what fits into the library's send buffer; no mutex is held while sending.
+void sendCatalog(AsyncWebServerRequest *request, std::shared_ptr<const std::string> body) {
+    if (catalogStreams.fetch_add(1) >= kMaxCatalogStreams) {
+        --catalogStreams;
+        AsyncWebServerResponse *response = request->beginResponse(503, kJson, "{\"error\":\"busy\"}");
+        response->addHeader("Cache-Control", "no-store");
+        response->addHeader("Retry-After", "1");
+        request->send(response);
+        return;
+    }
+    std::shared_ptr<CatalogStreamSlot> slot = std::make_shared<CatalogStreamSlot>();
+    const size_t length = body->size();
+    AsyncWebServerResponse *response = request->beginResponse(
+        kJson, length, [body, slot](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+            if (index >= body->size()) {
+                return 0;
+            }
+            const size_t n = std::min(maxLen, body->size() - index);
+            memcpy(buffer, body->data() + index, n);
+            return n;
+        });
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+}
+
+// GET /api/ha/entities: the first matching row of plan-step6.md §3.5 wins.
+void handleEntitiesGet(AsyncWebServerRequest *request) {
+    using core::ha::StatesState;
+    std::shared_ptr<const std::string> body;
+    std::string error;
+    int code = 0;
+    {
+        std::lock_guard<std::mutex> lock(snapshotMutex);
+        if (catalogState == StatesState::Fetching || catalogState == StatesState::Building) {
+            code = 202;
+        } else if (catalogBody) {
+            body = catalogBody;
+            code = 200;
+        } else if (catalogState == StatesState::Failed) {
+            error = catalogError;
+            code = 502;
+        } else if (haStatus.state != core::ha::State::Ready) {
+            code = 503;
+        } else {
+            // none, or ready without a body (treated alike): the main loop fetches unless it
+            // has a list to serve by then
+            if (catalogRequest == CatalogRequest::None) {
+                catalogRequest = CatalogRequest::Fetch;
+            }
+            code = 202;
+        }
+    }
+    if (code == 200) {
+        sendCatalog(request, std::move(body));
+    } else if (code == 202) {
+        sendPending(request);
+    } else if (code == 502) {
+        JsonDocument doc = makeDoc();
+        doc["error"] = "fetch_failed";
+        doc["detail"] = error;
+        sendJson(request, 502, doc);
+    } else {
+        sendError(request, 503, "ha_not_connected");
+    }
+}
+
+// POST /api/ha/entities/refresh: drops the published catalog / error and asks the main
+// loop for a new fetch (one already running is kept).
+void handleEntitiesRefresh(AsyncWebServerRequest *request) {
+    using core::ha::StatesState;
+    bool ready = false;
+    {
+        std::lock_guard<std::mutex> lock(snapshotMutex);
+        ready = haStatus.state == core::ha::State::Ready;
+        if (ready) {
+            catalogRequest = CatalogRequest::Refresh;
+            if (catalogState != StatesState::Building) {
+                catalogState = StatesState::Fetching;  // corrected by the main loop's next publish
+            }
+            catalogBody.reset();  // HaClient still holds the body: never the last reference here
+            catalogCount = 0;
+            catalogError.clear();
+        }
+    }
+    if (!ready) {
+        sendError(request, 503, "ha_not_connected");
+        return;
+    }
+    util::logPrintf("WEB entities refresh requested\n");
+    sendPending(request);
+}
+
+void handleMeta(AsyncWebServerRequest *request) { sendRawJson(request, 200, metaBody); }
+
 bool isListed(const std::string &path) {
     return std::find(staticFiles.begin(), staticFiles.end(), path) != staticFiles.end();
 }
@@ -357,6 +500,7 @@ void begin(ConfigStore &configStore, const char *touchVariant) {
     store = &configStore;
     touchName = touchVariant;
     refreshWebPassword();
+    metaBody = core::domain_actions::metaJson(PsramAllocator::instance());
 
     // LittleFS holds only web assets; never format it automatically (uploadfs does that).
     fsOk = LittleFS.begin(false);
@@ -381,6 +525,10 @@ void begin(ConfigStore &configStore, const char *touchVariant) {
     server.on("/api/config", HTTP_POST, handleConfigPost, nullptr, onConfigBody);
     server.on("/api/wifi/scan", HTTP_GET, handleScan);
     server.on("/api/ha/retry", HTTP_POST, handleHaRetry);
+    // Exact matches: a plain path would also take "<path>/..." (the library's default).
+    server.on(AsyncURIMatcher::exact("/api/meta/actions"), HTTP_GET, handleMeta);
+    server.on(AsyncURIMatcher::exact("/api/ha/entities"), HTTP_GET, handleEntitiesGet);
+    server.on(AsyncURIMatcher::exact("/api/ha/entities/refresh"), HTTP_POST, handleEntitiesRefresh);
     server.on("/api/reboot", HTTP_POST,
               [](AsyncWebServerRequest *request) { requestSystem(request, SystemRequest::Reboot); });
     server.on("/api/factory-reset", HTTP_POST,
@@ -419,6 +567,31 @@ bool takeScanRequest() { return scanRequested.exchange(false); }
 void publishHa(const ha::Status &status) {
     std::lock_guard<std::mutex> lock(snapshotMutex);
     haStatus = status;
+}
+
+void publishCatalog(core::ha::StatesState state, std::shared_ptr<const std::string> body, size_t count,
+                    const std::string &error) {
+    std::lock_guard<std::mutex> lock(snapshotMutex);
+    if (catalogRequest == CatalogRequest::Refresh) {
+        return;  // the refresh is not taken yet: keep the catalog it cleared
+    }
+    catalogState = state;
+    catalogBody = std::move(body);
+    catalogCount = count;
+    catalogError = error;
+}
+
+void publishEntityCounts(size_t entities, size_t subscribed) {
+    std::lock_guard<std::mutex> lock(snapshotMutex);
+    entityCount = entities;
+    subscribedCount = subscribed;
+}
+
+CatalogRequest takeCatalogRequest() {
+    std::lock_guard<std::mutex> lock(snapshotMutex);
+    const CatalogRequest request = catalogRequest;
+    catalogRequest = CatalogRequest::None;
+    return request;
 }
 
 bool takeHaRetry() { return haRetryRequested.exchange(false); }

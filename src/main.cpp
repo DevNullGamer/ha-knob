@@ -63,6 +63,16 @@ ui::NetworkView shownView;
 ha::Status shownHa;
 bool shownHaNetworkUp = false;
 bool haPublished = false;
+uint32_t shownCatalogChange = 0;
+bool catalogPublished = false;
+bool catalogRepublish = false;  // a catalog request was handled: publish even without a change
+// A refresh did not start (HA left Ready after the web check): the old list / error stays
+// hidden from the web server (published as none) until the fetch state changes.
+bool catalogHidden = false;
+uint32_t catalogHiddenChange = 0;  // ha::catalogChangeCount() when it was hidden
+size_t shownEntities = 0;
+size_t shownSubscribed = 0;
+bool entityCountsPublished = false;
 net::web::SystemRequest pendingSystem = net::web::SystemRequest::None;
 uint32_t pendingSystemAtMs = 0;
 
@@ -161,6 +171,33 @@ void publishHa() {
     }
 }
 
+// Publishes the entity list fetch and the entity counts to the web server snapshot.
+void publishCatalog() {
+    const uint32_t change = ha::catalogChangeCount();
+    if (catalogHidden && change != catalogHiddenChange) {
+        catalogHidden = false;  // a new fetch, failure or another HA instance
+    }
+    if (!catalogPublished || catalogRepublish || change != shownCatalogChange) {
+        if (catalogHidden) {
+            net::web::publishCatalog(core::ha::StatesState::None, nullptr, 0, std::string());
+        } else {
+            net::web::publishCatalog(ha::catalogState(), ha::catalogJson(), ha::catalogCount(),
+                                     ha::catalogError());
+        }
+        catalogPublished = true;
+        catalogRepublish = false;
+        shownCatalogChange = change;
+    }
+    const size_t entities = ha::entities().size();
+    const size_t subscribed = ha::subscribedCount();
+    if (!entityCountsPublished || entities != shownEntities || subscribed != shownSubscribed) {
+        net::web::publishEntityCounts(entities, subscribed);
+        entityCountsPublished = true;
+        shownEntities = entities;
+        shownSubscribed = subscribed;
+    }
+}
+
 // Work requested by the web server (whose callbacks run in the async_tcp task).
 void handleWebRequests(uint32_t nowMs) {
     if (net::web::takeConfigDirty()) {
@@ -176,6 +213,34 @@ void handleWebRequests(uint32_t nowMs) {
 
     if (net::web::takeHaRetry()) {
         ha::retry(nowMs);
+    }
+
+    // Entity list: never restart a running fetch (also not while its JSON is written); a
+    // GET fetches only when there is no list to serve (none, hidden, or Ready without a
+    // body), a refresh also replaces a list / error. A refresh that does not start hides
+    // the old list / error, so it never looks like a refreshed one (the GET then gets 503).
+    const net::web::CatalogRequest catalogRequest = net::web::takeCatalogRequest();
+    if (catalogRequest != net::web::CatalogRequest::None) {
+        using core::ha::StatesState;
+        if (catalogHidden && ha::catalogChangeCount() != catalogHiddenChange) {
+            catalogHidden = false;  // as in publishCatalog(): the fetch state changed meanwhile
+        }
+        const StatesState state = ha::catalogState();
+        const bool running = state == StatesState::Fetching || state == StatesState::Building;
+        const bool nothingServed = catalogHidden || state == StatesState::None ||
+                                   (state == StatesState::Ready && !ha::catalogJson());
+        if (!running && (catalogRequest == net::web::CatalogRequest::Refresh || nothingServed)) {
+            const uint32_t changeBefore = ha::catalogChangeCount();
+            const bool started = ha::requestStates(nowMs);
+            // Hide only when nothing changed: a send failure is a new state (failed:
+            // connection_lost) that must reach the web server as 502.
+            if (!started && catalogRequest == net::web::CatalogRequest::Refresh &&
+                ha::catalogChangeCount() == changeBefore && ha::catalogState() != StatesState::Fetching) {
+                catalogHidden = true;
+                catalogHiddenChange = ha::catalogChangeCount();
+            }
+        }
+        catalogRepublish = true;  // the snapshot may show a refresh that did not start
     }
 
     if (net::web::takeScanRequest()) {
@@ -295,6 +360,7 @@ void setup() {
     ha::configure(config.ha.url, configStore.haToken(), haTlsSettings(config), controlEntityIds(config),
                   millis());
     publishHa();
+    publishCatalog();
     net::web::begin(configStore, hal::touch::variantName());
     printBootLine();
 }
@@ -313,6 +379,7 @@ void loop() {
     ha::setNetworkUp(net::wifi::status().staConnected, nowMs);
     ha::loop();
     publishHa();
+    publishCatalog();
 
     if (nowMs - lastHeartbeatMs >= kHeartbeatMs) {
         lastHeartbeatMs = nowMs;
