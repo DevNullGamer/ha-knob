@@ -798,6 +798,140 @@ static void test_json_escapes_and_parses() {
     TEST_ASSERT_EQUAL_UINT32(3, d["fetched_at_s"].as<uint32_t>());
 }
 
+// ---------------- CatalogJsonWriter (Step 6.5 R8) ----------------
+
+static std::string writerJson(const ha::EntityCatalog &cat, size_t slice, size_t *regrow = nullptr,
+                              size_t *capacityMinusSize = nullptr, size_t *steps = nullptr) {
+    ha::CatalogJsonWriter w(cat, 77);
+    size_t n = 0;
+    while (!w.step(slice)) {
+        ++n;
+        TEST_ASSERT_TRUE(n < 100000);
+    }
+    if (steps) *steps = n + 1;
+    TEST_ASSERT_TRUE(w.done());
+    if (regrow) *regrow = w.regrowths();
+    std::string out = w.take();
+    (void)capacityMinusSize;
+    return out;
+}
+
+static ha::EntityCatalog catalogOf(const std::string &text) {
+    ha::EntityCatalogBuilder b(text.data(), text.size(), kId);
+    TEST_ASSERT_EQUAL(Status::Done, runAll(b, 100000));
+    return b.take();
+}
+
+static void test_writer_identical_for_all_slices() {
+    const std::string text = fixtureText();
+    const ha::EntityCatalog cat = catalogOf(text);
+    const std::string ref = ha::catalogToJson(cat, 77);
+    TEST_ASSERT_TRUE(ref.size() > 100);
+    const size_t slices[] = {0, 1, 3, 8, SIZE_MAX};
+    for (size_t sl : slices) {
+        TEST_ASSERT_EQUAL_STRING(ref.c_str(), writerJson(cat, sl).c_str());
+    }
+    JsonDocument d;
+    TEST_ASSERT_TRUE(!deserializeJson(d, ref));
+    TEST_ASSERT_EQUAL_UINT32(77, d["fetched_at_s"].as<uint32_t>());
+}
+
+static void test_writer_step0_is_1() {
+    const ha::EntityCatalog cat = catalogOf(fixtureText());
+    ha::CatalogJsonWriter w(cat, 1);
+    TEST_ASSERT_FALSE(w.step(0));
+    TEST_ASSERT_EQUAL_UINT32(1, (uint32_t)w.entriesWritten());
+    TEST_ASSERT_FALSE(w.step(0));
+    TEST_ASSERT_EQUAL_UINT32(2, (uint32_t)w.entriesWritten());
+    size_t steps = 0;
+    writerJson(cat, 0, nullptr, nullptr, &steps);
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)cat.size(), (uint32_t)steps);  // one entry per step
+}
+
+static void test_writer_progress_and_done_idempotent() {
+    const ha::EntityCatalog cat = catalogOf(fixtureText());
+    ha::CatalogJsonWriter w(cat, 1);
+    TEST_ASSERT_TRUE(w.step(SIZE_MAX));
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)cat.size(), (uint32_t)w.entriesWritten());
+    const size_t cap = w.capacity();
+    TEST_ASSERT_TRUE(w.step(5));  // after done: does nothing
+    const std::string once = w.take();
+    TEST_ASSERT_EQUAL_STRING(ha::catalogToJson(cat, 1).c_str(), once.c_str());
+    TEST_ASSERT_TRUE(cap >= once.size());
+}
+
+static void test_writer_empty_catalog() {
+    ha::EntityCatalog empty;
+    for (size_t sl : {size_t(0), size_t(1), size_t(8), SIZE_MAX}) {
+        ha::CatalogJsonWriter w(empty, 3);
+        TEST_ASSERT_TRUE(w.step(sl));  // the first step also closes an empty catalog
+        TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)w.regrowths());
+        const std::string j = w.take();
+        TEST_ASSERT_EQUAL_STRING(ha::catalogToJson(empty, 3).c_str(), j.c_str());
+        JsonDocument d;
+        TEST_ASSERT_TRUE(!deserializeJson(d, j));
+        TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)d["entities"].size());
+    }
+}
+
+static void test_writer_escape_heavy_names_and_long_steps() {
+    std::vector<std::string> els;
+    for (int i = 0; i < 60; ++i) {
+        // 90 escaped quotes/backslashes/control chars per name (name cap is 96 bytes)
+        std::string nm;
+        for (int k = 0; k < 20; ++k) nm += "\\\\\\\"\\u0001\\n";
+        els.push_back("{\"entity_id\":\"climate.c" + std::to_string(i) +
+                      "\",\"state\":\"heat\",\"attributes\":{\"friendly_name\":\"" + nm +
+                      "\",\"supported_features\":1,\"temperature\":20,\"target_temp_step\":0.5}}");
+    }
+    const ha::EntityCatalog cat = catalogOf(envelope(joinArray(els)));
+    TEST_ASSERT_EQUAL_UINT32(60, (uint32_t)cat.size());
+    const std::string ref = ha::catalogToJson(cat, 77);
+    JsonDocument d;
+    TEST_ASSERT_TRUE(!deserializeJson(d, ref));
+    TEST_ASSERT_EQUAL_UINT32(60, (uint32_t)d["entities"].size());
+    const size_t slices[] = {0, 1, 3, 8, SIZE_MAX};
+    for (size_t sl : slices) {
+        size_t regrow = 99;
+        const std::string j = writerJson(cat, sl, &regrow);
+        if (j != ref) {
+            size_t k = 0;
+            while (k < j.size() && k < ref.size() && j[k] == ref[k]) ++k;
+            printf("    MISMATCH slice=%zu sizes %zu vs %zu first diff at %zu: [%s] vs [%s]\n", sl, j.size(),
+                   ref.size(), k, j.substr(k > 20 ? k - 20 : 0, 60).c_str(),
+                   ref.substr(k > 20 ? k - 20 : 0, 60).c_str());
+        }
+        TEST_ASSERT_TRUE(j == ref);
+        printf("    escape-heavy slice=%zu bytes=%zu regrowths=%zu\n", sl, j.size(), regrow);
+        TEST_ASSERT_TRUE(regrow < 60);  // grows exactly, never once per entry
+    }
+}
+
+static void test_writer_capacity_no_doubling() {
+    std::vector<std::string> els;
+    for (int i = 0; i < 400; ++i) {
+        els.push_back("{\"entity_id\":\"light.l" + std::to_string(i) +
+                      "\",\"state\":\"on\",\"attributes\":{\"friendly_name\":\"Lamp number " +
+                      std::to_string(i) + "\",\"supported_color_modes\":[\"hs\"]}}");
+    }
+    const ha::EntityCatalog cat = catalogOf(envelope(joinArray(els)));
+    for (size_t sl : {size_t(1), size_t(8), SIZE_MAX}) {
+        ha::CatalogJsonWriter w(cat, 9);
+        while (!w.step(sl)) {
+        }
+        const size_t size = w.take().size();
+        (void)size;
+    }
+    ha::CatalogJsonWriter w(cat, 9);
+    while (!w.step(8)) {
+    }
+    const size_t cap = w.capacity();
+    const std::string out = w.take();
+    TEST_ASSERT_TRUE(cap >= out.size());
+    TEST_ASSERT_TRUE(cap - out.size() < out.size() / 2);  // far from a doubling (>= 100 % slack)
+    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)w.regrowths());
+}
+
 // ---------------- 1 MB synthetic ----------------
 
 static void test_one_megabyte_synthetic() {
@@ -874,6 +1008,12 @@ int main(int, char **) {
     RUN_TEST(test_cap_counting_continues);
     RUN_TEST(test_json_exact_body);
     RUN_TEST(test_json_escapes_and_parses);
+    RUN_TEST(test_writer_identical_for_all_slices);
+    RUN_TEST(test_writer_step0_is_1);
+    RUN_TEST(test_writer_progress_and_done_idempotent);
+    RUN_TEST(test_writer_empty_catalog);
+    RUN_TEST(test_writer_escape_heavy_names_and_long_steps);
+    RUN_TEST(test_writer_capacity_no_doubling);
     RUN_TEST(test_one_megabyte_synthetic);
     return UNITY_END();
 }

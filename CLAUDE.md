@@ -6,7 +6,7 @@ Guidance for AI assistants working in this repository.
 
 HA Knob: Home Assistant controller firmware for the LilyGo T-Encoder Pro (ESP32-S3R8,
 16 MB flash, 8 MB OPI PSRAM, 390x390 round AMOLED, touch, rotary encoder, buzzer).
-PlatformIO + Arduino framework. Current version 0.5.2 (Step 5b.4: https / wss to Home Assistant).
+PlatformIO + Arduino framework. Current version 0.6.0 (Step 6.5: live entities, entity list fetch).
 
 The approved specification and change log live outside the repo in
 `~/.claude/workspace/chgreq/LilyGo T-encoderPro - HA Controller/chg001/`.
@@ -60,10 +60,9 @@ line, not only on `BOOT`.
 - `lib/core/src/ha/`: `HaUrl` (the only URL parser; ConfigModel's `parseUrlEndpoint` is an
   alias of it), `HaProtocol` (message builders + classifier), `HaSession` (connection
   state machine, clock-injected, talks to a `Transport` interface; native tests use a fake
-  transport). `src/ha/HaClient` (`ha::`) wires the session to `src/ha/WsTransport` (the
-  project's own WebSocket client on `WiFiClient`) and logs; main loop only, like all HA
-  socket I/O. Never enable
-  `coalesce_messages`. The token lives only in `ConfigStore` and the session; log
+  transport). `src/ha/HaClient` (`ha::`) wires the session to `src/ha/WsTransport` (own
+  WebSocket client on `WiFiClient`) and logs; main loop only, like all HA socket I/O. Never
+  enable `coalesce_messages`. The token lives only in `ConfigStore` and the session; log
   `token_set len=N`, never the value.
 - `lib/core/src/ha/EntityAttrs` (Step 6.1) is the only attribute model (catalog, store,
   presenter): typed fields for exactly `kAttributeKeys`, `applyAttrs` Replace/Merge (`null`
@@ -71,12 +70,16 @@ line, not only on `BOOT`.
   other attributes. `EntityStore` (Step 6.2) applies compressed `subscribe_entities` a/c/r
   events (max 64 entities). `parseMessage` always uses a filter (unneeded attributes are
   never stored) and `NestingLimit(kMaxNesting = 20)`; use `kMaxNesting` for every HA parse.
+  Long-lived core containers take an injected allocator (`util::StdAllocator` over
+  `ArduinoJson::Allocator*`, nullptr = heap; build elements with the container's
+  allocator); the session passes its allocator (PSRAM) to its `EntityStore`.
 - `lib/core/src/util/JsonScan` (Step 6.3): iterative, allocation-free structural scanner
   (strings, escapes, bracket matching). `ha/EntityCatalog`: `peekEnvelope` (first 1 KB of
   top-level scalars), `EntityCatalogBuilder` (get_states text in budgeted `step(maxBytes)`
   slices, each `result` element parsed alone with a filter; output identical for any
   budget), `EntityCatalog` (compact records + one text buffer on the caller's allocator),
-  `catalogToJson`. Never parse a whole get_states result with ArduinoJson.
+  `CatalogJsonWriter` (sliced; `catalogToJson` one-shot, host only). Never parse a whole
+  get_states result with ArduinoJson.
 - **Web callbacks run in the `async_tcp` task**: never call LVGL, `WiFi.*` or main-loop state
   from them. They read the snapshot published by `net::web::publishNetwork` (mutex), write
   config **only via `ConfigStore::applyPatch()`** (never `save()`, which bypasses the token
@@ -90,11 +93,10 @@ line, not only on `BOOT`.
   whole config sections (section replace is literal), `ssid` in every `wifi` section, `url`,
   `ca_pem` and `tls_insecure` in every `ha` section (absent = reset to `""`/`false`), and
   the Wi-Fi password together with the SSID (`null` = open).
-- `lib/core/src/util/{Sha1,Base64}` and `lib/core/src/ws/` (Step 5b.1, pure): WebSocket
-  codec of the own client (device adapter `src/ha/WsTransport`, Step 5b.2).
-  `WsHandshake` (upgrade request/response), `WsFrame` (masked client frames), `WsReceiver`
-  (incremental, one event per `feed()`, message memory via a `BufferProvider`, 4 MB limit,
-  oversize/binary/no-memory messages become `Dropped` events). Spec: `plan-step5b.md`.
+- `lib/core/src/util/{Sha1,Base64}`, `lib/core/src/ws/` (pure WebSocket codec, spec
+  `plan-step5b.md`): `WsHandshake`, `WsFrame` (masked client frames), `WsReceiver`
+  (incremental, one event per `feed()`, memory via a `BufferProvider`, 4 MB limit;
+  oversize / binary / no-memory messages become `Dropped` events).
 - `lib/core/src/input/QuadratureDecoder.h` is header-only and `always_inline` because the
   encoder ISR calls it; keep anything it uses free of out-of-line calls and flash tables.
 - All library versions are pinned exactly in `platformio.ini`; record any change and its
@@ -111,30 +113,24 @@ line, not only on `BOOT`.
 - **Never call `Serial.setDebugOutput(true)`, and never define `CONFIG_ASYNC_TCP_DEBUG` or
   `ASYNCWEBSERVER_LOG_DEBUG`**: they route library/ESP-IDF output into the USB serial
   without the `logPrintf` protection below (and blocking writes from the `async_tcp` task).
-- **Serial: always log with `util::logPrintf()` (`src/util/Log.h`), never `Serial.print*`.**
-  Core 2.0.17's `HWCDC::write()` busy-loops when the USB host is attached but the port is
-  not being read and the TX buffer is full; it counts retries down from the TX timeout, so
-  `setTxTimeoutMs(0)` wraps around (~49 days). `setup()` uses `setTxTimeoutMs(1)` (0 also
-  made `Serial.flush()` discard the buffer).
-  That froze the main loop after a replug (stale Wi-Fi snapshot -> `Host: <ip>` got 403,
-  Wi-Fi scans never finished) until a monitor was opened. `logPrintf` only writes a line
-  that fits into the free buffer (4 KB, set in `setup()` before `Serial.begin`) and counts
-  the rest (`LOG dropped=N`). It is header-only and not ISR-safe.
+- **Serial: always log with `util::logPrintf()` (`src/util/Log.h`), never `Serial.print*`**
+  (core 2.0.17's `HWCDC::write()` can busy-loop forever; DESIGN-NOTES "Serial logging").
+  Keep `setTxTimeoutMs(1)` (never 0) and the 4 KB TX buffer set before `Serial.begin`.
+  `logPrintf` drops lines that do not fit (`LOG dropped=N`), max 255 chars per line;
+  header-only, not ISR-safe.
 - **The screen is the knob cap**: pressing it also clicks the button (touch ~120 ms before
   `BTN down`). User decision: all press actions come from the button; touch gives swipes
   only (`core::SwipeClassifier`); taps must never trigger an action.
-- **Encoder ISR is IRAM-safe**: registered with `gpio_install_isr_service(ESP_INTR_FLAG_IRAM)`
-  + `gpio_isr_handler_add`, pins read with inline `gpio_ll_get_level`. Arduino's
-  `attachInterrupt`/`digitalRead` are in flash on core 2.0.17 (`CONFIG_ARDUINO_ISR_IRAM` is
-  off). **Do not call `attachInterrupt` elsewhere**: Arduino would reuse this IRAM-flagged
-  ISR service and its flash-resident dispatcher could then run with the cache disabled.
-  Check placement after changes: `xtensa-esp32s3-elf-nm -C firmware.elf | grep encoder`
-  (ISR and `readAb` must be at 0x4037xxxx/0x4038xxxx, data at 0x3fcxxxxx).
+- **Encoder ISR is IRAM-safe** (`gpio_install_isr_service(ESP_INTR_FLAG_IRAM)` +
+  `gpio_isr_handler_add`, inline `gpio_ll_get_level`). **Never call `attachInterrupt`
+  anywhere**, nor `digitalRead` in the ISR (flash-resident on core 2.0.17; DESIGN-NOTES
+  "Serial logging and encoder ISR"). Check after changes: `xtensa-esp32s3-elf-nm -C
+  firmware.elf | grep encoder` (code at 0x4037xxxx/0x4038xxxx, data at 0x3fcxxxxx).
 - Buzzer uses the core-2.x LEDC API (`ledcSetup` + `ledcAttachPin`), not core-3 `ledcAttach`.
 - SensorLib drivers are given `sda/scl = -1` because `Wire.begin(5, 6)` is called first
   (otherwise core 2 logs "bus already initialized").
 
-## Invariants from Steps 1-5b
+## Invariants from Steps 1-6
 
 Binding rules distilled from the step history. Reasons, measurements and edge cases are in
 `docs/DESIGN-NOTES.md` (one section per step); read the section for the area you change.
@@ -169,13 +165,21 @@ Binding rules distilled from the step history. Reasons, measurements and edge ca
   unsubscribes + resubscribes on the same connection (stays Ready); only events of the
   active or pending subscribe id reach `entities()`. The get_states result is taken over
   via `Transport::retainText` (never parsed whole) and built in `tick()` slices;
-  `takeCatalog()` hands the `EntityCatalog` over once. The transport must call
-  `onRxProgress` for every read (pong / get_states liveness). Session log lines go
-  through `setLogger` (no "HA " prefix).
+  `takeCatalog()` hands the `EntityCatalog` over once. Session log lines go through
+  `setLogger` (no "HA " prefix; the logger must not call back into the session).
 - `WsTransport`: one blocking step per poll; `WiFiClient::connect` timeout is in
   milliseconds; read only when `available() > 0`; detect a closed peer with
   `recv(MSG_PEEK | MSG_DONTWAIT)`. Messages are assembled in PSRAM (limit 4 MB, larger /
-  binary ones dropped); messages > 256 KB are parsed envelope-only.
+  binary ones dropped); messages > 256 KB are parsed envelope-only. Every read with data
+  calls `onRxProgress`; mid-message silence for 15 s -> `rx_stalled`. `retainText` hands
+  over only the buffer being delivered to `onText` (detach, no copy, freed via the provider).
+- HaClient (Step 6.5): `main` passes the controls' unique entity ids on every
+  `ha::configure`. get_states only via `ha::requestStates()`; the catalog JSON is built
+  once into a `shared_ptr<const std::string>` (`ha::catalogJson()`, only while the fetch is
+  Ready). `-DHAKNOB_STATES_ON_READY` (test builds only) fetches on every Ready.
+- Loop task stack is 8 KB; HB `stack=` (high-water) must stay >= 2048. ArduinoJson parses
+  recursively (~160 B per kept level, ~64 B per skipped level; `kMaxNesting` 20): lower
+  `kMaxNesting` before raising the stack.
 - TLS: exactly one mode per attempt, never a fallback (to another mode or to plaintext).
   Reset the client before every attempt; connect with the pre-resolved IP and the URL host;
   never `connect(host, ...)`; `setCACertBundle` only with `_binary_x509_crt_bundle_start`.

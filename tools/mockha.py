@@ -33,7 +33,29 @@ TLS options (Step 5b.4; the mock then speaks wss)
                       (also without --tls-cert); the socket is closed after 20 s
 Per connection the mock logs "TLS handshake ok/failed ..."; a rejected certificate shows up as
 "TLS handshake failed" and no "REQ" line (no WebSocket request, no auth, no token sent).
-It answers subscribe_entities with a success result. The access token is never printed (only
+Entity/state options (Step 6.5)
+  --states-file F     JSON file with the entity state objects ([{"entity_id":..,"state":..,
+                      "attributes":{..}},..]) used for get_states and subscribe_entities
+  --states-synthetic BYTES  generate the list instead; a get_states result of about BYTES bytes
+                      (junk attributes pad each entity; they are filtered out on the device)
+  --states-count N    number of synthetic entities (default 300); entity i is
+                      <domain>.mock_<i> with domain = light, switch, climate, cover, fan,
+                      sensor, media_player for i % 7 = 0..6
+  --states-fragment N get_states is sent as N-byte fragments (default 16384); a pong may be
+                      sent between fragments
+  --pong-after-states hold the send lock for the whole get_states message so a pong (or any
+                      other frame) is queued behind it
+  --states-rate BPS   throttle get_states to about BPS bytes/s
+  --states-after-pings N  answer get_states only after N pings were answered, plus 1 s
+  --states-delay S    wait S seconds before the first get_states fragment (< 15 s)
+  --stall-states      send half of the get_states message, then nothing at all (no pong)
+  --change-every S    every S seconds send a "c" diff (state + brightness) for the first
+                      entity of each subscription
+  --rm-add-every S    every S seconds remove ("r") and then re-add ("a") the last entity of each
+                      subscription, so the device's ent= count moves (c diffs alone do not)
+  --deep-result N [N ..]  after auth send a small type=result (id 998) nested N levels, 2 s apart
+Logs: "RX get_states", "SENT states <bytes> in <s>", "SENT c-diff", "RX unsubscribe_events".
+It answers subscribe_entities with a success result (and, with a fixture, an "a" event). The access token is never printed (only
 its length).
 """
 import argparse, base64, hashlib, json, socket, ssl, struct, threading, time
@@ -92,6 +114,64 @@ def big_payload(n):
     return head + b"x" * (n - len(head) - len(tail)) + tail
 
 
+def make_states(count, total_bytes):
+    """Synthetic HA state list: count entities, padded with junk attributes to ~total_bytes."""
+    doms = ["light", "switch", "climate", "cover", "fan", "sensor", "media_player"]
+    out = []
+    for i in range(count):
+        d = doms[i % 7]
+        if d == "light":
+            k = i // 7
+            modes = ["onoff"] if k % 3 == 0 else (["brightness"] if k % 3 == 1 else ["color_temp", "hs"])
+            attrs = {"supported_color_modes": modes, "friendly_name": f"Køkken lys {i}", "brightness": 128}
+            if "hs" in modes:
+                attrs["hs_color"] = [30.0, 50.0]
+                attrs["color_temp_kelvin"] = 3000
+            st = "on"
+        elif d == "climate":
+            attrs = {"supported_features": 1, "temperature": 21.5, "current_temperature": 20.0,
+                     "min_temp": 7, "max_temp": 35, "target_temp_step": 0.5, "friendly_name": f"Climate {i}"}
+            st = "heat"
+        elif d == "cover":
+            attrs = {"supported_features": 15, "current_position": 40, "friendly_name": f"Cover {i}"}
+            st = "open"
+        elif d == "fan":
+            attrs = {"supported_features": 1, "percentage": 50, "percentage_step": 33.33, "friendly_name": f"Fan {i}"}
+            st = "on"
+        elif d == "media_player":
+            attrs = {"supported_features": 4, "volume_level": 0.42, "is_volume_muted": False, "friendly_name": f"Media {i}"}
+            st = "playing"
+        elif d == "switch":
+            attrs = {"friendly_name": f"Switch {i}"}
+            st = "off"
+        else:
+            attrs = {"friendly_name": f"Sensor {i}", "unit_of_measurement": "W"}
+            st = "123"
+        out.append({"entity_id": f"{d}.mock_{i}", "state": st, "attributes": attrs,
+                    "last_changed": "2026-10-16T10:00:00+00:00", "last_updated": "2026-10-16T10:00:00+00:00",
+                    "context": {"id": "01ABC", "parent_id": None, "user_id": None}})
+    base = len(json.dumps(out, separators=(",", ":")))
+    pad = max(0, (total_bytes - base) // max(1, count))
+    if pad > 0:
+        for e in out:
+            left, k = pad, 0
+            while left > 0:
+                n = min(left, 60000)
+                e["attributes"][f"junk{k}"] = "j" * max(0, n - 12)
+                left -= n
+                k += 1
+    return out
+
+
+def load_states(args):
+    if args.states_file:
+        with open(args.states_file, encoding="utf-8") as f:
+            return json.load(f)
+    if args.states_synthetic:
+        return make_states(args.states_count, args.states_synthetic)
+    return None
+
+
 def handle(c, addr, args):
     t0 = time.time()
     log = lambda *a: print(f"[{time.time()-t0:7.2f}s {addr[0]}]", *a, flush=True)
@@ -100,6 +180,87 @@ def handle(c, addr, args):
     def send(b):
         with send_lock:
             c.sendall(b)
+
+    states = args.states_list
+    pings_answered = [0]
+    subs = {}  # subscribe id -> entity ids
+
+    def compressed(e):
+        a = {k: v for k, v in e["attributes"].items() if not k.startswith("junk")}
+        return {"s": e["state"], "a": a, "c": "01ABC", "lc": 1760000000.0}
+
+    def send_states(mid):
+        """Answers get_states with the whole list, in fragments (see --pong-after-states)."""
+        try:
+            if args.states_delay:
+                time.sleep(args.states_delay)
+            if args.states_after_pings:
+                while pings_answered[0] < args.states_after_pings:
+                    time.sleep(0.2)
+                time.sleep(1.0)
+            body = json.dumps({"id": mid, "type": "result", "success": True, "result": states or []},
+                              separators=(",", ":")).encode()
+            n = len(body)
+            step = args.states_fragment
+            ts = time.time()
+            hold = args.pong_after_states
+            if hold:
+                send_lock.acquire()
+            try:
+                i = 0
+                while i < n:
+                    if args.stall_states and i >= n // 2:
+                        log(f"STALL states at {i}/{n} bytes (nothing more is sent)")
+                        if not hold:
+                            send_lock.acquire()
+                        time.sleep(3600)
+                        return
+                    chunk = frame(1 if i == 0 else 0, body[i:i + step], i + step >= n)
+                    if hold:
+                        c.sendall(chunk)
+                    else:
+                        send(chunk)
+                    i += step
+                    if args.states_rate:
+                        time.sleep(step / args.states_rate)
+            finally:
+                if hold:
+                    send_lock.release()
+            log(f"SENT states {n} bytes in {time.time()-ts:.2f}s")
+        except OSError as e:
+            log("states send aborted:", e)
+
+    def rm_add_loop(sid, entity):
+        eid = entity["entity_id"]
+        while sid in subs:
+            time.sleep(args.rm_add_every)
+            if sid not in subs:
+                return
+            try:
+                send(text({"id": sid, "type": "event", "event": {"r": [eid]}}))
+                log(f"SENT r sid={sid} {eid}")
+                time.sleep(args.rm_add_every)
+                if sid not in subs:
+                    return
+                send(text({"id": sid, "type": "event", "event": {"a": {eid: compressed(entity)}}}))
+                log(f"SENT a sid={sid} {eid}")
+            except OSError:
+                return
+
+    def change_loop(sid, eid):
+        k = 0
+        while sid in subs:
+            time.sleep(args.change_every)
+            if sid not in subs:
+                return
+            k += 1
+            diff = {"+": {"s": "off" if k % 2 else "on", "a": {"brightness": (k * 17) % 255},
+                          "lc": 1760000000.0 + k}}
+            try:
+                send(text({"id": sid, "type": "event", "event": {"c": {eid: diff}}}))
+                log(f"SENT c-diff sid={sid} {eid} k={k}")
+            except OSError:
+                return
 
     req = b""
     while b"\r\n\r\n" not in req:
@@ -144,6 +305,13 @@ def handle(c, addr, args):
                 else:
                     send(frame(1, p))
                 log(f"SENT big {n} bytes in {time.time()-ts:.2f}s")
+                time.sleep(2)
+            for n in args.deep_result:
+                inner = "1"
+                for _ in range(n):
+                    inner = "[" + inner + "]"
+                send(frame(1, ('{"id":998,"type":"result","success":true,"result":' + inner + "}").encode()))
+                log(f"SENT deep result nesting={n}")
                 time.sleep(2)
             if args.kill_mid_transfer:
                 p = big_payload(args.kill_mid_transfer)
@@ -211,11 +379,30 @@ def handle(c, addr, args):
                 return
         elif t == "subscribe_entities":
             send(text({"id": msg["id"], "type": "result", "success": True, "result": None}))
+            ids = msg.get("entity_ids") or []
+            subs[msg["id"]] = ids
+            log(f"SUBSCRIBE id={msg['id']} ids={len(ids)}")
+            if states:
+                added = {e["entity_id"]: compressed(e) for e in states if e["entity_id"] in ids}
+                send(text({"id": msg["id"], "type": "event", "event": {"a": added}}))
+                if args.rm_add_every and len(added) > 1:
+                    last = [e for e in states if e["entity_id"] in ids][-1]
+                    threading.Thread(target=rm_add_loop, args=(msg["id"], last), daemon=True).start()
+                if args.change_every and added:
+                    threading.Thread(target=change_loop, args=(msg["id"], next(iter(added))),
+                                     daemon=True).start()
+        elif t == "unsubscribe_events":
+            log(f"RX unsubscribe_events subscription={msg.get('subscription')}")
+            subs.pop(msg.get("subscription"), None)
+            send(text({"id": msg["id"], "type": "result", "success": True, "result": None}))
+        elif t == "get_states":
+            threading.Thread(target=send_states, args=(msg["id"],), daemon=True).start()
         elif t == "ping":
             if args.no_pong:
                 log("not answering ping")
             else:
                 send(text({"id": msg["id"], "type": "pong"}))
+                pings_answered[0] += 1
 
 
 def tls_conn(c, addr, args, ctx):
@@ -273,7 +460,20 @@ def main():
     ap.add_argument("--tls-key", default=None)
     ap.add_argument("--tls13-only", action="store_true")
     ap.add_argument("--stall", action="store_true")
+    ap.add_argument("--states-file", default=None)
+    ap.add_argument("--states-synthetic", type=int, default=0, metavar="BYTES")
+    ap.add_argument("--states-count", type=int, default=300)
+    ap.add_argument("--states-fragment", type=int, default=16384)
+    ap.add_argument("--pong-after-states", action="store_true")
+    ap.add_argument("--states-rate", type=int, default=0, metavar="BPS")
+    ap.add_argument("--states-after-pings", type=int, default=0, metavar="N")
+    ap.add_argument("--states-delay", type=float, default=0.0, metavar="S")
+    ap.add_argument("--stall-states", action="store_true")
+    ap.add_argument("--change-every", type=float, default=0.0, metavar="S")
+    ap.add_argument("--rm-add-every", type=float, default=0.0, metavar="S")
+    ap.add_argument("--deep-result", type=int, nargs="+", default=[], metavar="N")
     args = ap.parse_args()
+    args.states_list = load_states(args)
     ctx = None
     if args.tls_cert or args.tls13_only or args.stall:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

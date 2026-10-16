@@ -4,12 +4,32 @@
 
 #include <ArduinoJson.h>
 
+#include <cstdlib>
+#include <new>
 #include <string>
+#include <vector>
 
 #include "ha/EntityStore.h"
 #include "ha/HaProtocol.h"
 
 namespace ha = core::ha;
+
+// Counts global operator new calls (host heap) so a test can prove that a code path
+// allocates only through the injected backend.
+static long g_newCalls = 0;
+static bool g_countNew = false;
+void *operator new(std::size_t n) {
+    if (g_countNew) {
+        ++g_newCalls;
+    }
+    void *p = std::malloc(n ? n : 1);
+    if (!p) {
+        throw std::bad_alloc();
+    }
+    return p;
+}
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete(void *p, std::size_t) noexcept { std::free(p); }
 
 void setUp() {}
 void tearDown() {}
@@ -315,6 +335,119 @@ static void test_ha_format_end_to_end() {
     TEST_ASSERT_NULL(st.find("climate.hall"));
 }
 
+// ---- counting allocator (Step 6.5 audit carry-over: store memory goes to the backend) ----
+namespace {
+class CountingAllocator : public ArduinoJson::Allocator {
+public:
+    // Each block carries a 16-byte header with its size (no host-heap bookkeeping, so the
+    // operator new counter only sees allocations that bypass the backend).
+    void *allocate(size_t n) override {
+        unsigned char *raw = static_cast<unsigned char *>(std::malloc(n + 16));
+        if (!raw) {
+            return nullptr;
+        }
+        *reinterpret_cast<size_t *>(raw) = n;
+        ++allocs;
+        live += static_cast<long>(n);
+        return raw + 16;
+    }
+    void deallocate(void *p) override {
+        if (!p) {
+            return;
+        }
+        unsigned char *raw = static_cast<unsigned char *>(p) - 16;
+        ++frees;
+        live -= static_cast<long>(*reinterpret_cast<size_t *>(raw));
+        std::free(raw);
+    }
+    void *reallocate(void *p, size_t n) override {
+        deallocate(p);
+        return allocate(n);
+    }
+    long allocs = 0, frees = 0, live = 0;
+};
+}  // namespace
+
+static const char *kLongA =
+    "{\"a\":{\"light.living_room_ceiling_lamp\":{\"s\":\"on\",\"a\":{\"friendly_name\":"
+    "\"Living room ceiling lamp with a long name\",\"brightness\":200}},"
+    "\"climate.upstairs_bedroom_thermostat\":{\"s\":\"heat\",\"a\":{\"friendly_name\":"
+    "\"Upstairs bedroom thermostat long name\",\"temperature\":21.5}}}}";
+
+static void test_counting_allocator_balanced() {
+    CountingAllocator alloc;
+    {
+        ha::EntityStore st(&alloc);
+        JsonDocument doc;
+        TEST_ASSERT_TRUE(!deserializeJson(doc, std::string(kLongA)));
+        g_newCalls = 0;
+        g_countNew = true;
+        st.apply(doc.as<JsonVariantConst>());
+        g_countNew = false;
+        TEST_ASSERT_EQUAL_INT(0, g_newCalls);  // nothing on the host heap
+        TEST_ASSERT_EQUAL_UINT32(2, st.size());
+        TEST_ASSERT_TRUE(alloc.allocs >= 4);  // 2 nodes + long ids/names go to the backend
+        TEST_ASSERT_TRUE(alloc.live > 0);
+
+        // Replace path ("a" again with new content), keeps the allocator
+        JsonDocument doc2;
+        TEST_ASSERT_TRUE(!deserializeJson(doc2, std::string(
+            "{\"a\":{\"light.living_room_ceiling_lamp\":{\"s\":\"off\",\"a\":{\"friendly_name\":"
+            "\"Another quite long friendly name here\",\"brightness\":10}}}}")));
+        g_newCalls = 0;
+        g_countNew = true;
+        st.apply(doc2.as<JsonVariantConst>());
+        g_countNew = false;
+        TEST_ASSERT_EQUAL_INT(0, g_newCalls);
+        TEST_ASSERT_EQUAL_STRING("Another quite long friendly name here",
+                                 st.find("light.living_room_ceiling_lamp")->attrs.friendlyName.c_str());
+
+        // "c" path: state and merged attribute, new long state string
+        JsonDocument doc3;
+        TEST_ASSERT_TRUE(!deserializeJson(doc3, std::string(
+            "{\"c\":{\"climate.upstairs_bedroom_thermostat\":{\"+\":{\"s\":\"a_rather_long_state_value\","
+            "\"a\":{\"friendly_name\":\"A third quite long friendly name\"}}}}}")));
+        g_newCalls = 0;
+        g_countNew = true;
+        st.apply(doc3.as<JsonVariantConst>());
+        g_countNew = false;
+        TEST_ASSERT_EQUAL_INT(0, g_newCalls);
+        TEST_ASSERT_EQUAL_STRING("a_rather_long_state_value",
+                                 st.find("climate.upstairs_bedroom_thermostat")->state.c_str());
+
+        // remove one, then clear
+        JsonDocument doc4;
+        TEST_ASSERT_TRUE(!deserializeJson(doc4, std::string("{\"r\":[\"light.living_room_ceiling_lamp\"]}")));
+        st.apply(doc4.as<JsonVariantConst>());
+        TEST_ASSERT_EQUAL_UINT32(1, st.size());
+        st.clear();
+        TEST_ASSERT_EQUAL_UINT32(0, st.size());
+        TEST_ASSERT_EQUAL_INT(0, (int)alloc.live);  // balanced after clear()
+        // repopulate, then destroy with entries still in the store
+        st.apply(doc.as<JsonVariantConst>());
+        TEST_ASSERT_TRUE(alloc.live > 0);
+    }
+    TEST_ASSERT_EQUAL_INT(0, (int)alloc.live);  // balanced after destruction
+    TEST_ASSERT_EQUAL_INT((int)alloc.allocs, (int)alloc.frees);
+}
+
+static void test_counting_allocator_cap_64_balanced() {
+    CountingAllocator alloc;
+    {
+        ha::EntityStore st(&alloc);
+        std::string ev = "{\"a\":{";
+        for (int i = 0; i < 70; ++i) {
+            if (i) ev += ",";
+            ev += "\"light.some_long_entity_name_" + std::to_string(i) + "\":{\"s\":\"on\",\"a\":{\"friendly_name\":\"Friendly name number " + std::to_string(i) + " long\"}}";
+        }
+        ev += "}}";
+        applyJson(st, ev);
+        TEST_ASSERT_EQUAL_UINT32(64, st.size());
+    }
+    TEST_ASSERT_EQUAL_INT(0, (int)alloc.live);
+    TEST_ASSERT_EQUAL_INT((int)alloc.allocs, (int)alloc.frees);
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_initial_state);
@@ -337,5 +470,7 @@ int main(int, char **) {
     RUN_TEST(test_clear);
     RUN_TEST(test_cap_64);
     RUN_TEST(test_ha_format_end_to_end);
+    RUN_TEST(test_counting_allocator_balanced);
+    RUN_TEST(test_counting_allocator_cap_64_balanced);
     return UNITY_END();
 }

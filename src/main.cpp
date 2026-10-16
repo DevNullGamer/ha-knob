@@ -8,9 +8,14 @@
 //   TOUCH swipe=<left|right>
 //   HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<..>
 //      wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes>
-//      loopmax=<ms>   (every 5 s; ip = STA IP, else 192.168.4.1 with the setup AP up, else
-//      0.0.0.0; ha = HA connection state; heap / heap_min = internal free heap now / lowest
-//      since boot; loopmax = longest loop() pass since the previous HB, without its delay)
+//      loopmax=<ms> ent=<entities>/<ids> cat=<none|fetching|building|ready|failed>
+//      stack=<bytes> psram_free=<bytes>
+//      (every 5 s; ip = STA IP, else 192.168.4.1 with the setup AP up, else 0.0.0.0;
+//      ha = HA connection state; heap / heap_min = internal free heap now / lowest since
+//      boot; loopmax = longest loop() pass since the previous HB, without its delay;
+//      ent = live entities in the store / unique entity ids of the controls; cat = entity
+//      list fetch; stack = loop task stack never used so far (high-water mark, bytes);
+//      psram_free = free PSRAM now)
 //   CFG ...   config store events (see src/config/ConfigStore.h)
 //   WIFI ...  Wi-Fi events (see src/net/WifiManager.h)
 //   WEB ...   web server events (see src/net/WebServer.h)
@@ -18,8 +23,12 @@
 //   SYS reboot | SYS factory reset
 
 #include <Arduino.h>
+#include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <lvgl.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -71,14 +80,18 @@ void printHeartbeat(uint32_t nowMs) {
                      : wifi.apActive   ? net::wifi::kApIp
                                        : "0.0.0.0";
     util::logPrintf("HB up=%u psram=%u flash=%u touch=%s count=%d ctl=%u cfg=%s wifi=%s ip=%s ha=%s "
-                    "heap=%u heap_min=%u loopmax=%u\n",
+                    "heap=%u heap_min=%u loopmax=%u ent=%u/%u cat=%s stack=%u psram_free=%u\n",
                     static_cast<unsigned>(nowMs / 1000), static_cast<unsigned>(ESP.getPsramSize()),
                     static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
                     static_cast<int>(shownCount),
                     static_cast<unsigned>(configStore.controlCount()), bootCfgSource,
                     net::wifi::modeName(wifi.mode), ip, core::ha::stateName(ha::status().state),
                     static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMinFreeHeap()),
-                    static_cast<unsigned>((loopMaxUs + 999) / 1000));
+                    static_cast<unsigned>((loopMaxUs + 999) / 1000),
+                    static_cast<unsigned>(ha::entities().size()), static_cast<unsigned>(ha::subscribedCount()),
+                    core::ha::statesStateName(ha::catalogState()),
+                    static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),  // bytes on ESP-IDF
+                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     loopMaxUs = 0;
 }
 
@@ -111,6 +124,17 @@ core::ha::TlsSettings haTlsSettings(const core::config::Config &config) {
     tls.insecure = config.ha.tlsInsecure;
     tls.caPem = config.ha.caPem;
     return tls;
+}
+
+// The controls' entity ids, each once, in configuration order (the HA subscription).
+std::vector<std::string> controlEntityIds(const core::config::Config &config) {
+    std::vector<std::string> ids;
+    for (const core::config::Control &control : config.controls) {
+        if (std::find(ids.begin(), ids.end(), control.entityId) == ids.end()) {
+            ids.push_back(control.entityId);
+        }
+    }
+    return ids;
 }
 
 // Publishes Home Assistant connection changes to the web server snapshot and the screens.
@@ -146,7 +170,8 @@ void handleWebRequests(uint32_t nowMs) {
         }
         net::wifi::applyConfig(config.wifi.ssid, configStore.wifiPassword(), config.device.hostname,
                                nowMs);
-        ha::configure(config.ha.url, configStore.haToken(), haTlsSettings(config), nowMs);
+        ha::configure(config.ha.url, configStore.haToken(), haTlsSettings(config), controlEntityIds(config),
+                      nowMs);
     }
 
     if (net::web::takeHaRetry()) {
@@ -267,7 +292,8 @@ void setup() {
                      millis());
     publishNetwork();  // the web server guards need the network state from the start
     ha::begin();
-    ha::configure(config.ha.url, configStore.haToken(), haTlsSettings(config), millis());
+    ha::configure(config.ha.url, configStore.haToken(), haTlsSettings(config), controlEntityIds(config),
+                  millis());
     publishHa();
     net::web::begin(configStore, hal::touch::variantName());
     printBootLine();

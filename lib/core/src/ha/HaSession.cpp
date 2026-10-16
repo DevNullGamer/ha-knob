@@ -104,7 +104,7 @@ uint32_t HaSession::backoffDelayMs(uint32_t failures) {
 }
 
 HaSession::HaSession(Transport &transport, ArduinoJson::Allocator *allocator, const Options &options)
-    : transport_(transport), allocator_(allocator), options_(options) {}
+    : transport_(transport), allocator_(allocator), options_(options), store_(allocator) {}
 
 // ---- Inputs ----------------------------------------------------------------------------
 

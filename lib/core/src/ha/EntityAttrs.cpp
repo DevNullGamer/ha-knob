@@ -120,7 +120,7 @@ bool EntityAttrs::operator==(const EntityAttrs &o) const {
 
 void applyAttrs(JsonObjectConst attrs, EntityAttrs &out, AttrMode mode) {
     if (mode == AttrMode::Replace) {
-        out = EntityAttrs();
+        out = EntityAttrs();  // friendlyName keeps out's allocator (no propagation)
     }
     if (attrs.isNull()) {
         return;

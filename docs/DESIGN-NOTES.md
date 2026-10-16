@@ -14,6 +14,24 @@ reasons and numbers. Read the section for the area you are changing.
   (exactly ±1 per click, no missed steps). Rest positions are AB = 00 and 11; the sequence
   00 -> 10 -> 11 -> 01 -> 00 is clockwise.
 
+## Serial logging and encoder ISR (moved from CLAUDE.md 2026-10-16)
+
+- Serial: core 2.0.17's `HWCDC::write()` busy-loops when the USB host is attached but the
+  port is not being read and the TX buffer is full; it counts retries down from the TX
+  timeout, so `setTxTimeoutMs(0)` wraps around (~49 days), and 0 also made
+  `Serial.flush()` discard the buffer. `setup()` therefore uses `setTxTimeoutMs(1)`. The
+  hang froze the main loop after a replug (stale Wi-Fi snapshot -> `Host: <ip>` got 403,
+  Wi-Fi scans never finished) until a monitor was opened. `util::logPrintf` writes a line
+  only if it fits into the free part of the 4 KB TX buffer (set before `Serial.begin`) and
+  counts the rest (`LOG dropped=N`); lines are cut to 255 characters.
+- Encoder ISR: Arduino's `attachInterrupt` / `digitalRead` are in flash on core 2.0.17
+  (`CONFIG_ARDUINO_ISR_IRAM` is off), so the ISR is registered with
+  `gpio_install_isr_service(ESP_INTR_FLAG_IRAM)` + `gpio_isr_handler_add` and reads the
+  pins with inline `gpio_ll_get_level`. A later `attachInterrupt` anywhere would reuse this
+  IRAM-flagged ISR service, and its flash-resident dispatcher could then run with the
+  cache disabled. Placement check: ISR and `readAb` at 0x4037xxxx/0x4038xxxx, data at
+  0x3fcxxxxx (`xtensa-esp32s3-elf-nm -C firmware.elf | grep encoder`).
+
 ## Step 2 (2026-10-14)
 
 - `QuadratureDecoder` counts detents on arrival at a rest state (00/11) that differs from the
@@ -339,8 +357,8 @@ from 6.4.
   land in internal RAM as small `std::string` allocations. `CatalogEntry` is a view.
 - `catalogToJson` writes the header by hand and serialises one entry at a time with a
   reused JsonDocument (no document for the whole list). The output `std::string` uses the
-  default heap: PSRAM on the device only via the SPIRAM malloc threshold (>= 4 KB), and
-  growth past the initial reserve can need ~2x its size transiently.
+  default heap: PSRAM on the device only via the SPIRAM malloc threshold (>= 4 KB). Since
+  the 6.5 R8 fix it is a one-shot wrapper around `CatalogJsonWriter` (see Step 6.5).
 - Known limits: an element > 256 KB is skipped unparsed but still scanned in one step, so
   a multi-MB single entity makes one long main-loop step (may exceed the 6.5 `loopmax`
   gate; a resumable `skipValue` is the remedy if it is measured). A big non-`result`
@@ -410,3 +428,89 @@ Spec: `plan-step6.md` §3.1-3.3, §3.8. Core only; the device glue (WsTransport
   progress does not trigger the `HA state=` line.
 - `WsReceiver::detachDelivered(len)` hands over the last Text buffer (NUL-terminated); the
   receiver forgets it and grows a fresh one for the next message.
+
+## Step 6.5 (2026-10-16)
+
+Spec: `plan-step6.md` §3.1-3.3, §3.8, §4 Step 6.5. Device glue for 6.1-6.4; v0.6.0.
+
+- `WsTransport::retainText(data, len)` succeeds only for the Text event that
+  `handleEvent()` is passing to `onText` right now (pointer and length compared with the
+  event, at most once): `WsReceiver::detachDelivered` hands the PSRAM buffer over and the
+  `RetainedText` frees it through `PsramBufferProvider::release` (context = the
+  provider, which lives as long as the transport). The following `releaseDelivered()` is
+  then a no-op. Anything else gets an empty `RetainedText` (session: `states_no_memory`).
+  The buffer's capacity is the message size + 1 for an unfragmented message (the
+  receiver grows fragmented ones geometrically), so the retained block is not much larger
+  than the text.
+- `onRxProgress(n, millis())` after every socket read with `n > 0` in Open (before the
+  bytes are fed, so a message completing in that read already counts). `lastRxMs_` also
+  starts at socket open.
+- `rx_stalled`: checked when nothing is available and nothing was read in this poll:
+  `WsReceiver::messageBytesSoFar() > 0` (payload bytes of a data message in progress, also
+  of one being discarded) and 15 s (`kRxStallMs`) since the last read -> `HA rx stalled
+  bytes= ms=` + `fail("rx_stalled")`. A frame header without payload bytes yet does not
+  count (the session's pong rule covers it). Note: when a ping is outstanding at, or sent within 5 s of, the stall start, the
+  session's pong rule fires `pong_timeout` 10 s after the last received byte, i.e. before
+  `rx_stalled`; `rx_stalled` decides otherwise.
+- EntityStore memory (audit carry-over: ~10 KB internal RAM for 24 entities, gate 4 KB):
+  the map nodes (`EntityState` is a few hundred bytes, mostly `std::optional<double>`),
+  ids, states and friendly names are allocated through `util::StdAllocator<T>`, a
+  standard allocator over an injected `ArduinoJson::Allocator*` (lib/core stays pure; the
+  session passes its allocator, on the device `PsramAllocator`). `EntityAttrs::friendlyName`
+  and `EntityState::state` are `util::AllocString` (basic_string on that allocator; same
+  `c_str()`, `==`, string_view conversion as before). The allocator is stateful and the
+  propagate traits are false: `out = EntityAttrs()` in `applyAttrs` keeps `out`'s
+  allocator, entries are built with `EntityState(allocator_)` before they are moved into
+  the map, copies keep the source's allocator. Default-constructed objects (host tests,
+  the catalog builder's per-element `EntityAttrs`) use the heap. Internal RAM left for the
+  subscription: the session's `entityIds_` (~1.5 KB for 24 ids of > 15 chars).
+- `ha::configure(url, token, tls, ids, now)`: `main` builds the unique ids in config order
+  (`controlEntityIds`) on every config re-read; the session compares id sets, so saving
+  unrelated settings never resubscribes. `ha::begin()` installs the session logger
+  (`HA ` + line).
+- Catalog: `refreshCatalog()` runs after every session call (`statesChangeCount()`) and
+  takes a finished catalog; its JSON is then written in slices (below) into
+  `shared_ptr<const std::string>`, which is published only when complete; the
+  `EntityCatalog` (PSRAM) is freed right after. The JSON's characters reach PSRAM through
+  the SPIRAM malloc threshold (`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 4096 in the core's
+  sdkconfig; the reserve is >= 4 KB from about 40 entities on, smaller catalogs are
+  small). The JSON (published or pending) is dropped whenever the session's fetch state is
+  not Ready (new fetch, failure, URL change), so 6.6 can publish it as is.
+- R8 (catalog JSON time), measured: one-shot `catalogToJson` took `json_ms=162` for 1286
+  entries (138537 bytes; ~0.12 ms per entry, per-entry JsonDocument on PSRAM) and pushed
+  HB `loopmax` to 169 ms -> Tester FAIL (spec: split if > 25 ms). Fix:
+  `core::ha::CatalogJsonWriter` (lib/core, pure): header in the constructor, then
+  `step(maxEntries)` serialises entries with one reused JsonDocument (actions iterated from
+  the mask, no `std::vector` per entry) and closes the JSON in the step that writes the
+  last entry; output identical for every slice size (`catalogToJson` = loop of
+  `step(SIZE_MAX)`). Memory: the constructor sums an exact lower bound of every entry
+  (59 fixed characters + id + name + state + quoted action names + commas + 1
+  step_default character) and reserves it + 4 bytes per entry once (`reserve()` on an
+  empty `std::string` is exact, no doubling). An entry that does not fit (escapes,
+  step_default > 5 characters) moves the text (usually at most once; escape-heavy names can need a few) into a string reserved for what is
+  needed plus the remaining lower bound + 1 KB (`regrowths()`; never the doubling). HaClient
+  shrinks only when > 8 KB is unused (only possible after a regrowth). Host check: 1500
+  entries with `"0.25"` defaults and escaped names, 0 regrowths, 1.7 KB unused.
+- HaClient drives the writer from `loop()` only (one slice per pass): `step(8)` repeatedly
+  until 8 ms (`micros()`) are used, so a pass spends <= ~9 ms on it (plus a regrowth copy
+  if one happens). While the writer runs `catalogState()` reports `building` (session is
+  already Ready), `catalogJson()` is nullptr; `catalogChangeCount()` is bumped at take and
+  at publish. `HA catalog done ... json=<bytes> json_ms=<n> json_passes=<n>
+  json_slice_max_ms=<n> json_regrow=<n>` (not in §3.8): `json_ms` is now the wall time
+  from take to publish (across passes), `json_slice_max_ms` the longest slice.
+- HB gains `ent=<store size>/<unique ids> cat=<fetch state> stack=<loop task high-water,
+  bytes (ESP-IDF counts StackType_t = bytes)> psram_free=<bytes>`. `psram_free` is not in
+  §3.8; it is needed for the "PSRAM back within 64 KB after the build" gate (the old
+  `psram=` is the PSRAM size). Worst-case HB line 242 characters (< 255).
+- Stack (R2): `-fstack-usage` on the device build: ArduinoJson recursion costs
+  `parseVariant` 48 + `parseObject` 112 (`parseArray` 64) bytes per kept level and
+  `skipVariant` 32 + `skipObject`/`skipArray` 32 per skipped level. Deepest kept path is
+  `result: true` of a small non-states message (up to 20 levels ~ 3.2 KB); the filtered
+  event / catalog paths keep <= 6 levels and skip the rest (~64 B per level). Frames on
+  top: `parseMessage` 400, `EntityCatalogBuilder::element` 480. Not measured on the
+  device yet (Tester: HB `stack=` with a ~19-level message, gate >= 2048).
+- Test hook: `-DHAKNOB_STATES_ON_READY` (test builds only, e.g. via
+  `PLATFORMIO_BUILD_FLAGS`) makes HaClient call `requestStates()` on every transition to
+  Ready, so the get_states path can be tested on the device before the web API (6.6).
+- Build (v0.6.0): RAM 54472 bytes (16.6 %), flash 1789921 bytes (27.6 %); after the R8
+  fix RAM 54672 bytes (16.7 %), flash ~1790849 bytes (27.6 %).

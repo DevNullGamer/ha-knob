@@ -11,6 +11,9 @@ std::string_view keyOf(const JsonPairConst &kv) {
 
 }  // namespace
 
+EntityStore::EntityStore(ArduinoJson::Allocator *allocator)
+    : allocator_(allocator), entities_(Map::allocator_type(allocator)) {}
+
 void EntityStore::apply(JsonVariantConst event) {
     JsonObjectConst obj = event.as<JsonObjectConst>();
     if (obj.isNull()) {
@@ -35,7 +38,7 @@ void EntityStore::applyAdded(JsonObjectConst added) {
         if (entry.isNull()) {
             continue;  // not an entity state object
         }
-        EntityState next;
+        EntityState next(allocator_);
         JsonVariantConst s = entry["s"];
         if (s.is<const char *>()) {
             next.state = s.as<const char *>();
@@ -47,7 +50,7 @@ void EntityStore::applyAdded(JsonObjectConst added) {
             if (entities_.size() >= kMaxEntries) {
                 continue;
             }
-            entities_.emplace(std::string(id), std::move(next));
+            entities_.emplace(util::AllocString(id, util::StdAllocator<char>(allocator_)), std::move(next));
             ++version_;
         } else if (it->second != next) {
             it->second = std::move(next);

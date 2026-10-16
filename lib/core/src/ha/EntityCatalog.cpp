@@ -483,43 +483,120 @@ bool EntityCatalogBuilder::finish() {
     return false;
 }
 
-// ---- catalogToJson ------------------------------------------------------------------------
+// ---- CatalogJsonWriter --------------------------------------------------------------------
+
+namespace {
+
+constexpr size_t kJsonExtraPerEntry = 4;   // reserve beyond the lower bound (step_default "0.05")
+constexpr size_t kJsonRegrowSlack = 1024;  // extra room when the text has to be moved
+constexpr char kJsonClose[] = "]}";
+constexpr size_t kJsonCloseLen = sizeof(kJsonClose) - 1;
+
+// Fixed characters of one entry: {"id":"","name":"","state":"","actions":[],"step_default":}
+constexpr size_t kJsonEntryFixed = 59;
+
+// Bytes entry `index` takes at least in the output (with its leading ','): unescaped
+// strings and a one-character step_default. Mirrors the serialisation in step().
+size_t entryLowerBound(const CatalogEntry &e, size_t index) {
+    size_t n = kJsonEntryFixed + e.id.size() + e.name.size() + e.state.size() + 1;
+    if (index > 0) {
+        ++n;
+    }
+    if (e.domain != nullptr) {
+        size_t actions = 0;
+        for (size_t i = 0; i < e.domain->actionCount && i < 8; ++i) {
+            if (e.actionMask & (1u << i)) {
+                n += std::strlen(e.domain->actions[i].name) + 2 + (actions > 0 ? 1 : 0);
+                ++actions;
+            }
+        }
+    }
+    return n;
+}
+
+}  // namespace
+
+CatalogJsonWriter::CatalogJsonWriter(const EntityCatalog &catalog, uint32_t fetchedAtS,
+                                     ArduinoJson::Allocator *allocator)
+    : catalog_(&catalog), doc_(makeDoc(allocator)) {
+    std::string header = "{\"fetched_at_s\":";
+    header += std::to_string(fetchedAtS);
+    header += ",\"total\":";
+    header += std::to_string(catalog.total());
+    header += ",\"skipped\":";
+    header += std::to_string(catalog.skipped());
+    header += ",\"truncated\":";
+    header += catalog.truncated() ? "true" : "false";
+    header += ",\"entities\":[";
+    const size_t count = catalog.size();
+    for (size_t i = 0; i < count; ++i) {
+        lowerBoundLeft_ += entryLowerBound(catalog.entry(i), i);
+    }
+    // reserve() on an empty string allocates exactly this much (no doubling)
+    out_.reserve(header.size() + lowerBoundLeft_ + count * kJsonExtraPerEntry + kJsonCloseLen);
+    out_ += header;
+}
+
+void CatalogJsonWriter::ensureRoom(size_t extra) {
+    const size_t needed = out_.size() + extra;
+    if (needed <= out_.capacity()) {
+        return;
+    }
+    const size_t entriesLeft = catalog_->size() - next_ - 1;  // after the one being added
+    std::string bigger;
+    bigger.reserve(needed + lowerBoundLeft_ + entriesLeft * kJsonExtraPerEntry + kJsonRegrowSlack);
+    bigger += out_;
+    out_.swap(bigger);
+    ++regrowths_;
+}
+
+bool CatalogJsonWriter::step(size_t maxEntries) {
+    if (done_) {
+        return true;
+    }
+    const size_t count = catalog_->size();
+    const size_t budget = maxEntries == 0 ? 1 : maxEntries;
+    for (size_t written = 0; written < budget && next_ < count; ++written) {
+        const CatalogEntry e = catalog_->entry(next_);
+        doc_.clear();
+        doc_["id"] = JsonString(e.id.data(), e.id.size());
+        doc_["name"] = JsonString(e.name.data(), e.name.size());
+        doc_["state"] = JsonString(e.state.data(), e.state.size());
+        JsonArray actions = doc_["actions"].to<JsonArray>();
+        if (e.domain != nullptr) {  // as CatalogEntry::actions(), without the vector
+            for (size_t i = 0; i < e.domain->actionCount && i < 8; ++i) {
+                if (e.actionMask & (1u << i)) {
+                    const char *name = e.domain->actions[i].name;
+                    actions.add(JsonString(name, std::strlen(name), true));
+                }
+            }
+        }
+        doc_["step_default"] = e.stepDefault;
+        item_.clear();
+        serializeJson(doc_, item_);
+        const size_t bound = entryLowerBound(e, next_);
+        lowerBoundLeft_ = lowerBoundLeft_ > bound ? lowerBoundLeft_ - bound : 0;
+        ensureRoom((next_ > 0 ? 1 : 0) + item_.size() + kJsonCloseLen);  // the close always fits
+        if (next_ > 0) {
+            out_ += ',';
+        }
+        out_ += item_;
+        ++next_;
+    }
+    if (next_ == count) {
+        out_ += kJsonClose;
+        done_ = true;
+        doc_.clear();
+    }
+    return done_;
+}
 
 std::string catalogToJson(const EntityCatalog &catalog, uint32_t fetchedAtS,
                           ArduinoJson::Allocator *allocator) {
-    std::string out;
-    out.reserve(80 + catalog.size() * 112);
-    out += "{\"fetched_at_s\":";
-    out += std::to_string(fetchedAtS);
-    out += ",\"total\":";
-    out += std::to_string(catalog.total());
-    out += ",\"skipped\":";
-    out += std::to_string(catalog.skipped());
-    out += ",\"truncated\":";
-    out += catalog.truncated() ? "true" : "false";
-    out += ",\"entities\":[";
-    JsonDocument doc = makeDoc(allocator);
-    std::string item;
-    for (size_t i = 0; i < catalog.size(); ++i) {
-        const CatalogEntry e = catalog.entry(i);
-        doc.clear();
-        doc["id"] = JsonString(e.id.data(), e.id.size());
-        doc["name"] = JsonString(e.name.data(), e.name.size());
-        doc["state"] = JsonString(e.state.data(), e.state.size());
-        JsonArray actions = doc["actions"].to<JsonArray>();
-        for (const da::ActionSpec *action : e.actions()) {
-            actions.add(JsonString(action->name, std::strlen(action->name), true));
-        }
-        doc["step_default"] = e.stepDefault;
-        item.clear();
-        serializeJson(doc, item);
-        if (i > 0) {
-            out += ',';
-        }
-        out += item;
+    CatalogJsonWriter writer(catalog, fetchedAtS, allocator);
+    while (!writer.step(SIZE_MAX)) {
     }
-    out += "]}";
-    return out;
+    return writer.take();
 }
 
 }  // namespace ha

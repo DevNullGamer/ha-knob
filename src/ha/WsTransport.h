@@ -50,8 +50,14 @@
 //    message grows, freed as soon as onText returns); above 64 KB the largest free PSRAM block must be >= 1.5 x the size.
 //    Messages up to 4 MB are delivered; larger ones, binary ones, or ones PSRAM cannot hold
 //    are skipped without buffering and reported (HaSession::onMessageDropped); the
-//    connection stays up. A stalled transfer is ended by the session's timers (connect /
-//    auth timeouts, HA ping every 30 s with a 10 s pong timeout).
+//    connection stays up. Every read with data is reported to HaSession::onRxProgress (rx
+//    liveness, plan-step6.md §3.2). A data message in progress that receives no byte for
+//    kRxStallMs fails with rx_stalled; an idle connection is watched by the session's
+//    timers (connect / auth timeouts, HA ping every 30 s with a 10 s pong timeout).
+//  - retainText() (only from inside onText, for the get_states result): hands the receive
+//    buffer of the message being delivered to the session without copying
+//    (WsReceiver::detachDelivered); the returned RetainedText frees it in PSRAM. Any other
+//    pointer gets an empty RetainedText.
 //  - Server PING -> PONG with the same payload (HA's heartbeat needs it). Server Close ->
 //    Close reply (the server's code, 1000 instead of 1005/1006/1015 or an invalid code,
 //    empty if the server sent none), then closed_by_server. Protocol error -> Close 1002,
@@ -66,7 +72,7 @@
 //
 // Errors reported through HaSession::onClosed: dns_failed, connect_failed,
 // handshake_failed: <http NNN|bad_accept|bad_response|closed>, handshake_timeout,
-// closed_by_server, protocol_error, connection_lost, send_failed, and for wss:
+// closed_by_server, protocol_error, connection_lost, send_failed, rx_stalled, and for wss:
 //   tls_cert_rejected     certificate verification failed (-0x2700, or not issued by a
 //                         CA in the bundle)
 //   tls_ca_invalid        the stored CA PEM cannot be parsed by mbedTLS
@@ -89,6 +95,7 @@
 //   HA socket closed by=server code=<n> reason=<text, max 40 chars>
 //   HA socket closed by=peer                       TCP closed or reset while open
 //   HA protocol error reason=<r>
+//   HA rx stalled bytes=<n> ms=<n>                 no byte for kRxStallMs mid-message
 namespace ha {
 
 // core::ws::BufferProvider in PSRAM with a fragmentation guard (see above).
@@ -121,6 +128,7 @@ public:
     static constexpr size_t kPollMaxBytes = 32u * 1024u;
     static constexpr uint32_t kPollMaxUs = 8000;
     static constexpr size_t kLogRxBytes = 64u * 1024u;  // log "HA rx" from this size
+    static constexpr uint32_t kRxStallMs = 15000;  // mid-message silence -> rx_stalled
 
     WsTransport();
 
@@ -129,6 +137,7 @@ public:
     void open(const core::ha::HaUrl &endpoint, const core::ha::TlsSettings &tls) override;
     void close() override;
     bool sendText(const std::string &text) override;
+    core::ha::RetainedText retainText(const char *data, size_t length) override;
 
     // Drives the attempt / connection. Call from the main loop; may block during the TCP
     // connect and the TLS handshake (see above).
@@ -175,6 +184,9 @@ private:
     uint32_t tcpStartMs_ = 0;
     uint32_t upgradeStartMs_ = 0;
     uint32_t rxStartMs_ = 0;   // when the message in progress started arriving
+    uint32_t lastRxMs_ = 0;    // last read with data (Open; socket open time before that)
+    const uint8_t *delivering_ = nullptr;  // Text event being passed to onText (retainText)
+    size_t deliveringLen_ = 0;
 
     // Calls from the session inside poll() are deferred until poll() returns.
     bool inPoll_ = false;

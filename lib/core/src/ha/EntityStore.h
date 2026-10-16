@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "ha/EntityAttrs.h"
+#include "util/StdAllocator.h"
 
 // Live state of the subscribed entities (plan-step6.md §3.3), fed with the "event" object
 // of subscribe_entities messages in HA's compressed format:
@@ -18,11 +19,17 @@
 //   {"r":["light.x"]}                                             removed
 // Pure. The session decides which events belong to the current subscription; the store
 // applies whatever it is given. At most kMaxEntries entities (new ones beyond are ignored).
+// The map nodes, ids, states and names live on the allocator given to the constructor (on
+// the device PSRAM, so 24-64 entities do not take internal RAM; nullptr = default heap).
 namespace core {
 namespace ha {
 
 struct EntityState {
-    std::string state;  // "" if HA sent none / not a string
+    EntityState() = default;
+    explicit EntityState(ArduinoJson::Allocator *allocator)
+        : state(util::StdAllocator<char>(allocator)), attrs(allocator) {}
+
+    util::AllocString state;  // "" if HA sent none / not a string
     EntityAttrs attrs;
 
     bool operator==(const EntityState &o) const { return state == o.state && attrs == o.attrs; }
@@ -32,6 +39,8 @@ struct EntityState {
 class EntityStore {
 public:
     static constexpr size_t kMaxEntries = 64;
+
+    explicit EntityStore(ArduinoJson::Allocator *allocator = nullptr);
 
     // Applies one event object, in the order "a", "c", "r":
     //   a: insert or replace (attributes Replace); non-object entries are ignored;
@@ -60,7 +69,11 @@ private:
     void applyChanged(JsonObjectConst changed);
     void applyRemoved(JsonArrayConst removed);
 
-    std::map<std::string, EntityState, std::less<>> entities_;
+    using Map = std::map<util::AllocString, EntityState, std::less<>,
+                         util::StdAllocator<std::pair<const util::AllocString, EntityState>>>;
+
+    ArduinoJson::Allocator *allocator_;
+    Map entities_;
     uint32_t version_ = 0;
     bool snapshotSeen_ = false;
 };

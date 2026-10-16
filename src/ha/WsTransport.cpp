@@ -76,6 +76,11 @@ void dnsStart(void *arg) {  // tcpip task
 
 uint32_t randomMask() { return esp_random(); }
 
+// RetainedText::ReleaseFn for a detached receive buffer (context = the provider).
+void releaseRetained(void *context, char *data) {
+    static_cast<PsramBufferProvider *>(context)->release(reinterpret_cast<uint8_t *>(data));
+}
+
 // mbedTLS result of parsing the CA PEM: 0 if every certificate in it parsed, > 0 the number
 // of certificates that did not, < 0 an error. The config check only validates the PEM/DER
 // structure, so a certificate mbedTLS rejects (e.g. an unsupported key type) is caught
@@ -160,6 +165,22 @@ void WsTransport::close() {
         return;
     }
     shutdown(true);
+}
+
+hc::RetainedText WsTransport::retainText(const char *data, size_t length) {
+    // Only the message handleEvent() is delivering right now, and only once.
+    if (delivering_ == nullptr || reinterpret_cast<const uint8_t *>(data) != delivering_ ||
+        length != deliveringLen_) {
+        return hc::RetainedText();
+    }
+    delivering_ = nullptr;
+    size_t len = 0;
+    uint8_t *buffer = rx_.detachDelivered(len);
+    if (buffer == nullptr) {
+        return hc::RetainedText();
+    }
+    // buffer is the event's data (WsReceiver::detachDelivered), NUL-terminated at len.
+    return hc::RetainedText(reinterpret_cast<char *>(buffer), len, releaseRetained, &provider_);
 }
 
 bool WsTransport::sendText(const std::string &text) {
@@ -362,6 +383,7 @@ void WsTransport::pollUpgrade() {
             const std::string rest = upgradeBuf_.substr(result.headerBytes);
             std::string().swap(upgradeBuf_);
             rx_.reset();
+            lastRxMs_ = millis();
             phase_ = Phase::Open;
             if (!rest.empty()) {
                 handleBytes(reinterpret_cast<const uint8_t *>(rest.data()), rest.size());
@@ -391,6 +413,10 @@ void WsTransport::pollOpen() {
             if (total == 0 && peerClosed()) {
                 util::logPrintf("HA socket closed by=peer\n");
                 fail("connection_lost");
+            } else if (total == 0 && rx_.messageBytesSoFar() > 0 && millis() - lastRxMs_ >= kRxStallMs) {
+                util::logPrintf("HA rx stalled bytes=%u ms=%u\n", static_cast<unsigned>(rx_.messageBytesSoFar()),
+                                static_cast<unsigned>(millis() - lastRxMs_));
+                fail("rx_stalled");
             }
             return;
         }
@@ -402,6 +428,8 @@ void WsTransport::pollOpen() {
             return;  // a failed read stops the client; seen as closed on the next poll
         }
         total += static_cast<size_t>(n);
+        lastRxMs_ = millis();
+        session_->onRxProgress(static_cast<size_t>(n), lastRxMs_);  // only records the time
         if (!handleBytes(chunk_, static_cast<size_t>(n))) {
             return;
         }
@@ -433,9 +461,13 @@ bool WsTransport::handleEvent(const ws::Event &event) {
     switch (event.type) {
         case ws::EventType::Text: {
             const uint32_t now = millis();
+            delivering_ = event.data;  // the session may retain it (retainText)
+            deliveringLen_ = event.length;
             session_->onText(reinterpret_cast<const char *>(event.data), event.length, now);
-            // The session keeps no pointer into the message (parseMessage copies what it
-            // needs); free the PSRAM now rather than on the next received byte.
+            delivering_ = nullptr;
+            // Unless the session retained it (then nothing is held here), the session keeps
+            // no pointer into the message (parseMessage copies what it needs); free the
+            // PSRAM now rather than on the next received byte.
             rx_.releaseDelivered();
             if (event.length >= kLogRxBytes) {
                 util::logPrintf("HA rx len=%u ms=%u handle_ms=%u\n", static_cast<unsigned>(event.length),

@@ -8,6 +8,8 @@
 #include <string>
 #include <string_view>
 
+#include "util/StdAllocator.h"
+
 // The typed subset of Home Assistant entity attributes the device uses (plan-step6.md §3.3).
 // The one attribute model for the entity catalog, the live EntityStore and the presenter.
 // Pure. Attributes not listed in kAttributeKeys are never parsed or stored.
@@ -30,7 +32,11 @@ enum ColorModeBit : uint16_t {
 };
 
 struct EntityAttrs {
-    std::string friendlyName;        // "friendly_name" ("" if absent)
+    EntityAttrs() = default;
+    // friendlyName on this allocator (nullptr = default heap); see util/StdAllocator.h.
+    explicit EntityAttrs(ArduinoJson::Allocator *allocator) : friendlyName(util::StdAllocator<char>(allocator)) {}
+
+    util::AllocString friendlyName;  // "friendly_name" ("" if absent)
     uint32_t supportedFeatures = 0;  // "supported_features" bitmask (0 if absent)
     uint16_t colorModes = 0;         // "supported_color_modes" as ColorModeBit mask
     std::optional<double> brightness;            // 0-255

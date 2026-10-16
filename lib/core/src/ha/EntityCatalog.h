@@ -190,10 +190,51 @@ private:
 // The 200 body of GET /api/ha/entities (plan-step6.md §3.5), compact JSON:
 //   {"fetched_at_s":N,"total":T,"skipped":S,"truncated":false,"entities":[{"id":"light.k",
 //    "name":"Kitchen","state":"on","actions":["brightness","none"],"step_default":5},..]}
-// Built entry by entry (only one entry's JsonDocument at a time, on the allocator). The
-// returned std::string itself uses the default heap: on the device it lands in PSRAM only
-// through the SPIRAM malloc threshold (allocations >= 4 KB), and growth beyond the initial
-// reserve can need about twice its size for a moment.
+//
+// CatalogJsonWriter builds it in budgeted slices (R8: ~0.12 ms per entry on the device):
+// the header is written by hand, then step(maxEntries) serialises entries one at a time
+// with a reused JsonDocument on the allocator (no document for the whole list). The output
+// is identical for every budget. The output std::string uses the default heap (on the
+// device PSRAM through the SPIRAM malloc threshold, allocations >= 4 KB); it is reserved
+// once with a lower bound of the final size computed from the records (exact except for
+// escapes and step_default digits beyond the first + 4 bytes per entry). If an entry does
+// not fit, the text is moved (usually at most once; escape-heavy names can need a few) into an exactly reserved larger string (sized from the
+// remaining lower bound; never the std::string doubling), counted in regrowths().
+class CatalogJsonWriter {
+public:
+    // `catalog` must stay valid and unchanged (not moved from) while the writer lives.
+    CatalogJsonWriter(const EntityCatalog &catalog, uint32_t fetchedAtS,
+                      ArduinoJson::Allocator *allocator = nullptr);
+    CatalogJsonWriter(const CatalogJsonWriter &) = delete;
+    CatalogJsonWriter &operator=(const CatalogJsonWriter &) = delete;
+
+    // Writes up to maxEntries (minimum 1) entries; the step that writes the last entry (the
+    // first step for an empty catalog) also closes the JSON. Returns done(); after that it
+    // does nothing.
+    bool step(size_t maxEntries);
+
+    bool done() const { return done_; }
+    size_t entriesWritten() const { return next_; }
+    size_t regrowths() const { return regrowths_; }
+    size_t capacity() const { return out_.capacity(); }
+
+    // Moves the JSON out (call once, when done()).
+    std::string take() { return std::move(out_); }
+
+private:
+    void ensureRoom(size_t extra);
+
+    const EntityCatalog *catalog_;
+    JsonDocument doc_;
+    std::string item_;
+    std::string out_;
+    size_t next_ = 0;
+    size_t lowerBoundLeft_ = 0;  // lower bound of the entries not written yet
+    size_t regrowths_ = 0;
+    bool done_ = false;
+};
+
+// One-shot wrapper around CatalogJsonWriter (same output).
 std::string catalogToJson(const EntityCatalog &catalog, uint32_t fetchedAtS,
                           ArduinoJson::Allocator *allocator = nullptr);
 

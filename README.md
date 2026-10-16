@@ -4,11 +4,12 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.5.2, Step 5b.4 (https / wss to Home Assistant).** The firmware drives the hardware
-(display, touch swipes, encoder, button, buzzer), loads its configuration from NVS, joins
-Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home Assistant and
-device settings, and keeps an authenticated, self-healing WebSocket connection to Home
-Assistant. Entity selection and control come in later steps.
+**Status: v0.6.0, Step 6.5 (live entity state, entity list fetch).** The firmware drives the
+hardware (display, touch swipes, encoder, button, buzzer), loads its configuration from NVS,
+joins Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home Assistant
+and device settings, keeps an authenticated, self-healing WebSocket connection to Home
+Assistant and keeps the configured controls' entities live. The entity picker, the control
+screens and encoder control come in later steps.
 
 ## First-time setup
 
@@ -105,7 +106,7 @@ BTN long                                 held 600 ms (fired while held; no "shor
 BTN verylong                             held 10 s
 BTN up                                   release after long / verylong
 TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
-HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes> loopmax=<ms>   every 5 s
+HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes> loopmax=<ms> ent=<n>/<ids> cat=<state> stack=<bytes> psram_free=<bytes>   every 5 s
 WIFI ap ssid=<HA-Knob-XXXX> ip=192.168.4.1   setup access point up
 WIFI ap off                              setup access point shut down
 WIFI sta connecting ssid=<ssid>
@@ -137,6 +138,17 @@ HA frame dropped len=<n> ms=<n> reason=<too_large|no_memory|binary>   message di
 HA socket closed by=server code=<n> reason=<text>   server sent a WebSocket Close
 HA socket closed by=peer                 TCP connection closed or reset
 HA protocol error reason=<r>             invalid WebSocket data from the server (connection closed)
+HA rx stalled bytes=<n> ms=<n>           a message stopped arriving for 15 s (connection closed, rx_stalled)
+HA subscribe id=<n> ids=<k>              subscribe_entities for the k unique entity ids of the controls
+HA unsubscribe id=<n> subscription=<id>  the controls changed: old subscription ended (same connection)
+HA unsubscribe failed: <message>         Home Assistant refused it (or "timeout"); logged only
+HA snapshot entities=<n>                 first state snapshot of a subscription
+HA event dropped error=<e>               an entity update that could not be applied (too_large or a JSON error)
+HA states request id=<n>                 entity list (get_states) requested
+HA states retained len=<bytes>           its result arrived; the list is built from it in slices
+HA states late result dropped len=<bytes>   the large result of an abandoned request
+HA catalog done total=<n> supported=<n> skipped=<n> build_ms=<n> json=<bytes> json_ms=<n>   list ready
+HA catalog failed error=<e>              states_too_large / states_no_memory / states_timeout / states_failed: .. / states_unexpected / connection_lost
 HA state=<state>[ ha_version=<v>][ error=<error>][ retry_in_ms=<ms>]   every state change
 HA retry                                 web UI Retry accepted
 SYS reboot | SYS factory reset           performed by the main loop just after the response
@@ -150,8 +162,10 @@ reconnect backoff).
 In `HB`, `ip` is the station IP when connected, else `192.168.4.1` while the setup AP is up,
 else `0.0.0.0`; `ha` is the Home Assistant connection state, `heap` / `heap_min` the free
 internal heap now / the lowest since boot, and `loopmax` the longest main-loop pass (ms,
-without the loop's own 5 ms delay) since the previous `HB`. SSIDs are logged, passwords and
-tokens never.
+without the loop's own 5 ms delay) since the previous `HB`. `ent` is the number of live
+entities / unique entity ids of the controls, `cat` the entity list fetch (`none`,
+`fetching`, `building`, `ready`, `failed`), `stack` the loop task stack never used since
+boot (bytes) and `psram_free` the free PSRAM. SSIDs are logged, passwords and tokens never.
 
 Serial output never blocks the firmware: when the board is plugged into a PC but no program
 reads the port, the 4 KB transmit buffer fills up and further lines are dropped (counted in
@@ -391,15 +405,27 @@ the long-lived token. REST is not used.
 | `no_config` | No address or no token stored; or the stored address is not used: `last_error` `invalid_url` (e.g. a `?` or `#` in the address) |
 | `connecting` | Resolving the name, connecting, waiting for Home Assistant's `auth_required` |
 | `authenticating` | Token sent, waiting for the answer |
-| `subscribing` | Subscribing to the selected entities (from Step 6; Step 5 subscribes to nothing) |
+| `subscribing` | Subscribing to the controls' entities (`subscribe_entities`); straight to `ready` when no control is configured |
 | `ready` | Connected and authenticated; `ha_version` is the Home Assistant version |
 | `auth_failed` | Home Assistant rejected the token (`last_error` `auth_invalid: <message>`). **No automatic retry** (Home Assistant would ban the IP after repeated failures): save a new token, or press Retry |
 | `backoff` | Not connected; the next attempt follows after 1, 2, 4, 8, 16, then every 30 s. `last_error` says why (`dns_failed`, `connect_failed`, `handshake_failed: http <code>` / `bad_accept` / `bad_response` / `closed` (the server closed the connection before answering the upgrade, e.g. a proxy refusing it), `handshake_timeout`, `connect_timeout`, `auth_timeout`, `pong_timeout`, `connection_lost`, `closed_by_server`, `protocol_error`, `send_failed`, `network_down`, `network_lost`, and for `https` the TLS errors below) |
 
 - Without Wi-Fi the client waits in `backoff` and connects as soon as the station is up.
 - Liveness: an HA `ping` every 30 s; no `pong` within 10 s closes the connection and
-  reconnects. No `auth_required` within 20 s of connecting, or no answer to the token
-  within 10 s, also counts as a failed attempt.
+  reconnects. Received bytes count as a sign of life (the pong may wait behind a large
+  message), but 90 s after a ping without a pong the connection is closed anyway. A
+  message that stops arriving in the middle for 15 s closes it as `rx_stalled`. No
+  `auth_required` within 20 s of connecting, or no answer to the token within 10 s, also
+  counts as a failed attempt.
+- Entities: the unique entity ids of the configured controls are subscribed with
+  `subscribe_entities`; their state and the attributes the device uses are kept live in
+  PSRAM (`HB ent=`). Changing the controls unsubscribes and subscribes again on the same
+  connection (no reconnect); events of an old subscription are ignored.
+- Entity list: `get_states` (multi-MB on large installations) is taken over from the
+  receive buffer without a copy and turned into a compact list of the supported entities
+  in 32 KB slices (about 5 ms each), so the main loop never blocks on it. The list (at most
+  1500 entities, names cut to 96 bytes) is kept in RAM only. The web UI requests it from
+  Step 6.6 on.
 - Message ids start at 1 on every connection.
 - Name resolution (also `.local` names via mDNS) runs in the background. The TCP connect
   itself blocks the main loop for up to 2 s when the host does not answer at all. The
@@ -576,11 +602,12 @@ data/             web UI (index.html, app.js, style.css), flashed with uploadfs
 lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the host
   src/config/     ConfigModel (schema, JSON, validation, redaction, patch merge)
   src/control/    DomainActions (per-domain actions, presses and step ranges)
-  src/ha/         HaUrl (URL -> WebSocket endpoint), HaProtocol (messages), HaSession (state machine)
+  src/ha/         HaUrl (URL -> WebSocket endpoint), HaProtocol (messages), HaSession (state machine),
+                  EntityAttrs, EntityStore (live entities), EntityCatalog (entity list)
   src/input/      QuadratureDecoder, ButtonFsm, Acceleration, SwipeClassifier
   src/ui/         Presenter (number formatting)
   src/web/        RequestGuard (Host allow-list, CSRF, body limit, Basic auth check)
-  src/util/       MathUtil, Sha1, Base64
+  src/util/       MathUtil, Sha1, Base64, JsonScan, StdAllocator (STL allocator on an injected allocator)
   src/ws/         WsHandshake, WsFrame, WsReceiver (WebSocket client codec, RFC 6455)
 test/native/      host unit tests (Unity), run with `pio test -e native`
 tools/            serial_check.py, gen_fonts.sh

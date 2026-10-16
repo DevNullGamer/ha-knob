@@ -218,6 +218,7 @@ public:
     // 1000, 2000, 4000, 8000, 16000, then 30000 ms.
     static uint32_t backoffDelayMs(uint32_t failures);
 
+    // allocator: JSON documents, the catalog and the entities() store (device: PSRAM).
     explicit HaSession(Transport &transport, ArduinoJson::Allocator *allocator = nullptr,
                        const Options &options = Options());
 
