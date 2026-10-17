@@ -32,6 +32,15 @@ void PageRing::previous() {
     }
 }
 
+bool PageRing::selectControl(size_t index) {
+    if (index >= controlCount_) {
+        return false;
+    }
+    onStatus_ = false;
+    index_ = index;
+    return true;
+}
+
 int PageRing::controlPage() const {
     if (onStatus_ || controlCount_ == 0) {
         return -1;

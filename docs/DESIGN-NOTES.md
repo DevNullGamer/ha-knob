@@ -878,3 +878,67 @@ Spec: `plan-step7.md` §3.4, §4 Step 7.4 (Q7-1, Q7-3, Q7-5..Q7-7, Q7-11). Core 
   and whenever `tick()` sees a control's `holding()` change (settle expiry; `rotate` sets
   `wasHolding` so the start of a hold is not counted twice); extra bumps
   are harmless (compare for inequality).
+
+## Step 7.5 (2026-10-17)
+
+Spec: `plan-step7.md` §3.5, §4 Step 7.5 (Q7-6, Q7-9, Amendment A1). Core only; the device
+uses it from Step 7.6 (local value) and 7.7 / 7.8 (arc colours, Select list).
+
+- `present()` takes HA's values from `domain_actions::currentValue` and the arc range from
+  `valueRange` (the action looked up by name in any domain, as before); the presenter no
+  longer has its own value extraction. **Deviation from "Step 6.8 outputs identical":** a
+  fan with no `percentage` and state `off` now shows `0` % (currentValue's Q7-5 rule)
+  instead of `--`, so the screen shows the value a turn starts from. Every other output is
+  unchanged (all existing presenter tests pass unmodified). Open: showing a hue modulo 360
+  (359.6 -> `0` instead of `360`) was asked in round 2 but contradicts the Step 6.8 test
+  `test_hue` (expects `360`); not done until that test is changed.
+- `PresentContext::local` (`optional<control::LocalValue>`, from `ControlEngine::local()`):
+  the value shown and the arc come from it, formatted like HA's; `ControlView::unconfirmed`
+  is copied from it; the state line stays; `dimmed` is only "HA not Ready" (an entity that
+  turned unavailable mid-hold is not dimmed while the local value shows). Ignored for
+  actions without a value and for a missing entity (the `waiting...` / `not found` view
+  wins). Fan `percentage`: the local value is floored like the call, through the one helper
+  `domain_actions::sentPercentage` (`floor(v + 1e-6)`, Amendment A1; `encoderCall` uses it
+  too), so 66.667 shows `66` and the arc sits at 66; HA's own percentage is still shown
+  rounded (it is an integer anyway). `LocalValue` lives in `control/LocalValue.h` (round 2),
+  so `Presenter.h` does not include the engine.
+- `ControlView::arcRgb` (hue action only, whenever a hue value is shown, local or HA's):
+  `hueToRgb(h)` = HSV(h, 100 %, 100 %) as 0xRRGGBB, h modulo 360 (non-finite -> 0), each
+  channel rounded. `unconfirmed` and `arcRgb` are part of `operator==` (main's rebuild /
+  `UI view` log compare).
+- `titleFor(control, entity)`: the title rule of `present()` (label, `friendly_name`,
+  entity id), exposed for the Select list.
+- `core::ui::SelectModel`: `open(count, selected, now)` (count 0 stays closed, selection
+  clamped), `move(delta, now)` clamped at both ends, every move restarts the 8 s idle time
+  (`kIdleMs`) even at an end; `choose()` closes and returns the index (`optional`, nullopt
+  while closed); `tick(now)` returns true once when idle and closes; `close()`. Elapsed time
+  modulo 2^32; callers pass one `now` per loop pass (non-decreasing; documented in
+  `SelectModel.h` and `ControlEngine.h`).
+- `PageRing::selectControl(i)` (false and no change when out of range, also with zero
+  controls) and `selectStatus()`.
+- Build: RAM 55132 bytes (16.8 %), flash 1821441 bytes (28.1 %) (nothing on the device
+  calls the new code yet).
+
+## Step 8.1 / 8.2: IdleTimer and ResetConfirm (core)
+
+- `core::ui::IdleTimer` (`lib/core/src/ui/IdleTimer.{h,cpp}`): level On / Dim / Off from the
+  idle time (`now - lastActivity`, modulo 2^32). `tick()` only moves the level forward, so
+  Off survives the `millis()` wrap; only activity (`onInput`, any `onButton` event other
+  than None, `keepAwake`, `configure`) wakes. `dim_after_s` / `off_after_s` convert to ms
+  clamped at UINT32_MAX; 0 = never; Off wins over Dim (`off <= dim` goes On -> Off).
+- Gesture swallowing (Q8-3): a button event that finds the level not On wakes it and
+  swallows the gesture up to `ShortPress` / `Released` (returns false), including
+  `LongPress` / `VeryLongPress`. A lone `ShortPress` / `LongPress` (TIN style) at Dim/Off is
+  swallowed too. While the button is held `tick()` counts as activity (Q8-4).
+  `configure` / `keepAwake` leave the gesture state (held / swallowing) untouched.
+- `panelSetting(level, brightness, dimLevel)`: Dim uses `min(dimLevel, brightness)`.
+- `core::ui::ResetConfirm`: `observeButton(false)` arms (Q8-13); `VeryLongPress` while armed
+  opens a 10 s confirmation (deadline compared signed), `ShortPress` confirms, rotate
+  (n != 0) / swipe / timeout cancel; `Released` and `LongPress` are ignored. Not armed:
+  `IgnoredNotArmed`. `Confirmed` is terminal. `lastCancel()` keeps the last reason until a
+  new confirmation opens; `cancelReasonName(None)` is "none". `secondsLeft` is ceil of the
+  remaining ms (10..1), 0 once the deadline has passed or when not confirming.
+- For 8.4 / 8.7: a lone `LongPress` / `VeryLongPress` at Dim/Off (TIN, test builds only)
+  leaves `held` true until a TIN up / short press, so the screen stays On meanwhile.
+  Callers must `ResetConfirm::tick()` before reading `secondsLeft()`, else the display shows
+  "0" at the deadline.

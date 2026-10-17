@@ -172,6 +172,67 @@ static void test_zero_to_n_to_zero() {
     TEST_ASSERT_EQUAL_INT(0, r.controlPage());
 }
 
+// ---- Step 7.5: selectControl / selectStatus ----
+
+static void test_select_control_in_range() {
+    PageRing r;
+    r.setControlCount(3);
+    r.selectStatus();
+    TEST_ASSERT_TRUE(r.onStatus());
+    TEST_ASSERT_TRUE(r.selectControl(2));
+    TEST_ASSERT_FALSE(r.onStatus());
+    TEST_ASSERT_EQUAL_INT(2, r.controlPage());
+    TEST_ASSERT_TRUE(r.selectControl(0));
+    TEST_ASSERT_EQUAL_INT(0, r.controlPage());
+}
+
+static void test_select_control_out_of_range_no_change() {
+    PageRing r;
+    r.setControlCount(3);
+    r.next();
+    TEST_ASSERT_FALSE(r.selectControl(3));
+    TEST_ASSERT_EQUAL_INT(1, r.controlPage());
+    r.selectStatus();
+    TEST_ASSERT_FALSE(r.selectControl(3));
+    TEST_ASSERT_TRUE(r.onStatus());
+    TEST_ASSERT_FALSE(r.selectControl(static_cast<size_t>(-1)));
+    TEST_ASSERT_TRUE(r.onStatus());
+}
+
+static void test_select_control_with_zero_controls() {
+    PageRing r;
+    r.setControlCount(0);
+    TEST_ASSERT_FALSE(r.selectControl(0));
+    TEST_ASSERT_TRUE(r.onNoControls());
+    r.selectStatus();
+    TEST_ASSERT_FALSE(r.selectControl(0));
+    TEST_ASSERT_TRUE(r.onStatus());
+}
+
+static void test_select_status_then_navigation() {
+    PageRing r;
+    r.setControlCount(3);
+    r.selectControl(1);
+    r.selectStatus();
+    TEST_ASSERT_TRUE(r.onStatus());
+    TEST_ASSERT_EQUAL_INT(-1, r.controlPage());
+    r.next();
+    TEST_ASSERT_EQUAL_INT(0, r.controlPage());
+    r.selectStatus();
+    r.previous();
+    TEST_ASSERT_EQUAL_INT(2, r.controlPage());
+}
+
+static void test_select_status_kept_when_count_shrinks() {
+    PageRing r;
+    r.setControlCount(5);
+    r.selectStatus();
+    r.setControlCount(2);
+    TEST_ASSERT_TRUE(r.onStatus());
+    r.setControlCount(0);
+    TEST_ASSERT_TRUE(r.onStatus());
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_initial_state);
@@ -186,5 +247,10 @@ int main() {
     RUN_TEST(test_in_range_index_is_kept);
     RUN_TEST(test_status_is_kept_across_count_changes);
     RUN_TEST(test_zero_to_n_to_zero);
+    RUN_TEST(test_select_control_in_range);
+    RUN_TEST(test_select_control_out_of_range_no_change);
+    RUN_TEST(test_select_control_with_zero_controls);
+    RUN_TEST(test_select_status_then_navigation);
+    RUN_TEST(test_select_status_kept_when_count_shrinks);
     return UNITY_END();
 }

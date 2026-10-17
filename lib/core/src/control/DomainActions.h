@@ -148,6 +148,11 @@ struct CallBuild {
 CallBuild encoderCall(const DomainSpec &domain, const ActionSpec &action,
                       const std::string &entityId, double value, const ha::EntityState *entity);
 
+// The fan percentage encoderCall sends for a stepped value: floor(value + 1e-6), as HA
+// reports speeds as int(k * 100 // count) (Amendment A1): 66.667 -> 66, 99.99999999 -> 100.
+// The presenter shows a local percentage the same way. value must be finite and in range.
+int sentPercentage(double value);
+
 // The service call of a press: toggle -> <domain>.toggle, except climate: state "off" ->
 // climate.turn_on, else climate.turn_off; stop -> cover.stop_cover; play_pause ->
 // media_player.media_play_pause; mute -> media_player.volume_mute {"is_volume_muted":

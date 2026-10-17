@@ -388,7 +388,7 @@ CallBuild encoderCall(const DomainSpec &domain, const ActionSpec &action,
     if (isAction(action, "percentage")) {
         // HA's speed percentages are int(k * 100 // count) (33, 66, 100): floor, not round,
         // so a value on the 100/count grid maps to that speed (Amendment A1)
-        data["percentage"] = static_cast<int>(std::floor(value + kPercentFloorSlack));
+        data["percentage"] = sentPercentage(value);
         return makeCall(domain.domain, "set_percentage", entityId, std::move(data));
     }
     if (isAction(action, "volume")) {
@@ -396,6 +396,10 @@ CallBuild encoderCall(const DomainSpec &domain, const ActionSpec &action,
         return makeCall(domain.domain, "volume_set", entityId, std::move(data));
     }
     return noCall(NoCall::NoAction);  // an action without a mapping
+}
+
+int sentPercentage(double value) {
+    return static_cast<int>(std::floor(value + kPercentFloorSlack));
 }
 
 CallBuild pressCall(const DomainSpec &domain, std::string_view press,

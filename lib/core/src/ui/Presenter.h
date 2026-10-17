@@ -1,9 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "config/ConfigModel.h"
+#include "control/LocalValue.h"
 #include "ha/EntityStore.h"
 
 namespace core {
@@ -33,6 +35,10 @@ struct PresentContext {
     bool haReady = false;           // HA session state Ready
     bool snapshotSeen = false;      // EntityStore::snapshotSeen()
     uint32_t msSinceSubscribe = 0;  // since the current subscription was started
+    // The control's local value while it holds (ControlEngine::local(), plan-step7.md Q7-1);
+    // shown instead of HA's value. Ignored for actions without a value ("none") and for a
+    // control whose entity is missing.
+    std::optional<control::LocalValue> local;
 };
 
 // True once a missing entity counts as "not found" (snapshot seen or kNotFoundAfterMs over).
@@ -49,12 +55,23 @@ struct ControlView {
     double arcValue = 0;    // within [arcMin, arcMax]; arcMin when there is no value
     std::string stateText;  // entity state / "HA offline" / "waiting..." / "not found"
     bool dimmed = false;    // HA not Ready, entity missing, unavailable or unknown
+    bool unconfirmed = false;  // the value is a local one not yet confirmed by HA (Q7-6)
+    std::optional<uint32_t> arcRgb;  // hue action: the arc colour 0xRRGGBB of the shown hue
 
     bool operator==(const ControlView &o) const;
     bool operator!=(const ControlView &o) const { return !(*this == o); }
 };
 
-// The read-only view of one control (plan-step6.md §3.7). entity = the store's state of
+// The colour of a hue in degrees at full saturation and value (HSV(h, 100 %, 100 %)) as
+// 0xRRGGBB: 0 -> 0xFF0000, 120 -> 0x00FF00, 240 -> 0x0000FF. Any hue is taken modulo 360
+// (negative ones too); a non-finite hue counts as 0.
+uint32_t hueToRgb(double hue);
+
+// The page title of a control: its label, else the entity's friendly_name, else the
+// entity id (entity nullptr = not in the store). Also used by the Select list.
+std::string titleFor(const config::Control &control, const ha::EntityState *entity);
+
+// The view of one control (plan-step6.md §3.7). entity = the store's state of
 // control.entityId (nullptr = not in the store). Per action:
 //   brightness  round(brightness * 100 / 255) %, 0 % when the light is off or the value is
 //               absent; arc 0-100
@@ -68,6 +85,10 @@ struct ControlView {
 //               the value is "--" and the state goes to the state text
 // An absent value (other than brightness) shows "--" with the arc at its minimum. Not
 // Ready: the last values dimmed, state text "HA offline". Unknown actions show as "none".
+// HA's values come from domain_actions::currentValue (fan: absent and state "off" -> 0 %).
+// context.local (Step 7.5, Q7-6): the action's value is the local one, formatted like HA's
+// (fan percentage floored like the call sends it: 66.667 -> "66"), unconfirmed is copied,
+// the state text stays and dimmed is only "HA not Ready". Hue: arcRgb = hueToRgb(shown hue).
 ControlView present(const config::Control &control, const ha::EntityState *entity,
                     const PresentContext &context);
 

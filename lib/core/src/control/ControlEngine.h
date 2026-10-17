@@ -9,13 +9,15 @@
 
 #include "config/ConfigModel.h"
 #include "control/DomainActions.h"
+#include "control/LocalValue.h"
 #include "control/Throttle.h"
 #include "ha/EntityStore.h"
 #include "ha/HaSession.h"
 
 // Turns encoder detents and button presses on the configured controls into Home Assistant
 // service calls (plan-step7.md §3.4, Q7-1, Q7-3, Q7-5..Q7-7, Q7-11). Pure and clock-injected
-// (all times are millis(), wrap-safe); the caller passes HA's entity state and whether the
+// (all times are millis(), wrap-safe; callers pass one `now` per loop pass, so timestamps
+// never decrease between calls); the caller passes HA's entity state and whether the
 // session is Ready on every call, sends through a CallSender, feeds every CallResult back
 // via onResult() and calls tick() every loop pass. Every CallResult of a sent call must
 // reach onResult() (on the device: drain ha::takeCallResults() every pass before tick());
@@ -66,11 +68,6 @@ struct Notice {
     NoticeKind kind;
     std::string text;  // for the toast; at most kMaxNoticeBytes bytes, UTF-8 intact
     size_t control;    // index into the controls
-};
-
-struct LocalValue {
-    double value;      // display units, already stepped
-    bool unconfirmed;  // true while holding (always, as local() is empty otherwise)
 };
 
 class ControlEngine {

@@ -19,6 +19,12 @@ public:
     void next();
     void previous();
 
+    // Selects control page index (the Select list, Step 7.8). Out of range (also with no
+    // controls: the NoControls page is not a control) -> false and no change.
+    bool selectControl(size_t index);
+    // Selects the Status page.
+    void selectStatus() { onStatus_ = true; }
+
     bool onStatus() const { return onStatus_; }
     // True on the NoControls page (no controls, Status not selected).
     bool onNoControls() const { return !onStatus_ && controlCount_ == 0; }

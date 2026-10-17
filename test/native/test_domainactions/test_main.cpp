@@ -214,6 +214,15 @@ static void test_step_default_others_use_table() {
 
 // ---- applyAttrs ----
 
+static void test_sent_percentage() {
+    TEST_ASSERT_EQUAL_INT(66, da::sentPercentage(66.6666667));
+    TEST_ASSERT_EQUAL_INT(100, da::sentPercentage(99.9999999));
+    TEST_ASSERT_EQUAL_INT(33, da::sentPercentage(33.3333333));
+    TEST_ASSERT_EQUAL_INT(0, da::sentPercentage(0));
+    TEST_ASSERT_EQUAL_INT(100, da::sentPercentage(100));
+    TEST_ASSERT_EQUAL_INT(50, da::sentPercentage(50));
+}
+
 static void test_apply_replace_full() {
     ha::EntityAttrs a = attrsFrom(
         "{\"friendly_name\":\"K\\u00f8kken\",\"supported_features\":44,"
@@ -466,5 +475,6 @@ int main(int, char **) {
     RUN_TEST(test_attrs_equality);
     RUN_TEST(test_meta_json_exact);
     RUN_TEST(test_meta_json_parses_and_covers_table);
+    RUN_TEST(test_sent_percentage);
     return UNITY_END();
 }

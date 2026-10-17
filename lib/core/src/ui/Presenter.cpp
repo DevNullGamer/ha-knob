@@ -42,23 +42,22 @@ namespace {
 constexpr const char *kNoValue = "--";
 constexpr const char *kDegree = "\xC2\xB0";  // U+00B0, in the project fonts
 constexpr double kDefaultTempStep = 0.5;
+constexpr double kHueCycle = 360;
 
 bool isFinite(const std::optional<double> &v) { return v.has_value() && std::isfinite(*v); }
 
-// The action's arc range from the DomainActions table (domain_actions::valueRange); the
-// action is looked up by name in any domain, like present() treats it.
-void setRange(ControlView &view, const std::string &action, const ha::EntityAttrs &attrs) {
+// The DomainActions entry of an action with a value, looked up by name in any domain (like
+// present() treats the action); nullptr for "none" and unknown actions.
+const domain_actions::ActionSpec *valueAction(const std::string &action) {
     size_t count = 0;
     const domain_actions::DomainSpec *specs = domain_actions::domains(count);
     for (size_t i = 0; i < count; ++i) {
         const domain_actions::ActionSpec *spec = domain_actions::findAction(specs[i], action);
         if (spec != nullptr && spec->hasStep) {
-            const domain_actions::ValueRange range = domain_actions::valueRange(*spec, attrs);
-            view.arcMin = range.min;
-            view.arcMax = range.max;
-            return;
+            return spec;
         }
     }
+    return nullptr;
 }
 
 // Sets value / unit / arc from an optional number (shown as `text`); absent -> "--".
@@ -75,16 +74,7 @@ void setValue(ControlView &view, const std::optional<double> &arcValue, const st
     view.arcValue = std::min(std::max(*arcValue, view.arcMin), view.arcMax);
 }
 
-std::optional<double> scaled(const std::optional<double> &v, double factor) {
-    if (!isFinite(v)) return std::nullopt;
-    return *v * factor;
-}
-
 bool isUnavailable(const std::string &state) { return state == "unavailable" || state == "unknown"; }
-
-std::string percentText(const std::optional<double> &v) {
-    return isFinite(v) ? formatPercent(*v) : std::string();
-}
 
 }  // namespace
 
@@ -95,33 +85,57 @@ bool waitOver(const PresentContext &context) {
 bool ControlView::operator==(const ControlView &o) const {
     return title == o.title && value == o.value && unit == o.unit && hasArc == o.hasArc &&
            arcMin == o.arcMin && arcMax == o.arcMax && arcValue == o.arcValue &&
-           stateText == o.stateText && dimmed == o.dimmed;
+           stateText == o.stateText && dimmed == o.dimmed && unconfirmed == o.unconfirmed &&
+           arcRgb == o.arcRgb;
+}
+
+uint32_t hueToRgb(double hue) {
+    double h = std::isfinite(hue) ? std::fmod(hue, kHueCycle) : 0.0;
+    if (h < 0) h += kHueCycle;
+    if (h >= kHueCycle) h = 0;  // a tiny negative hue + 360 can round up to 360
+    const double sector = h / 60.0;
+    // The channel that rises or falls within the sector, 0-255.
+    const double x = 255.0 * (1.0 - std::fabs(std::fmod(sector, 2.0) - 1.0));
+    const uint32_t full = 255;
+    const uint32_t part = static_cast<uint32_t>(std::lround(std::min(std::max(x, 0.0), 255.0)));
+    uint32_t r = 0, g = 0, b = 0;
+    switch (static_cast<int>(sector)) {
+        case 0: r = full; g = part; break;
+        case 1: r = part; g = full; break;
+        case 2: g = full; b = part; break;
+        case 3: g = part; b = full; break;
+        case 4: r = part; b = full; break;
+        default: r = full; b = part; break;
+    }
+    return (r << 16) | (g << 8) | b;
+}
+
+std::string titleFor(const config::Control &control, const ha::EntityState *entity) {
+    if (!control.label.empty()) {
+        return control.label;
+    }
+    if (entity != nullptr && !entity->attrs.friendlyName.empty()) {
+        return std::string(entity->attrs.friendlyName.data(), entity->attrs.friendlyName.size());
+    }
+    return control.entityId;
 }
 
 ControlView present(const config::Control &control, const ha::EntityState *entity,
                     const PresentContext &context) {
     ControlView view;
-    if (!control.label.empty()) {
-        view.title = control.label;
-    } else if (entity != nullptr && !entity->attrs.friendlyName.empty()) {
-        view.title.assign(entity->attrs.friendlyName.data(), entity->attrs.friendlyName.size());
-    } else {
-        view.title = control.entityId;
-    }
+    view.title = titleFor(control, entity);
 
     const std::string &action = control.action;
-    const bool isBrightness = action == "brightness";
-    const bool isHue = action == "hue";
-    const bool isColorTemp = action == "color_temp";
-    const bool isTargetTemp = action == "target_temp";
-    const bool isPercent = action == "position" || action == "percentage" || action == "volume";
-    view.hasArc = isBrightness || isHue || isColorTemp || isTargetTemp || isPercent;
+    const domain_actions::ActionSpec *spec = valueAction(action);
+    view.hasArc = spec != nullptr;
 
     // Ranges first: they do not depend on a value.
     const ha::EntityAttrs empty;
     const ha::EntityAttrs &attrs = entity != nullptr ? entity->attrs : empty;
-    if (view.hasArc) {
-        setRange(view, action, attrs);
+    if (spec != nullptr) {
+        const domain_actions::ValueRange range = domain_actions::valueRange(*spec, attrs);
+        view.arcMin = range.min;
+        view.arcMax = range.max;
     }
 
     if (entity == nullptr) {
@@ -140,39 +154,48 @@ ControlView present(const config::Control &control, const ha::EntityState *entit
     const std::string state(entity->state.data(), entity->state.size());
     view.stateText = state;
 
-    if (isBrightness) {
-        double percent = 0;  // off or absent -> 0 %
-        if (state != "off" && isFinite(attrs.brightness)) {
-            percent = std::min(std::max(std::round(*attrs.brightness * 100.0 / 255.0), 0.0), 100.0);
+    // The shown value: the local one while the control holds, else HA's.
+    const bool useLocal = spec != nullptr && context.local.has_value();
+    std::optional<double> value;
+    if (useLocal) {
+        value = context.local->value;
+        view.unconfirmed = context.local->unconfirmed;
+    } else if (spec != nullptr) {
+        value = domain_actions::currentValue(*spec, *entity);
+    }
+    const bool has = isFinite(value);
+
+    if (action == "brightness") {
+        setValue(view, value, has ? formatPercent(*value) : "", "%");
+    } else if (action == "hue") {
+        setValue(view, value, has ? formatNumber(*value, 0) : "", kDegree);
+        if (has) {
+            view.arcRgb = hueToRgb(*value);
         }
-        setValue(view, percent, formatPercent(percent), "%");
-    } else if (isHue) {
-        setValue(view, attrs.hue, isFinite(attrs.hue) ? formatNumber(*attrs.hue, 0) : "", kDegree);
-    } else if (isColorTemp) {
-        setValue(view, attrs.colorTempKelvin,
-                 isFinite(attrs.colorTempKelvin) ? formatNumber(*attrs.colorTempKelvin, 0) : "", "K");
-    } else if (isTargetTemp) {
+    } else if (action == "color_temp") {
+        setValue(view, value, has ? formatNumber(*value, 0) : "", "K");
+    } else if (action == "target_temp") {
         // The configured step (validated); a missing one falls back to HA's step, then 0.5.
         double step = control.step;
         if (!(step > 0)) {
             step = isFinite(attrs.targetTempStep) && *attrs.targetTempStep > 0 ? *attrs.targetTempStep
                                                                                : kDefaultTempStep;
         }
-        setValue(view, attrs.temperature,
-                 isFinite(attrs.temperature) ? formatStepped(*attrs.temperature, step) : "", kDegree);
+        setValue(view, value, has ? formatStepped(*value, step) : "", kDegree);
         if (isFinite(attrs.currentTemperature)) {
             const int decimals = std::max(decimalsForStep(step), 1);
             const std::string now = "now " + formatNumber(*attrs.currentTemperature, decimals) + kDegree;
             view.stateText = state.empty() ? now : state + ", " + now;
         }
-    } else if (action == "position") {
-        setValue(view, attrs.currentPosition, percentText(attrs.currentPosition), "%");
     } else if (action == "percentage") {
-        setValue(view, attrs.percentage, percentText(attrs.percentage), "%");
-    } else if (action == "volume") {
-        const std::optional<double> percent = scaled(attrs.volumeLevel, 100.0);
-        setValue(view, percent, percentText(percent), "%");
-        if (attrs.isVolumeMuted.value_or(false)) {
+        // A local value lies on HA's speed grid (e.g. 66.667) and is sent floored.
+        if (useLocal && has) {
+            value = domain_actions::sentPercentage(*value);
+        }
+        setValue(view, value, has ? formatPercent(*value) : "", "%");
+    } else if (action == "position" || action == "volume") {
+        setValue(view, value, has ? formatPercent(*value) : "", "%");
+        if (action == "volume" && attrs.isVolumeMuted.value_or(false)) {
             view.stateText = state.empty() ? "muted" : state + ", muted";
         }
     } else {
@@ -188,7 +211,8 @@ ControlView present(const config::Control &control, const ha::EntityState *entit
         }
     }
 
-    view.dimmed = !context.haReady || isUnavailable(state);
+    // A local value is the user's own turn: dimmed only while HA is not Ready (Q7-6).
+    view.dimmed = !context.haReady || (!useLocal && isUnavailable(state));
     if (!context.haReady) {
         view.stateText = "HA offline";
     }

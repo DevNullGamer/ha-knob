@@ -2,10 +2,12 @@
 // (plan.md §4 Step 2).
 #include <unity.h>
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <string>
 
+#include "control/DomainActions.h"
 #include "ui/Presenter.h"
 #include "util/MathUtil.h"
 
@@ -484,6 +486,242 @@ static void test_view_equality_per_field() {
     b = a; b.dimmed = !b.dimmed;  TEST_ASSERT_TRUE(a != b);
 }
 
+
+// ---------------------------------------------------------------------------
+// Step 7.5: local value, hue colour, titleFor, percentage helper
+// ---------------------------------------------------------------------------
+
+using core::control::LocalValue;
+
+static PresentContext readyLocal(double v) {
+    PresentContext c = ready();
+    c.local = LocalValue{v, true};
+    return c;
+}
+
+static void test_local_brightness() {
+    core::ha::EntityState e = ent("on");
+    e.attrs.brightness = 255;
+    ControlView v = present(ctl("brightness"), &e, readyLocal(65));
+    ASSERT_STR("65", v.value);
+    ASSERT_STR("%", v.unit);
+    TEST_ASSERT_EQUAL_FLOAT(65, v.arcValue);
+    TEST_ASSERT_TRUE(v.unconfirmed);
+    TEST_ASSERT_FALSE(v.dimmed);
+    ASSERT_STR("on", v.stateText);
+    v = present(ctl("brightness"), &e, ready());
+    TEST_ASSERT_FALSE(v.unconfirmed);
+}
+
+static void test_local_climate_keeps_state_line() {
+    core::ha::EntityState e = ent("heat");
+    e.attrs.temperature = 20;
+    e.attrs.currentTemperature = 21;
+    ControlView v = present(ctl("target_temp", "climate.c", "", 0.5), &e, readyLocal(22));
+    ASSERT_STR("22.0", v.value);
+    ASSERT_STR(DEG, v.unit);
+    ASSERT_STR("heat, now 21.0" DEG, v.stateText);
+    TEST_ASSERT_TRUE(v.unconfirmed);
+    TEST_ASSERT_FALSE(v.dimmed);
+}
+
+static void test_local_volume_keeps_muted() {
+    core::ha::EntityState e = ent("playing");
+    e.attrs.volumeLevel = 0.1;
+    e.attrs.isVolumeMuted = true;
+    ControlView v = present(ctl("volume", "media_player.m"), &e, readyLocal(42));
+    ASSERT_STR("42", v.value);
+    ASSERT_STR("%", v.unit);
+    ASSERT_STR("playing, muted", v.stateText);
+    TEST_ASSERT_TRUE(v.unconfirmed);
+}
+
+static void test_local_kelvin() {
+    core::ha::EntityState e = ent("on");
+    e.attrs.colorTempKelvin = 4000;
+    ControlView v = present(ctl("color_temp"), &e, readyLocal(2800));
+    ASSERT_STR("2800", v.value);
+    ASSERT_STR("K", v.unit);
+    TEST_ASSERT_EQUAL_FLOAT(2800, v.arcValue);
+}
+
+static void test_local_position() {
+    core::ha::EntityState e = ent("open");
+    e.attrs.currentPosition = 10;
+    ControlView v = present(ctl("position", "cover.c"), &e, readyLocal(80));
+    ASSERT_STR("80", v.value);
+    ASSERT_STR("%", v.unit);
+}
+
+static void test_local_fan_floored() {
+    core::ha::EntityState e = ent("on");
+    e.attrs.percentage = 10;
+    ControlView v = present(ctl("percentage", "fan.f"), &e, readyLocal(66.6666667));
+    ASSERT_STR("66", v.value);
+    TEST_ASSERT_EQUAL_FLOAT(66, v.arcValue);
+    v = present(ctl("percentage", "fan.f"), &e, readyLocal(99.9999999));
+    ASSERT_STR("100", v.value);
+    TEST_ASSERT_EQUAL_FLOAT(100, v.arcValue);
+    v = present(ctl("percentage", "fan.f"), &e, readyLocal(33.3333333));
+    ASSERT_STR("33", v.value);
+    v = present(ctl("percentage", "fan.f"), &e, readyLocal(0));
+    ASSERT_STR("0", v.value);
+}
+
+static void test_fan_off_without_percentage() {
+    core::ha::EntityState off = ent("off");
+    ControlView v = present(ctl("percentage", "fan.f"), &off, ready());
+    ASSERT_STR("0", v.value);
+    ASSERT_STR("%", v.unit);
+    core::ha::EntityState on = ent("on");
+    v = present(ctl("percentage", "fan.f"), &on, ready());
+    ASSERT_STR("--", v.value);
+    ASSERT_STR("", v.unit);
+}
+
+static void test_local_unavailable_ready_not_dimmed() {
+    core::ha::EntityState e = ent("unavailable");
+    ControlView v = present(ctl("brightness"), &e, readyLocal(30));
+    TEST_ASSERT_FALSE(v.dimmed);
+    ASSERT_STR("unavailable", v.stateText);
+    ASSERT_STR("30", v.value);
+    TEST_ASSERT_TRUE(v.unconfirmed);
+}
+
+static void test_local_not_ready_dimmed_offline() {
+    core::ha::EntityState e = ent("on");
+    PresentContext c = readyLocal(40);
+    c.haReady = false;
+    ControlView v = present(ctl("brightness"), &e, c);
+    TEST_ASSERT_TRUE(v.dimmed);
+    ASSERT_STR("HA offline", v.stateText);
+    ASSERT_STR("40", v.value);
+    TEST_ASSERT_TRUE(v.unconfirmed);
+}
+
+static void test_local_ignored_for_none_and_missing_entity() {
+    core::ha::EntityState e = ent("on");
+    ControlView v = present(ctl("none", "switch.s"), &e, readyLocal(50));
+    TEST_ASSERT_FALSE(v.unconfirmed);
+    ASSERT_STR("on", v.value);
+    TEST_ASSERT_FALSE(v.hasArc);
+    v = present(ctl("brightness"), nullptr, readyLocal(50));
+    TEST_ASSERT_FALSE(v.unconfirmed);
+    ASSERT_STR("--", v.value);
+    ASSERT_STR("not found", v.stateText);
+    PresentContext c = readyLocal(50);
+    c.snapshotSeen = false;
+    c.msSinceSubscribe = 0;
+    v = present(ctl("brightness"), nullptr, c);
+    ASSERT_STR("waiting...", v.stateText);
+    TEST_ASSERT_FALSE(v.unconfirmed);
+}
+
+static void test_local_nan_shows_dashes() {
+    core::ha::EntityState e = ent("on");
+    e.attrs.brightness = 100;
+    ControlView v = present(ctl("brightness"), &e, readyLocal(std::nan("")));
+    ASSERT_STR("--", v.value);
+    ASSERT_STR("", v.unit);
+}
+
+static void test_hue_to_rgb() {
+    using core::presenter::hueToRgb;
+    TEST_ASSERT_EQUAL_HEX32(0xFF0000, hueToRgb(0));
+    TEST_ASSERT_EQUAL_HEX32(0x00FF00, hueToRgb(120));
+    TEST_ASSERT_EQUAL_HEX32(0x0000FF, hueToRgb(240));
+    TEST_ASSERT_EQUAL_HEX32(0xFFFF00, hueToRgb(60));
+    TEST_ASSERT_EQUAL_HEX32(0x00FFFF, hueToRgb(180));
+    TEST_ASSERT_EQUAL_HEX32(0xFF00FF, hueToRgb(300));
+    TEST_ASSERT_EQUAL_HEX32(0xFF8000, hueToRgb(30));
+    const uint32_t near360 = hueToRgb(359.6);
+    TEST_ASSERT_EQUAL_HEX32(0xFF0000, near360 & 0xFF0000);
+    TEST_ASSERT_EQUAL_HEX32(0, near360 & 0x00FF00);
+    TEST_ASSERT_TRUE((near360 & 0xFF) > 0 && (near360 & 0xFF) < 0x10);
+    TEST_ASSERT_EQUAL_HEX32(0x0000FF, hueToRgb(-120));
+    TEST_ASSERT_EQUAL_HEX32(0xFF0000, hueToRgb(720));
+    TEST_ASSERT_EQUAL_HEX32(0xFF0000, hueToRgb(-1e-20));
+    TEST_ASSERT_EQUAL_HEX32(0xFF0000, hueToRgb(std::nan("")));
+    TEST_ASSERT_EQUAL_HEX32(0xFF0000, hueToRgb(INFINITY));
+    TEST_ASSERT_EQUAL_HEX32(0xFF0000, hueToRgb(-INFINITY));
+}
+
+static void test_arc_rgb_in_present() {
+    core::ha::EntityState e = ent("on");
+    e.attrs.hue = 120;
+    ControlView v = present(ctl("hue"), &e, ready());
+    TEST_ASSERT_TRUE(v.arcRgb.has_value());
+    TEST_ASSERT_EQUAL_HEX32(0x00FF00, *v.arcRgb);
+    v = present(ctl("hue"), &e, readyLocal(240));
+    TEST_ASSERT_TRUE(v.arcRgb.has_value());
+    TEST_ASSERT_EQUAL_HEX32(0x0000FF, *v.arcRgb);
+    ASSERT_STR("240", v.value);
+    TEST_ASSERT_TRUE(v.unconfirmed);
+    core::ha::EntityState none = ent("on");  // absent hue
+    v = present(ctl("hue"), &none, ready());
+    TEST_ASSERT_FALSE(v.arcRgb.has_value());
+    e.attrs.brightness = 100;  // other actions
+    v = present(ctl("brightness"), &e, ready());
+    TEST_ASSERT_FALSE(v.arcRgb.has_value());
+    v = present(ctl("none"), &e, ready());
+    TEST_ASSERT_FALSE(v.arcRgb.has_value());
+    v = present(ctl("hue"), nullptr, ready());
+    TEST_ASSERT_FALSE(v.arcRgb.has_value());
+}
+
+static void test_hue_359_6_text_stays_360() {
+    core::ha::EntityState e = ent("on");
+    e.attrs.hue = 359.6;
+    ControlView v = present(ctl("hue"), &e, ready());
+    ASSERT_STR("360", v.value);
+    TEST_ASSERT_TRUE(v.arcRgb.has_value());
+}
+
+static void test_view_equality_sees_new_fields() {
+    core::ha::EntityState e = ent("on");
+    e.attrs.hue = 120;
+    ControlView a = present(ctl("hue"), &e, ready());
+    ControlView b = a;
+    TEST_ASSERT_TRUE(a == b);
+    b.unconfirmed = !a.unconfirmed;
+    TEST_ASSERT_TRUE(a != b);
+    b = a;
+    b.arcRgb = 0x123456;
+    TEST_ASSERT_TRUE(a != b);
+    b.arcRgb.reset();
+    TEST_ASSERT_TRUE(a != b);
+}
+
+static void test_title_for_fallbacks() {
+    using core::presenter::titleFor;
+    core::ha::EntityState e = ent("on");
+    e.attrs.friendlyName.assign("Lamp");
+    ASSERT_STR("Mine", titleFor(ctl("brightness", "light.x", "Mine"), &e));
+    ASSERT_STR("Lamp", titleFor(ctl("brightness", "light.x"), &e));
+    core::ha::EntityState bare = ent("on");
+    ASSERT_STR("light.x", titleFor(ctl("brightness", "light.x"), &bare));
+    ASSERT_STR("light.x", titleFor(ctl("brightness", "light.x"), nullptr));
+    ASSERT_STR("Mine", titleFor(ctl("brightness", "light.x", "Mine"), nullptr));
+}
+
+static void test_percentage_helper_same_in_call_and_view() {
+    namespace da = core::domain_actions;
+    const da::DomainSpec *fan = da::findDomain("fan");
+    TEST_ASSERT_NOT_NULL(fan);
+    const da::ActionSpec *act = da::findAction(*fan, "percentage");
+    TEST_ASSERT_NOT_NULL(act);
+    core::ha::EntityState e = ent("on");
+    e.attrs.percentage = 10;
+    const double values[] = {0, 33.3333333, 50, 66.6666667, 99.9999999, 100};
+    for (double val : values) {
+        da::CallBuild b = da::encoderCall(*fan, *act, "fan.f", val, &e);
+        TEST_ASSERT_TRUE(b.call.has_value());
+        const int sent = b.call->data["percentage"].as<int>();
+        ControlView v = present(ctl("percentage", "fan.f"), &e, readyLocal(val));
+        TEST_ASSERT_EQUAL_STRING(std::to_string(sent).c_str(), v.value.c_str());
+    }
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_brightness);
@@ -519,5 +757,22 @@ int main() {
     RUN_TEST(test_percent_to_byte_rounding);
     RUN_TEST(test_percent_to_byte_monotonic);
     RUN_TEST(test_percent_to_byte_clamps_out_of_range);
+    RUN_TEST(test_local_brightness);
+    RUN_TEST(test_local_climate_keeps_state_line);
+    RUN_TEST(test_local_volume_keeps_muted);
+    RUN_TEST(test_local_kelvin);
+    RUN_TEST(test_local_position);
+    RUN_TEST(test_local_fan_floored);
+    RUN_TEST(test_fan_off_without_percentage);
+    RUN_TEST(test_local_unavailable_ready_not_dimmed);
+    RUN_TEST(test_local_not_ready_dimmed_offline);
+    RUN_TEST(test_local_ignored_for_none_and_missing_entity);
+    RUN_TEST(test_local_nan_shows_dashes);
+    RUN_TEST(test_hue_to_rgb);
+    RUN_TEST(test_arc_rgb_in_present);
+    RUN_TEST(test_hue_359_6_text_stays_360);
+    RUN_TEST(test_view_equality_sees_new_fields);
+    RUN_TEST(test_title_for_fallbacks);
+    RUN_TEST(test_percentage_helper_same_in_call_and_view);
     return UNITY_END();
 }
