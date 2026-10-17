@@ -58,6 +58,23 @@ Step 6.6 option
   --stdin-commands    read commands from stdin, one per line: "rst" aborts every open connection
                       with a TCP RST (SO_LINGER 0), "wsclose" sends a ws Close frame (1001) on
                       every open connection (used to race a refresh against a dropping HA)
+Step 7.6 call_service options (every call is logged "CALL id=<n> <domain>.<service> entity=<e>
+data=<json>"; the default answer is HA's success result with a context)
+  --call-log FILE     append one JSON line per call: time, n (running count), id, domain,
+                      service, entity, data
+  --call-delay S      answer each call after S seconds
+  --call-error CODE:MSG  answer with success=false, error {code, message} (every call, or only
+                      every Nth with --call-error-every N)
+  --call-silent       never answer calls
+  --call-close-after N  drop the connection (no answer) when the Nth call (count over the whole
+                      mock run) arrives
+  --call-apply        update the fixture entity from the call and send a "c" diff to the
+                      subscriptions containing it after --echo-delay S (default 0.2); skipped
+                      for error replies. Handles turn_on (brightness_pct, hs_color,
+                      color_temp_kelvin), turn_off, toggle, set_temperature, set_cover_position,
+                      set_percentage, volume_set, volume_mute, media_play_pause
+  --echo-stale        first send the previous value of the changed attributes, then the new one
+                      --echo-stale-gap S (default 0.5) later
 Logs: "RX get_states", "SENT states <bytes> in <s>", "SENT c-diff", "RX unsubscribe_events".
 It answers subscribe_entities with a success result (and, with a fixture, an "a" event). The access token is never printed (only
 its length).
@@ -167,6 +184,68 @@ def make_states(count, total_bytes):
     return out
 
 
+CALL_LOCK = threading.Lock()   # guards CALL_COUNT, the call log file and entity mutation
+CALL_COUNT = [0]
+
+
+def _find(states, eid):
+    for e in states or []:
+        if e["entity_id"] == eid:
+            return e
+    return None
+
+
+def apply_call(states, domain, service, eid, data):
+    """Applies a call_service to the mock entity (--call-apply). Returns (old, new) dicts of
+    {"s": state, "a": {changed attrs}} or None when nothing changed / unknown entity."""
+    e = _find(states, eid)
+    if e is None:
+        return None
+    a = e["attributes"]
+    old = {"s": e["state"], "a": {}}
+    new = {"s": e["state"], "a": {}}
+
+    def setattr_(k, v):
+        old["a"][k] = a.get(k)
+        new["a"][k] = v
+        a[k] = v
+
+    st = e["state"]
+    if service == "turn_on":
+        new["s"] = "heat" if domain == "climate" else ("playing" if domain == "media_player" else "on")
+        if "brightness_pct" in data:
+            setattr_("brightness", int(data["brightness_pct"] * 255 / 100 + 0.5))
+        if "hs_color" in data:
+            setattr_("hs_color", list(data["hs_color"]))
+        if "color_temp_kelvin" in data:
+            setattr_("color_temp_kelvin", data["color_temp_kelvin"])
+    elif service == "turn_off":
+        new["s"] = "off"
+    elif service == "toggle":
+        if domain == "cover":
+            new["s"] = "closed" if st in ("open", "opening") else "open"
+        elif domain == "media_player":
+            new["s"] = "off" if st != "off" else "on"
+        else:
+            new["s"] = "off" if st == "on" else "on"
+    elif service == "set_temperature":
+        setattr_("temperature", data.get("temperature"))
+    elif service == "set_cover_position":
+        setattr_("current_position", data.get("position"))
+    elif service == "set_percentage":
+        p = data.get("percentage")
+        setattr_("percentage", p)
+        new["s"] = "off" if p == 0 else "on"
+    elif service == "volume_set":
+        setattr_("volume_level", data.get("volume_level"))
+    elif service == "volume_mute":
+        setattr_("is_volume_muted", data.get("is_volume_muted"))
+    elif service == "media_play_pause":
+        new["s"] = "paused" if st == "playing" else "playing"
+    e["state"] = new["s"]
+    return old, new
+
+
 def load_states(args):
     if args.states_file:
         with open(args.states_file, encoding="utf-8") as f:
@@ -233,6 +312,55 @@ def handle(c, addr, args):
             log(f"SENT states {n} bytes in {time.time()-ts:.2f}s")
         except OSError as e:
             log("states send aborted:", e)
+
+    def send_diff(eid, part):
+        """Sends a "c" diff for eid to this connection's subscriptions that contain it."""
+        diff = {"+": {"a": part["a"], "lc": time.time()}}
+        diff["+"]["s"] = part["s"]
+        for sid, ids in list(subs.items()):
+            if eid in ids:
+                send(text({"id": sid, "type": "event", "event": {"c": {eid: diff}}}))
+                log(f"SENT c-diff sid={sid} {eid} state={part['s']} attrs={json.dumps(part['a'], separators=(',', ':'))}")
+
+    def answer_call(msg, n, domain, service, eid, data):
+        try:
+            if args.call_delay:
+                time.sleep(args.call_delay)
+            err = None
+            if args.call_error:
+                every = args.call_error_every or 1
+                if n % every == 0:
+                    err = args.call_error.split(":", 1)
+                    err = {"code": err[0], "message": err[1] if len(err) > 1 else ""}
+            if err is None and args.call_apply:
+                with CALL_LOCK:
+                    res = apply_call(states, domain, service, eid, data or {})
+                if res is not None:
+                    old, new = res
+                    threading.Thread(target=echo, args=(eid, old, new), daemon=True).start()
+            if args.call_silent:
+                log(f"call {n}: not answering")
+                return
+            if err:
+                send(text({"id": msg["id"], "type": "result", "success": False, "error": err}))
+                log(f"SENT call {n} error {err['code']}")
+            else:
+                send(text({"id": msg["id"], "type": "result", "success": True,
+                           "result": {"context": {"id": "01MOCK%d" % n, "parent_id": None, "user_id": None},
+                                      "response": None}}))
+                log(f"SENT call {n} ok")
+        except OSError as e:
+            log("call answer aborted:", e)
+
+    def echo(eid, old, new):
+        try:
+            time.sleep(args.echo_delay)
+            if args.echo_stale and old["a"]:
+                send_diff(eid, {"s": old["s"], "a": old["a"]})
+                time.sleep(args.echo_stale_gap)
+            send_diff(eid, new)
+        except OSError as e:
+            log("echo aborted:", e)
 
     def rm_add_loop(sid, entity):
         eid = entity["entity_id"]
@@ -401,6 +529,26 @@ def handle(c, addr, args):
             send(text({"id": msg["id"], "type": "result", "success": True, "result": None}))
         elif t == "get_states":
             threading.Thread(target=send_states, args=(msg["id"],), daemon=True).start()
+        elif t == "call_service":
+            domain, service = msg.get("domain"), msg.get("service")
+            eid = (msg.get("target") or {}).get("entity_id")
+            data = msg.get("service_data")
+            with CALL_LOCK:
+                CALL_COUNT[0] += 1
+                n = CALL_COUNT[0]
+                log(f"CALL id={msg.get('id')} {domain}.{service} entity={eid} "
+                    f"data={json.dumps(data, separators=(',', ':'))}")
+                if args.call_log:
+                    with open(args.call_log, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"time": time.time(), "n": n, "id": msg.get("id"),
+                                            "domain": domain, "service": service, "entity": eid,
+                                            "data": data}, separators=(",", ":")) + "\n")
+            if args.call_close_after and n == args.call_close_after:
+                log(f"CLOSE after call {n}")
+                c.shutdown(socket.SHUT_RDWR)
+                return
+            threading.Thread(target=answer_call, args=(msg, n, domain, service, eid, data),
+                             daemon=True).start()
         elif t == "ping":
             if args.no_pong:
                 log("not answering ping")
@@ -503,6 +651,16 @@ def main():
     ap.add_argument("--rm-add-every", type=float, default=0.0, metavar="S")
     ap.add_argument("--stdin-commands", action="store_true")
     ap.add_argument("--deep-result", type=int, nargs="+", default=[], metavar="N")
+    ap.add_argument("--call-log", default=None, metavar="FILE")
+    ap.add_argument("--call-delay", type=float, default=0.0, metavar="S")
+    ap.add_argument("--call-error", default=None, metavar="CODE:MSG")
+    ap.add_argument("--call-error-every", type=int, default=0, metavar="N")
+    ap.add_argument("--call-silent", action="store_true")
+    ap.add_argument("--call-close-after", type=int, default=0, metavar="N")
+    ap.add_argument("--call-apply", action="store_true")
+    ap.add_argument("--echo-delay", type=float, default=0.2, metavar="S")
+    ap.add_argument("--echo-stale", action="store_true")
+    ap.add_argument("--echo-stale-gap", type=float, default=0.5, metavar="S")
     args = ap.parse_args()
     args.states_list = load_states(args)
     ctx = None

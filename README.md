@@ -4,12 +4,12 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.6.1, Step 6.8 (control screens with live entity state, entity picker in the web UI).** The firmware
+**Status: v0.7.0, Step 7.6 (knob and button control Home Assistant entities).** The firmware
 drives the hardware (display, touch swipes, encoder, button, buzzer), loads its configuration
 from NVS, joins Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home
 Assistant, controls and device settings, keeps an authenticated, self-healing WebSocket
-connection to Home Assistant and shows the configured controls' entities live on read-only
-control screens (see "Screens"). Encoder control of entities comes in Step 7.
+connection to Home Assistant, shows the configured controls' entities live on control
+screens (see "Screens") and changes them with the knob and the button (see "Control").
 
 ## First-time setup
 
@@ -68,6 +68,7 @@ the upload command.
 | Serial monitor | `pio device monitor` |
 | Host unit tests | `pio test -e native` |
 | Serial assertions | see below |
+| Test build (serial test input, never for normal use) | `pio run -e t-encoder-pro-test [-t upload]` (see Test input) |
 | Regenerate fonts | `sh tools/gen_fonts.sh` (see Fonts) |
 
 ### Serial check
@@ -95,6 +96,22 @@ The ESP32-S3 USB serial drops everything printed before the PC has re-enumerated
 so the one-time `BOOT` line is often missed. The `HB` heartbeat line repeats the key facts
 every 5 seconds.
 
+### Test input
+
+The env `t-encoder-pro-test` is the normal firmware built with `-DHAKNOB_TEST_INPUT`. It
+reads lines from the serial port (non-blocking, at most 40 characters; longer lines are
+dropped) and injects them like the real input, so device tests can be automated:
+
+| Line | Same as |
+|---|---|
+| `TIN rot <+n\|-n>` | n encoder detents (1..100) in this loop pass's batch (`encoder_reverse` and acceleration apply) |
+| `TIN short` / `TIN long` | a short / long button press (no `BTN down`, so no click) |
+| `TIN swipe left` / `TIN swipe right` | a swipe |
+
+Each accepted line is logged as `TIN <cmd>`, anything else after `TIN ` as `TIN bad <cmd>`.
+The normal build contains none of it (`xtensa-esp32s3-elf-strings firmware.elf | grep -w TIN`
+finds no `TIN` word).
+
 ### Serial log lines
 
 ```
@@ -106,7 +123,7 @@ CFG saved controls=<n> bytes=<n> cfg_written=<0|1>   cfg_written=0: only secrets
 CFG unchanged                            accepted patch that changes nothing (nothing written)
 CFG secrets wifi_pw_set=<0|1> ha_token_set=<0|1> web_pw_set=<0|1> ap_pw_set=<0|1>[ token_set len=<n>]
 CFG factory reset ok=<0|1>
-ENC d=<+1|-1> count=<n>                  one line per detent, clockwise = +1
+ENC d=<+1|-1> count=<n>                  one line per detent, clockwise = +1 (-1 with encoder_reverse)
 BTN down                                 debounced press (the buzzer clicks)
 BTN up + BTN short                       release before 600 ms
 BTN long                                 held 600 ms (fired while held; no "short" after it)
@@ -114,7 +131,14 @@ BTN verylong                             held 10 s
 BTN up                                   release after long / verylong
 TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
 UI page=<i>/<n> | no_controls | status   page shown after a swipe / long press
-UI view page=<i>/<n> value=<v><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1> title=<t>   the shown control page changed
+UI view page=<i>/<n> value=<v><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1> unconfirmed=<0|1> title=<t>   the shown control page changed (unconfirmed=1: a turned value HA has not confirmed yet)
+UI toast text=<t>                        a control notice shown to the user (Step 7.6: logged only)
+CTL press page=<i> press=<press>         short press on control page i
+CTL notice=<kind> page=<i> text=<t>      ha_offline / not_found / unavailable / no_value / busy / failed / timeout
+HA call id=<n> <domain>.<service> entity=<id> data=<json>   a service call sent
+HA call ok id=<n> ms=<rtt> | HA call failed id=<n> error=<code>: <message> | HA call timeout id=<n>
+HA calls dropped n=<k> reason=connection_lost   unanswered calls when the connection ended
+TIN <cmd> | TIN bad <cmd>                test build only (see Test input)
 HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes> loopmax=<ms> ent=<n>/<ids> cat=<state> stack=<bytes> psram_free=<bytes>   every 5 s
 WIFI ap ssid=<HA-Knob-XXXX> ip=192.168.4.1   setup access point up
 WIFI ap off                              setup access point shut down
@@ -528,14 +552,15 @@ followed by the **Status page** (Wi-Fi, web UI addresses, HA state, encoder coun
 input). The **setup screen** replaces them while the setup access point is up and the
 station is not connected.
 
-| Input | Step 6 behaviour |
+| Input | Behaviour |
 |---|---|
-| Swipe left / long press | Next page (wrapping) |
+| Swipe left / long press | Next page (wrapping; the long press opens a Select list from Step 7.8) |
 | Swipe right | Previous page (wrapping) |
-| Short press, rotation | Nothing yet (shown on the Status page); encoder control comes in Step 7 |
+| Rotation | Control page: changes the value (see Control); Status page: the encoder count |
+| Short press | Control page: the control's press action (see Control) |
 | Tap | Never does anything |
 
-A control page is read-only: the title (label, else HA's `friendly_name`, else the entity
+A control page shows the title (label, else HA's `friendly_name`, else the entity
 id), a 270° arc for the value, the value with its unit, a state line and the page
 indicator `i/N` (of the controls). Values: brightness in % (0 % when the light is off),
 hue in °, colour temperature in K, target temperature in the control's step (state line
@@ -547,6 +572,42 @@ or `unknown`, or the entity missing ("waiting..." until the subscription's first
 snapshot arrives or for 3 s, then "not found"). A page stays selected across a config
 change while its number still exists, otherwise the first page is shown.
 
+## Control
+
+Turning the knob on a control page changes its value, a short press runs its press action,
+both as Home Assistant `call_service` calls on the WebSocket (`plan-step7.md`):
+
+| Action | Call per turn |
+|---|---|
+| brightness | `light.turn_on {brightness_pct}`; 0 % = `light.turn_off` |
+| hue | `light.turn_on {hs_color: [hue, saturation or 100]}` (wraps at 360°) |
+| color_temp | `light.turn_on {color_temp_kelvin}` (the light's min / max, else 2000-6500 K) |
+| target_temp | `climate.set_temperature {temperature}` (min_temp / max_temp, else 7-35°) |
+| position | `cover.set_cover_position {position}` |
+| percentage | `fan.set_percentage {percentage}` (steps of HA's speed size) |
+| volume | `media_player.volume_set {volume_level}` |
+
+Presses: `toggle` = `<domain>.toggle` (climate: `turn_on` when off, else `turn_off`),
+`stop` = `cover.stop_cover`, `play_pause` = `media_player.media_play_pause`, `mute` =
+`media_player.volume_mute` (flips). Presses are not optimistic: the page waits for HA.
+
+- Each detent moves one step (the control's `step`) on the step grid, clamped to the
+  range; with `device.accel` detents less than 40 ms apart count x4, less than 80 ms x2
+  (the detents of one loop pass are spread evenly over the time since the previous pass).
+  `device.encoder_reverse` flips the direction.
+- The value on screen follows the knob at once and stays (HA's own updates are not
+  shown) while a value is unsent or unanswered and for 1.5 s after the last turn; then HA's
+  value is shown again. A failed call ends this at once.
+- Per control at most one call per `device.send_interval_ms` (the first at once, then the
+  latest value; the final value is always sent, an unchanged value is not re-sent within one hold); at most
+  8 unanswered calls overall. A call without an answer for 10 s counts as failed.
+- HA not connected: turns and presses do nothing (notice "HA offline", at most every 2 s);
+  values not yet sent are dropped, never sent after a reconnect.
+- Notices (HA's error message, "No answer from HA", "Entity not found", "Unavailable",
+  "No value to change", "Busy, try again") are logged as `CTL notice=`; the on-screen
+  toast and the error beep follow in Step 7.7.
+- Some lights restore their previous level when turned on from 0 %; accepted.
+
 ## Input handling
 
 | Input | Rule |
@@ -554,7 +615,7 @@ change while its number still exists, otherwise the first page is shown.
 | Encoder | One count per detent, counted on arrival at a rest state (00/11); bounce, half-turns back and invalid jumps never count |
 | Button | 30 ms debounce; short press < 600 ms (on release); long press at 600 ms (once, while held); very long press at 10 s |
 | Swipe | Horizontal travel >= 80 px, finger down for <= 700 ms, and \|dx\| >= 2 x \|dy\| |
-| Acceleration (used from Step 7) | Detents < 40 ms apart x4, < 80 ms x2, else x1 |
+| Acceleration (`device.accel`) | Detents < 40 ms apart x4, < 80 ms x2, else x1 (per loop-pass batch) |
 
 ## Fonts
 
@@ -610,6 +671,7 @@ All versions are pinned exactly in `platformio.ini`.
 | `ESP32Async/AsyncTCP` | 3.5.0 | TCP layer of the web server; maintained fork, core 2.x compatible |
 | `ESP32Async/ESPAsyncWebServer` | 3.12.1 | Web server (middleware, static files); maintained fork, core 2.x compatible. PlatformIO prints "Ignored `Hash` dependency": that dependency is for ESP8266 only |
 | `throwtheswitch/Unity` | 2.6.1 | Host test framework (native env); pinned to the version PlatformIO resolved |
+| `lv_font_conv` (npx, font generation only) | 1.5.3 | See Fonts; source fonts from LVGL 9.2.2's `scripts/built_in_font/` |
 
 `links2004/WebSockets` 2.7.3 (Step 5) was removed in v0.5.1 (Step 5b.2): it read every frame
 in one blocking loop into an unguarded 15 KB-limited buffer, would silently fall back to an

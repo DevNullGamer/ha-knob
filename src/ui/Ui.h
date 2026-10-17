@@ -53,10 +53,18 @@ bool nextPage();
 bool previousPage();
 // Index of the selected control page; -1 for the Status and the NoControls page.
 int controlPage();
+// True while the pages take input (not the boot or the setup screen); rotation and presses
+// act on a control page only then.
+bool pagesActive();
 // True while the Status page is selected.
 bool statusPage();
 // Shows the view of the selected control page (call when controlPage() >= 0).
 void showControl(const core::presenter::ControlView &view);
+
+// A short message over every screen (control notices, plan-step7.md Q7-6); a new toast
+// replaces the old one. Ignored before begin(). Step 7.6: a stub that only logs
+// `UI toast text=<t>`; the overlay comes in Step 7.7.
+void showToast(const std::string &text, uint32_t nowMs);
 
 void showNetwork(const NetworkView &view);
 void showHa(const HaView &view);

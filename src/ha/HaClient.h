@@ -38,6 +38,9 @@
 //   HA catalog done total=<n> supported=<n> skipped=<n> build_ms=<n> json=<bytes> json_ms=<n>
 //                   json_passes=<n> json_slice_max_ms=<n> json_regrow=<n>   (one line)
 //   HA catalog failed error=<e>
+//   HA call id=<n> <domain>.<service> entity=<id> data=<json>   (session, plan-step7.md §3.3)
+//   HA call ok id=<n> ms=<rtt> | HA call failed id=<n> error=<code>: <message>
+//   HA call timeout id=<n> | HA calls dropped n=<k> reason=connection_lost
 //   HA connect / dns / tcp / tls / socket / rx / frame ...   transport (src/ha/WsTransport.h)
 namespace ha {
 
@@ -71,6 +74,14 @@ void retry(uint32_t nowMs);
 // is kept); a started fetch drops the previous catalog. False when HA is not Ready or
 // the send failed.
 bool requestStates(uint32_t nowMs);
+
+// Service calls (plan-step7.md §3.6): sends call_service (HaSession::callService with
+// millis(), Ready only) and returns its message id, or 0 when nothing was sent (no result
+// follows). Every sent call ends in exactly one CallResult carrying `tag`; drain
+// takeCallResults() every loop pass (results arise in loop(), configure(), setNetworkUp()
+// and callService() itself: a send failure ends the other pending calls).
+uint32_t callService(const core::domain_actions::ServiceCall &call, uint32_t tag);
+std::vector<core::ha::CallResult> takeCallResults();
 
 // Drives the socket and the session timers, takes a finished catalog and writes one slice
 // of its JSON. Reads millis() itself (a TCP connect can block inside).

@@ -3,7 +3,7 @@
 // Serial log lines:
 //   BOOT fw=<v> psram=<bytes> flash=<bytes> touch=<CST816|CHSC5816|none> heap=<bytes>
 //        cfg=<defaults|loaded>
-//   ENC d=<+1|-1> count=<n>
+//   ENC d=<+1|-1> count=<n>     (after device.encoder_reverse)
 //   BTN down | up | short | long | verylong
 //   TOUCH swipe=<left|right>
 //   HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<..>
@@ -22,7 +22,10 @@
 //   HA ...    Home Assistant connection events (see src/ha/HaClient.h)
 //   UI page=<i>/<n> | no_controls | status        page changed (swipe / long press)
 //   UI view page=<i>/<n> value=<value><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1>
-//           title=<t>   (one line) the selected control page shows something new
+//           unconfirmed=<0|1> title=<t>   (one line) the selected control page shows something new
+//   UI toast text=<t>                             a control notice (src/ui/Ui.h)
+//   CTL ...   control presses and notices (see src/app/Control.h)
+//   TIN <cmd> | TIN bad <cmd>   test builds only (-DHAKNOB_TEST_INPUT): injected input
 //   SYS reboot | SYS factory reset
 
 #include <Arduino.h>
@@ -33,9 +36,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
+#include "app/Control.h"
 #include "config/ConfigStore.h"
 #include "ha/HaClient.h"
 #include "hal/Button.h"
@@ -47,6 +52,7 @@
 #include "net/WifiManager.h"
 #include "ui/Ui.h"
 #include "util/Log.h"
+#include "util/Text.h"
 #include "version.h"
 
 namespace {
@@ -81,16 +87,19 @@ bool entityCountsPublished = false;
 // page was last built from (rebuilt only when one of these changes).
 std::vector<core::config::Control> controls;
 uint32_t controlsGeneration = 0;  // +1 whenever `controls` is replaced
+bool encoderReverse = false;      // device.encoder_reverse
 struct ViewKey {
     int page = -1;
     uint32_t controlsGeneration = 0;
     uint32_t storeVersion = 0;
     core::ha::State haState = core::ha::State::NoConfig;
     bool waitOver = false;
+    uint32_t controlVersion = 0;  // app::control::version(): a local value can have changed
 
     bool operator==(const ViewKey &o) const {
         return page == o.page && controlsGeneration == o.controlsGeneration &&
-               storeVersion == o.storeVersion && haState == o.haState && waitOver == o.waitOver;
+               storeVersion == o.storeVersion && haState == o.haState && waitOver == o.waitOver &&
+               controlVersion == o.controlVersion;
     }
 };
 ViewKey shownViewKey;
@@ -170,8 +179,11 @@ std::vector<std::string> controlEntityIds(const core::config::Config &config) {
     return ids;
 }
 
-// Takes the configured controls for the pages (after boot and after every config re-read).
+// Takes the configured controls for the pages and the control settings (after boot and
+// after every config re-read).
 void applyControls(const core::config::Config &config) {
+    encoderReverse = config.device.encoderReverse;
+    app::control::applyConfig(config.device, config.controls);
     if (config.controls == controls && controlsGeneration != 0) {
         return;
     }
@@ -180,26 +192,6 @@ void applyControls(const core::config::Config &config) {
     if (displayOk) {
         ui::setControlCount(controls.size());
     }
-}
-
-// HA-supplied text for a log line: control characters become '?', cut to at most maxBytes
-// on a UTF-8 character boundary.
-std::string logText(const std::string &text, size_t maxBytes) {
-    size_t length = text.size();
-    if (length > maxBytes) {
-        length = maxBytes;
-        while (length > 0 && (static_cast<unsigned char>(text[length]) & 0xC0) == 0x80) {
-            --length;  // text[length] continues a character: cut before that character
-        }
-    }
-    std::string out = text.substr(0, length);
-    for (char &c : out) {
-        const unsigned char u = static_cast<unsigned char>(c);
-        if (u < 0x20 || u == 0x7F) {
-            c = '?';
-        }
-    }
-    return out;
 }
 
 // Logs the selected page after a swipe / long press changed it.
@@ -213,7 +205,8 @@ void logPage() {
 }
 
 // Builds the view of the selected control page when the store, the controls, the HA state,
-// the page or the "waiting..." timer changed, and hands it to the screen.
+// the page, the "waiting..." timer or a local (turned) value changed, and hands it to the
+// screen.
 void publishControlView(uint32_t nowMs) {
     if (!displayOk) {
         return;
@@ -232,6 +225,7 @@ void publishControlView(uint32_t nowMs) {
     key.storeVersion = store.version();
     key.haState = haState;
     key.waitOver = core::presenter::waitOver(context);
+    key.controlVersion = app::control::version();
     if (viewBuilt && key == shownViewKey) {
         return;
     }
@@ -243,6 +237,7 @@ void publishControlView(uint32_t nowMs) {
     }
 
     const core::config::Control &control = controls[static_cast<size_t>(key.page)];
+    context.local = app::control::local(static_cast<size_t>(key.page), nowMs);
     const core::presenter::ControlView view =
         core::presenter::present(control, store.find(control.entityId), context);
     ui::showControl(view);
@@ -251,11 +246,12 @@ void publishControlView(uint32_t nowMs) {
         if (view.hasArc) {
             snprintf(arc, sizeof(arc), "%g[%g,%g]", view.arcValue, view.arcMin, view.arcMax);
         }
-        util::logPrintf("UI view page=%d/%u value=%s%s state=%s arc=%s dimmed=%d title=%s\n",
+        using core::util::logSafe;
+        util::logPrintf("UI view page=%d/%u value=%s%s state=%s arc=%s dimmed=%d unconfirmed=%d title=%s\n",
                         key.page + 1, static_cast<unsigned>(controls.size()),
-                        logText(view.value, 32).c_str(), view.unit.c_str(),
-                        logText(view.stateText, 40).c_str(), arc, view.dimmed ? 1 : 0,
-                        logText(view.title, 48).c_str());
+                        logSafe(view.value, 32).c_str(), view.unit.c_str(),
+                        logSafe(view.stateText, 40).c_str(), arc, view.dimmed ? 1 : 0,
+                        view.unconfirmed ? 1 : 0, logSafe(view.title, 48).c_str());
     }
     shownControlView = view;
 }
@@ -385,10 +381,23 @@ void handleWebRequests(uint32_t nowMs) {
     }
 }
 
-void handleEncoder() {
-    const int32_t delta = hal::encoder::takeDelta();
+#if defined(HAKNOB_TEST_INPUT)
+int32_t testDelta = 0;  // detents injected by "TIN rot" since the last handleEncoder()
+#endif
+
+// The detents of this pass (one batch, plan-step7.md Q7-2): counted for the Status page and
+// turned on the selected control page.
+void handleEncoder(uint32_t nowMs) {
+    int32_t delta = hal::encoder::takeDelta();
+#if defined(HAKNOB_TEST_INPUT)
+    delta += testDelta;
+    testDelta = 0;
+#endif
     if (delta == 0) {
         return;
+    }
+    if (encoderReverse) {
+        delta = -delta;  // here, never in the ISR
     }
     const int d = delta > 0 ? 1 : -1;
     for (int32_t i = 0; i != delta; i += d) {
@@ -397,12 +406,15 @@ void handleEncoder() {
     }
     if (displayOk) {
         ui::showEncoderCount(shownCount);
+        const int page = ui::controlPage();
+        if (page >= 0 && ui::pagesActive()) {
+            app::control::rotate(static_cast<size_t>(page), static_cast<int>(delta), nowMs);
+        }
     }
 }
 
-void handleButton(uint32_t nowMs) {
+void handleButtonEvent(core::ButtonFsm::Event event, uint32_t nowMs) {
     using Event = core::ButtonFsm::Event;
-    const Event event = hal::button::poll(nowMs);
     if (event == Event::None) {
         return;
     }
@@ -417,10 +429,17 @@ void handleButton(uint32_t nowMs) {
     if (!displayOk) {
         return;
     }
-    // Step 6 (Q6-1): a long press shows the next page (Step 7 turns it into the Select
-    // list); a short press only shows up on the Status page.
+    // Step 6 (Q6-1): a long press shows the next page (Step 7.8 turns it into the Select
+    // list); a short press runs the control page's press action (plan-step7.md §3.6).
     switch (event) {
-        case Event::ShortPress: ui::showLastInput("short press"); break;
+        case Event::ShortPress: {
+            ui::showLastInput("short press");
+            const int page = ui::controlPage();
+            if (page >= 0 && ui::pagesActive()) {
+                app::control::press(static_cast<size_t>(page), nowMs);
+            }
+            break;
+        }
         case Event::LongPress:
             ui::showLastInput("long press");
             if (ui::nextPage()) {
@@ -432,8 +451,9 @@ void handleButton(uint32_t nowMs) {
     }
 }
 
-void handleTouch(uint32_t nowMs) {
-    const core::Swipe swipe = hal::touch::poll(nowMs);
+void handleButton(uint32_t nowMs) { handleButtonEvent(hal::button::poll(nowMs), nowMs); }
+
+void handleSwipe(core::Swipe swipe) {
     if (swipe == core::Swipe::None) {
         return;
     }
@@ -447,6 +467,72 @@ void handleTouch(uint32_t nowMs) {
         logPage();
     }
 }
+
+void handleTouch(uint32_t nowMs) { handleSwipe(hal::touch::poll(nowMs)); }
+
+#if defined(HAKNOB_TEST_INPUT)
+// Test builds only (plan-step7.md Q7-10): "TIN rot <+-n>", "TIN short", "TIN long",
+// "TIN swipe left|right" lines on the serial port are injected through the same paths as
+// the HAL events (rotations join this pass's encoder batch, so encoder_reverse and the
+// acceleration apply). Non-blocking; lines longer than kTestLineMax characters are dropped
+// whole, lines without the "TIN " prefix are ignored.
+constexpr size_t kTestLineMax = 40;
+constexpr long kTestRotMax = 100;
+std::string testLine;
+bool testLineTooLong = false;
+
+void runTestLine(const std::string &line, uint32_t nowMs) {
+    using Event = core::ButtonFsm::Event;
+    if (line.compare(0, 4, "TIN ") != 0) {
+        return;
+    }
+    const std::string cmd = line.substr(4);
+    bool ok = true;
+    if (cmd.compare(0, 4, "rot ") == 0) {
+        // A sign or a digit right after "rot " (strtol would skip whitespace).
+        const char first = cmd.size() > 4 ? cmd[4] : '\0';
+        char *end = nullptr;
+        const long n = strtol(cmd.c_str() + 4, &end, 10);
+        ok = (first == '+' || first == '-' || (first >= '0' && first <= '9')) &&
+             end != cmd.c_str() + 4 && *end == '\0' && n != 0 && n >= -kTestRotMax && n <= kTestRotMax;
+        if (ok) {
+            util::logPrintf("TIN %s\n", core::util::logSafe(cmd, kTestLineMax).c_str());
+            testDelta += static_cast<int32_t>(n);
+        }
+    } else if (cmd == "short" || cmd == "long") {
+        util::logPrintf("TIN %s\n", cmd.c_str());
+        handleButtonEvent(cmd == "short" ? Event::ShortPress : Event::LongPress, nowMs);
+    } else if (cmd == "swipe left" || cmd == "swipe right") {
+        util::logPrintf("TIN %s\n", cmd.c_str());
+        handleSwipe(cmd == "swipe left" ? core::Swipe::Left : core::Swipe::Right);
+    } else {
+        ok = false;
+    }
+    if (!ok) {
+        util::logPrintf("TIN bad %s\n", core::util::logSafe(cmd, kTestLineMax).c_str());
+    }
+}
+
+void handleTestInput(uint32_t nowMs) {
+    while (Serial.available() > 0) {
+        const int c = Serial.read();
+        if (c < 0) {
+            break;
+        }
+        if (c == '\n' || c == '\r') {
+            if (!testLineTooLong && !testLine.empty()) {
+                runTestLine(testLine, nowMs);
+            }
+            testLine.clear();
+            testLineTooLong = false;
+        } else if (testLine.size() >= kTestLineMax) {
+            testLineTooLong = true;
+        } else {
+            testLine.push_back(static_cast<char>(c));
+        }
+    }
+}
+#endif
 
 }  // namespace
 
@@ -496,7 +582,10 @@ void loop() {
     const uint32_t startUs = micros();
     const uint32_t nowMs = millis();
 
-    handleEncoder();
+#if defined(HAKNOB_TEST_INPUT)
+    handleTestInput(nowMs);
+#endif
+    handleEncoder(nowMs);
     handleButton(nowMs);
     handleTouch(nowMs);
     hal::buzzer::loop(nowMs);
@@ -505,6 +594,7 @@ void loop() {
     publishNetwork();
     ha::setNetworkUp(net::wifi::status().staConnected, nowMs);
     ha::loop();
+    app::control::loop(nowMs);  // after ha::loop() (its call results), before the view
     publishHa();
     publishCatalog();
     publishControlView(nowMs);

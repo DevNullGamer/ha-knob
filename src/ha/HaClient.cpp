@@ -215,6 +215,14 @@ bool requestStates(uint32_t nowMs) {
     return ok;
 }
 
+uint32_t callService(const core::domain_actions::ServiceCall &call, uint32_t tag) {
+    const uint32_t id = session.callService(call, tag, millis());
+    refresh();  // a send failure leaves Ready
+    return id;
+}
+
+std::vector<hc::CallResult> takeCallResults() { return session.takeCallResults(); }
+
 void loop() {
     transport.poll();
     session.tick(millis());  // taken after poll(), which can block during a TCP connect

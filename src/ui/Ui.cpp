@@ -8,6 +8,8 @@
 #include "ui/screens/NoControlsScreen.h"
 #include "ui/screens/SetupScreen.h"
 #include "ui/screens/StatusScreen.h"
+#include "util/Log.h"
+#include "util/Text.h"
 
 namespace ui {
 
@@ -21,6 +23,7 @@ lv_obj_t *setupScr = nullptr;
 lv_obj_t *controlScr = nullptr;
 lv_obj_t *noControlsScr = nullptr;
 lv_obj_t *shownScr = nullptr;  // screen loaded after boot
+bool begun = false;            // begin() ran
 bool booting = false;
 uint32_t bootStartMs = 0;
 bool wantSetup = false;
@@ -54,6 +57,7 @@ void begin(uint32_t nowMs) {
     lv_obj_delete(defaultScr);
     booting = true;
     bootStartMs = nowMs;
+    begun = true;
 }
 
 void tick(uint32_t nowMs) {
@@ -92,6 +96,8 @@ bool previousPage() {
 
 int controlPage() { return pages.controlPage(); }
 
+bool pagesActive() { return begun && canNavigate(); }
+
 bool statusPage() { return pages.onStatus(); }
 
 void showControl(const core::presenter::ControlView &view) {
@@ -99,6 +105,13 @@ void showControl(const core::presenter::ControlView &view) {
     if (page >= 0) {
         controlScreen::show(view, static_cast<size_t>(page), pages.controlCount());
     }
+}
+
+void showToast(const std::string &text, uint32_t /*nowMs*/) {
+    if (!begun) {
+        return;
+    }
+    util::logPrintf("UI toast text=%s\n", core::util::logSafe(text, 60).c_str());
 }
 
 void showNetwork(const NetworkView &view) {

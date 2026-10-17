@@ -919,6 +919,47 @@ uses it from Step 7.6 (local value) and 7.7 / 7.8 (arc colours, Select list).
 - Build: RAM 55132 bytes (16.8 %), flash 1821441 bytes (28.1 %) (nothing on the device
   calls the new code yet).
 
+## Step 7.6 (2026-10-17)
+
+Spec: `plan-step7.md` §3.6, §4 Step 7.6 (Q7-2, Q7-8..Q7-10). Device glue, v0.7.0.
+
+- `ha::callService(call, tag)` / `ha::takeCallResults()`: pass-throughs to the session;
+  `callService` reads `millis()` itself (like `loop()`), so its time is never later than
+  the next session tick, and calls `refresh()` (a send failure leaves Ready). The session
+  logger already adds the `HA ` prefix to the `call ...` lines.
+- `src/app/Control` (`app::control`): owns the `ControlEngine`, its `CallSender`
+  (`ha::callService(...) != 0`) and a `core::Acceleration`. `applyConfig(device,
+  controls)` runs on every config apply (also when the controls did not change, so
+  `accel` / `send_interval_ms` apply at once; `setControls` resets only on a change).
+  `rotate` applies `Acceleration::onDetents` to the pass's batch, then `engine.rotate`.
+  `loop(now)` drains every result into `onResult`, then `tick`, then logs and toasts the
+  newest notice. HA readiness = `ha::status().state == Ready` (mirrored on every `ha::`
+  entry point, so current within the pass). `page` in `CTL` lines is 1-based, like
+  `UI page`.
+- `main`: one `nowMs` per pass for the engine; `app::control::loop` right after
+  `ha::loop()` and before `publishControlView`, so a hold expiry seen by `tick` reaches the
+  view in the same pass. `ViewKey` gains `app::control::version()`, `PresentContext.local`
+  comes from `app::control::local(page, now)`. `encoder_reverse` flips the pass's delta in
+  `main` (the HAL's `begin(reverse)` stays unused, so a config change applies without
+  re-initialising the ISR). Rotation and short presses reach the engine only on a control
+  page while `ui::pagesActive()` (not during the boot or the setup screen, where the page
+  is not visible); the Status page keeps its count. Short press on a control page -> `app::control::press`.
+  Long press stays "next page" until Step 7.8; `Pressed` still always clicks and there is
+  no error beep yet (both Step 7.7 per §4, which lists them there). `logText` replaced by
+  `core::util::logSafe`. `UI view` gained `unconfirmed=<0|1>` (before `title=`); HB
+  unchanged.
+- `ui::showToast(text, now)`: Step 7.6 stub, logs `UI toast text=<logSafe 60>`; ignored
+  before `ui::begin` (so `app::control` needs no display flag; the 7.7 overlay keeps that).
+- Test input (`-DHAKNOB_TEST_INPUT`, env `t-encoder-pro-test` extending the main env):
+  `handleTestInput` reads serial bytes non-blocking, lines up to 40 characters (longer
+  lines dropped whole), `TIN ` prefix. `rot <n>` (|n| 1..100) is added to the pass's
+  encoder batch (summed with the HAL delta, so reverse and acceleration apply and several
+  `rot` lines in one pass do not look like 0 ms apart); `short` / `long` / `swipe
+  left|right` go through `handleButtonEvent` / `handleSwipe`. Everything is inside
+  `#if`, the normal `firmware.elf` has no `TIN` word (`strings | grep -w TIN`; a plain `grep TIN` matches library strings such as `CONTINUE`).
+- Build: normal RAM 55260 bytes (16.9 %), flash 1838229 bytes (28.3 %); test build RAM
+  55292, flash 1839549.
+
 ## Step 8.1 / 8.2: IdleTimer and ResetConfirm (core)
 
 - `core::ui::IdleTimer` (`lib/core/src/ui/IdleTimer.{h,cpp}`): level On / Dim / Off from the
