@@ -825,3 +825,56 @@ calls it yet (Step 7.6).
   The same one-line guard applies to the subscribe / unsubscribe expiry in that loop
   (otherwise unchanged); elapsed times above ~24.8 days count as 0 (never reached: every
   entry expires after 10-15 s).
+
+## Step 7.4 (2026-10-17)
+
+Spec: `plan-step7.md` §3.4, §4 Step 7.4 (Q7-1, Q7-3, Q7-5..Q7-7, Q7-11). Core only
+(`core::control::ControlEngine`); nothing on the device uses it yet (Step 7.6).
+
+- One `Slot` per control: a `Throttle`, the latest built `ServiceCall` (built at once in
+  `rotate`, sent by `sendDue` when the throttle says due, then released), notice
+  suppression stamps. The in-flight list is engine-wide (`tag -> control, press?`,
+  at most `maxInFlight` entries incl. presses and orphans); tags are a counter that skips
+  0 and tags still in flight. Due trailing values go out in `tick()` in control-index
+  order (no round robin; accepted because only the shown page's control is turned).
+  `maxInFlight` is clamped to >= 1 (0 would block every call); `flights_` is reserved to
+  it in the constructor and `setOptions`.
+- The caller must feed every `CallResult` to `onResult` (7.6: drain
+  `ha::takeCallResults()` every pass before `tick()`); a lost result keeps its in-flight
+  slot occupied until the next `setControls` change.
+- `rotate`: an action `none` (or one the domain lacks) is silent even when HA is offline
+  (the knob does nothing on a press-only control); then HaOffline; then the base (held
+  target, else `baseValue`) and `stepValue`; `encoderCall` decides NotFound / Unavailable /
+  NoValue in its own order (a NaN value is passed when there is no entity or base). A
+  missing / non-positive configured step falls back to `stepDefaultFor` (defensive; config
+  validation already rejects it).
+- `press`: press `none` silent; HaOffline; then the hold is dropped (also when the press
+  then fails with NotFound / Unavailable / Busy), then the call; Busy at the cap. Press
+  results: Failed / Timeout notices only (no throttle involved).
+- **Sender refusal (Auditor 7.3 #2):** `HaSession::callService` returns 0 for not Ready,
+  call cap, pending map full and send failure alike. The engine only sends while the
+  caller says HA is Ready, so a refusal then is a full session (or a send failure, after
+  which the session leaves Ready and the page shows "HA offline" anyway): notice **Busy**
+  ("Busy, try again") instead of the spec's HaOffline, and the unsent value is dropped
+  (the hold ends). Rare: the engine's own cap (8, incl. orphans) matches the session's.
+- Results: Ok -> `answered(true)`; Failed -> `answered(false)` + notice (HA's message cut
+  to 60 bytes with `util::truncateUtf8`, i.e. on a UTF-8 boundary; empty message ->
+  `"Failed: <code>"`, cut the same way); Timeout -> `answered(false)` + "No answer from
+  HA"; ConnectionLost -> `answered(true)` + `drop()`, no notice. Failed / Timeout are never
+  suppressed; other kinds once per `noticeRepeatMs` per control and kind. Only the newest
+  notice is kept. Unknown tags are ignored; orphans (after a `setControls` change) only
+  free their slot. `noticeKindName()` (`ha_offline`, ...) added for the 7.6 log line.
+- **millis() wrap (carry-over from 7.1/7.2):** `tick()` replaces a control's throttle by a
+  fresh one once it is idle (not holding, nothing in flight, `sendIntervalMs` since its
+  last send). A fresh throttle behaves exactly like an expired one (the next change starts
+  a new hold, forgets the last sent value and may send at once, which the elapsed interval
+  allows), but it has no settle / send timestamps left that could look recent again after
+  ~49.7 days. Notice suppression stamps are likewise forgotten in `tick()` once their
+  repeat time is over. This relies on `tick()` running every loop pass.
+- `setOptions` keeps state: `maxInFlight` / `noticeRepeatMs` apply at once; a new send
+  interval / settle time applies to idle controls at once and to busy ones when they go
+  idle (`Throttle` has no setters, and changing them mid-hold is not needed).
+- `version()` is bumped on every turn, press, matched result, drop, `setControls` change
+  and whenever `tick()` sees a control's `holding()` change (settle expiry; `rotate` sets
+  `wasHolding` so the start of a hold is not counted twice); extra bumps
+  are harmless (compare for inequality).

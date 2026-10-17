@@ -509,6 +509,8 @@ static void test_press_no_action_and_problems() {
     }
 }
 
+void run_engine_tests();  // test_engine.cpp (ControlEngine, Step 7.4)
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_range_fixed);
@@ -540,5 +542,6 @@ int main(int, char **) {
     RUN_TEST(test_press_stop_and_play_pause);
     RUN_TEST(test_press_mute);
     RUN_TEST(test_press_no_action_and_problems);
+    run_engine_tests();
     return UNITY_END();
 }
