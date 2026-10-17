@@ -109,7 +109,35 @@
 
   <section id="tab-controls" class="tab" hidden>
     <h2>Controls</h2>
-    <p class="hint">Available in a later version.</p>
+    <p class="hint">The knob shows these controls in this order. Add entities from the Home
+      Assistant list below, choose what turning the knob and pressing it do, then save.</p>
+    <fieldset id="ctl-editor" class="plain">
+    <h3>Selected controls (<span id="ctl-count">0</span> of <span id="ctl-max">-</span>)</h3>
+    <p id="ctl-empty" class="hint">No controls yet.</p>
+    <ol id="ctl-list" class="controls"></ol>
+    <div class="row">
+      <button type="button" id="ctl-save" disabled>Save controls</button>
+      <span id="ctl-dirty" class="hint" hidden>Unsaved changes</span>
+    </div>
+    <p id="ctl-status" class="message" role="status" aria-live="polite" hidden></p>
+
+    <h3>Home Assistant entities</h3>
+    <div class="row">
+      <button type="button" id="ent-refresh">Refresh list</button>
+      <span id="ent-state" class="hint" role="status" aria-live="polite"></span>
+    </div>
+    <div class="filters">
+      <label>Search
+        <input id="ent-search" type="search" spellcheck="false" autocapitalize="off"
+               placeholder="name or entity id">
+      </label>
+      <label>Domain
+        <select id="ent-domain"><option value="">All</option></select>
+      </label>
+    </div>
+    <p id="ent-note" class="hint"></p>
+    <ul id="ent-list" class="entities"></ul>
+    </fieldset>
   </section>
 
   <section id="tab-device" class="tab" hidden>

@@ -568,3 +568,103 @@ Spec: `plan-step6.md` §3.5, §3.8, §4 Step 6.6. Web API for the entity list; n
   when the list is hidden or `catalogState()` is `ready` without a body (the GET handler
   already treats that like `none`), so a GET cannot get 202 forever.
 - Build: RAM 54776 bytes (16.7 %), flash 1797733 bytes (27.7 %); round 2 flash 1797977 bytes.
+
+## Step 6.7 (2026-10-16)
+
+Spec: `plan-step6.md` §3.6, §4 Step 6.7. Web UI Controls tab (`data/*` only); no firmware
+change, no version bump.
+
+- Sources: `/api/meta/actions` once per page load (actions, step ranges, presses,
+  `max_controls`, `max_label_bytes`; nothing of the table is in `app.js`), the controls from
+  `/api/config`, the entity list from `/api/ha/entities`. The domain filter is built from
+  meta.
+- Entity list (Q6-2): opening the tab loads it while the page has no list and no load is
+  running (so it retries on the next opening after a failure); **Refresh list** POSTs
+  `/api/ha/entities/refresh` first. 202 -> poll every 1 s, give up after 120 s; `503 busy`
+  -> wait `Retry-After` (capped at 10 s) within the same 120 s; 503 `ha_not_connected` /
+  502 `fetch_failed` (detail translated) / anything else -> reason in the state line. A
+  newer load cancels an older poll loop (generation counter). A failed refresh keeps the
+  list the page already has. Refresh is disabled while a load runs. Each request waits at
+  most 10 s for the response headers and then 60 s for the body (a list of a few hundred KB
+  on a weak link), both capped by the loop's 120 s (`AbortController`; `api()` reports the
+  headers through its `onResponse` callback). A timed-out GET shows "The device is slow to
+  answer, retrying..." and is retried within the 120 s. Leaving the tab aborts the loop;
+  coming back continues it with a GET (the device keeps fetching). A stale load error under
+  Save is cleared once meta and config have loaded.
+- Picker: case-insensitive search over id and name (lower-cased once per list), domain
+  filter, sorted by name (one `Intl.Collator`, base sensitivity, then id), state shown. At most 100 rows are rendered
+  (hint "refine the search"): keeps typing responsive with 1500 entities on a phone
+  (not in §3.6, display only). Add buttons are disabled at `max_controls`, and
+  `addControl` refuses the 25th as well.
+- New control: `action = actions[0]` of the entity (if the domain offers it), step =
+  `step_default` for that action, the domain's first press, label `""`. On an action change
+  the step becomes `step_default` if the new action is the entity's default action, else the
+  meta default.
+- Editor model: a JS array edited in place; rows are rebuilt (max 24) only on structural
+  changes (add, remove, move, catalog arrival), label / step typing updates the model and the
+  row's error only. A rebuild restores the focus (same row, field and caret); after Up /
+  Down / Remove the focus goes to the same button of the moved row (or the neighbour's).
+  The list is taken from the page's cached config (`config`, kept current by
+  `loadConfig()`; no extra GET) when the tab is opened without unsaved edits, and after a
+  successful save (`loadConfig()` re-reads it; if that fails, the sent list is put into the
+  cache). `controlsLoaded`: until a config was taken, Save is disabled and `saveControls()`
+  returns, so a failed `GET /api/config` can never save `{"controls":[]}`. While a save
+  runs, the `#ctl-editor` fieldset is disabled (rows, picker, Save), so rows cannot move
+  before a row error is mapped. Afterwards the focus goes to the first visible
+  `aria-invalid` input when the device rejected a row, else to Save.
+- Missing-entity hint: "Not in Home Assistant" when the list is complete, "Not in the loaded
+  entity list" when it is `truncated` or has `skipped` entries.
+- Accessibility: `aria-label`s on the repeated buttons ("Add <name>", "Move control 3 up",
+  "Remove control 3"), `role="status"` + `aria-live="polite"` on `#ent-state` and
+  `#ctl-status`, row errors linked with `aria-describedby`, the failing input (or all of the
+  row's inputs for a row-level error) gets `aria-invalid`.
+- CSS: `[hidden] { display: none !important; }`, because `label { display: block }` beat
+  the UA rule and left the Step field visible for `none`.
+- Client checks before Save (§3.6): count, label UTF-8 bytes (`TextEncoder`, also live while
+  typing), step finite and within min/max (same 1e-9 tolerance as `stepInRange`; the
+  granularity is not checked, `step=min` only sets the spinner increment). Not checked
+  client-side (server reports them on the row): label control characters, action / press
+  validity (the selects only offer valid values plus the saved one).
+- Save sends `{"controls":[{entity_id,label,action,step,press}]}` (whole section, all five
+  keys; `step` 0 for actions without a step). A 400 with `field` `controls[i].<key>` is shown
+  on row i of the list that was sent; other errors (`controls` / `too_many`, `too_large`,
+  401, 500) as a general message under the Save button.
+- `api()` now also returns the response headers (for `Retry-After`) and takes an optional
+  `AbortSignal` and `onResponse` callback; `loadConfig()` returns whether the config was read. Non-ASCII text in
+  `app.js` is written as `\uXXXX` escapes (the file is served without a charset).
+
+## Step 6.5c (2026-10-16)
+
+Follow-up to the 6.5 `loopmax` gate (<= 25 ms). Tester figures (mock HA, id-first result
+in 16 KB fragments): 100 KB / 300 entities 46-47 ms, 435 KB / 1200 entities 45 ms,
+3 MB / 1500 entities 13-19 ms.
+
+- Cause: the catalog build. `step(32 KB)` was a byte budget only, but the cost of an
+  element is mostly fixed (filtered `deserializeJson` into a PSRAM document, `applyAttrs`,
+  `availableActions`, `catalog_.add`), not per byte. 32 KB of ~330-byte mock entities is
+  ~100 parses per tick, 32 KB of ~2 KB entities only ~16. Host check (MinGW -Os, the
+  mock's `make_states` data): longest 32 KB step 0.81-1.22 ms for 300 / 1200 entities and
+  0.35-0.41 ms for 3 MB, the same ~3:1 ratio as on the device (host-to-device factor ~50,
+  cf. the JSON writer: 1.7-2.5 us host vs 0.12 ms device per entry). Per element on the
+  host ~7.4 us + ~3.3 ns per byte, i.e. on the device ~0.4 ms + ~0.17 ms per KB.
+  Not the cause: the receive path (`pollOpen` stops at 32 KB / 8 ms, the receiver copies
+  per 2 KB read), the peek (1 KB), `retainText` (no copy), the JSON writer (8 ms slices;
+  its constructor's lower-bound pass is ~40 us host / ~2 ms device for 1286 entries).
+- Fix: `EntityCatalogBuilder::step(maxBytes, maxElements = SIZE_MAX)` also ends after
+  `maxElements` (min. 1) result elements (every element unit counts, also skipped ones);
+  output still independent of the budget. `SessionOptions::statesElementsPerTick = 16`.
+  Host longest step afterwards 0.17-0.43 ms for all three sizes (300 entities: 19 steps,
+  1200: 76, 1500 / 3 MB: 94), i.e. ~7-12 ms on the device.
+- Also: while Fetching, a message whose `peekEnvelope` finds no id (only possible with
+  `<= 64 KB`, larger ones are retained by length) is parsed envelope-only first
+  (`parseMessage(..., envelopeOnly = true)`): a states result is retained without its
+  `result` ever being kept in a document (a 64 KB result kept whole would be ~200
+  entities in one pass), any other result / pong / error uses that parse, an event is
+  parsed again with its payload. HA sends `id` first, so this only matters for other
+  servers. The old "small result, id not first" branch after the normal parse stays as a
+  fallback.
+- Remaining O(message) work in one pass (not seen in the measurements): a fragmented
+  message's PSRAM buffer grows geometrically with `heap_caps_realloc`, which may copy the
+  text so far (up to 2 MB for a 3 MB message) if it cannot grow in place; the JSON
+  writer's regrowth / `shrink_to_fit` copy the JSON (rare, only for escape-heavy names);
+  a single element up to 256 KB is parsed in one unit (6.3 known limit).

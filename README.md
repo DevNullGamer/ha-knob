@@ -4,11 +4,11 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.6.0, Step 6.6 (live entity state, entity list API).** The firmware drives the
-hardware (display, touch swipes, encoder, button, buzzer), loads its configuration from NVS,
-joins Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home Assistant
-and device settings, keeps an authenticated, self-healing WebSocket connection to Home
-Assistant and keeps the configured controls' entities live. The entity picker, the control
+**Status: v0.6.0, Step 6.7 (live entity state, entity picker in the web UI).** The firmware
+drives the hardware (display, touch swipes, encoder, button, buzzer), loads its configuration
+from NVS, joins Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home
+Assistant, controls and device settings, keeps an authenticated, self-healing WebSocket
+connection to Home Assistant and keeps the configured controls' entities live. The control
 screens and encoder control come in later steps.
 
 ## First-time setup
@@ -29,6 +29,13 @@ screens and encoder control come in later steps.
    token (Home Assistant: your user profile, Security, "Long-lived access tokens"; best for a
    dedicated non-admin user) and save. The tab and the status screen show the connection
    state ("connected" plus the Home Assistant version once it works).
+7. In the **Controls** tab, the device loads the entity list from Home Assistant (a few
+   seconds on large installations; **Refresh list** loads it again). Search or filter by
+   domain, **Add** the entities you want (the same entity may be added several times, e.g.
+   for brightness and colour temperature), choose per control what turning and pressing
+   the knob do and the step, order them with **Up** / **Down**, then **Save controls**.
+   Only the actions the entity reports are offered; an entity no longer in Home Assistant
+   is marked "Not in Home Assistant".
 
 If the device cannot join the configured network within 30 s, it opens the setup access
 point again (and keeps retrying the network every 60 s).

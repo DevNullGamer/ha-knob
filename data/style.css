@@ -11,6 +11,9 @@
 
 * { box-sizing: border-box; }
 
+/* The hidden attribute must win over the display rules below (e.g. label { display: block }). */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -45,7 +48,8 @@ main { max-width: 40rem; margin: 0 auto; padding: 1rem; }
 label { display: block; margin: 0.75rem 0; color: var(--muted); }
 label.check { color: var(--text); }
 
-input[type="text"], input:not([type]), input[type="password"], input[type="number"] {
+input[type="text"], input:not([type]), input[type="password"], input[type="number"],
+input[type="search"], select {
   display: block;
   width: 100%;
   margin-top: 0.25rem;
@@ -75,7 +79,7 @@ legend { color: var(--muted); padding: 0 0.25rem; }
 
 .hint.warning { color: var(--danger); }
 
-input:disabled, textarea:disabled { opacity: 0.5; }
+input:disabled, textarea:disabled, select:disabled { opacity: 0.5; }
 
 button {
   padding: 0.5rem 1rem;
@@ -108,3 +112,35 @@ button.danger { border-color: var(--danger); }
 .networks button { border-color: #3a414a; text-align: left; }
 
 code { color: var(--accent); }
+
+/* Controls tab */
+fieldset.plain { margin: 0; padding: 0; border: none; min-width: 0; }
+.controls { padding: 0; margin: 0.5rem 0; list-style: none; }
+.controls > li {
+  margin: 0.5rem 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #3a414a;
+  border-radius: 4px;
+  background: var(--panel);
+}
+.controls > li.invalid { border-color: var(--danger); }
+.control-title { font-weight: 600; overflow-wrap: anywhere; }
+.control-id { overflow-wrap: anywhere; }
+.control-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0 0.75rem; }
+.control-fields label, .controls label { margin: 0.5rem 0; }
+.controls .row { margin: 0.5rem 0 0.25rem; }
+.controls .row button { padding: 0.35rem 0.75rem; }
+
+.filters { display: grid; grid-template-columns: 2fr 1fr; gap: 0 0.75rem; }
+
+.entities { list-style: none; padding: 0; margin: 0.5rem 0; }
+.entities li {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid #2a3038;
+}
+.entity-text { flex: 1; min-width: 0; }
+.entity-name, .entity-id { display: block; overflow-wrap: anywhere; }
+.entities button { padding: 0.35rem 0.75rem; }
