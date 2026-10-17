@@ -237,7 +237,8 @@ private:
     bool done_ = false;
 };
 
-// One-shot wrapper around CatalogJsonWriter (same output).
+// One-shot wrapper around CatalogJsonWriter (same output). Host only (tests): never call it
+// from the device loop, where it blocks for ~0.12 ms per entry (R8); use CatalogJsonWriter.
 std::string catalogToJson(const EntityCatalog &catalog, uint32_t fetchedAtS,
                           ArduinoJson::Allocator *allocator = nullptr);
 

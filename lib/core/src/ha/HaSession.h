@@ -274,6 +274,9 @@ public:
     const EntityStore &entities() const { return store_; }
     // The configured entity ids, de-duplicated, in configuration order.
     const std::vector<std::string> &entityIds() const { return entityIds_; }
+    // Milliseconds since the current subscribe_entities (active or still pending) was sent;
+    // nullopt while there is none (not connected, no ids, or the subscribe failed).
+    std::optional<uint32_t> msSinceSubscribe(uint32_t nowMs) const;
 
     void setLogger(Logger logger) { logger_ = std::move(logger); }
 
@@ -375,6 +378,7 @@ private:
     uint32_t lastRxMs_ = 0;            // last onRxProgress (connect() for a new connection)
     uint32_t subscriptionId_ = 0;      // id of the active subscribe_entities (0 = none)
     uint32_t pendingSubscribeId_ = 0;  // subscribe_entities sent, no result yet (0 = none)
+    uint32_t subscribeSentMs_ = 0;     // when the current (active / pending) one was sent
     std::vector<Pending> pending_;
     uint32_t changeCount_ = 0;
     uint32_t droppedMessages_ = 0;

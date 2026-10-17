@@ -507,12 +507,20 @@ void HaSession::onAuthenticated(uint32_t nowMs) {
     setState(State::Subscribing);
 }
 
+std::optional<uint32_t> HaSession::msSinceSubscribe(uint32_t nowMs) const {
+    if (subscriptionId_ == 0 && pendingSubscribeId_ == 0) {
+        return std::nullopt;
+    }
+    return nowMs - subscribeSentMs_;
+}
+
 bool HaSession::subscribe(uint32_t nowMs) {
     const uint32_t id = nextId_++;
     if (!send(buildSubscribeEntities(id, entityIds_, allocator_), nowMs)) {
         return false;
     }
     pendingSubscribeId_ = id;
+    subscribeSentMs_ = nowMs;
     if (pending_.size() >= kMaxPending) {
         // The subscribe needs its expiry more than the oldest unsubscribe its failure log.
         auto oldest = std::find_if(pending_.begin(), pending_.end(),

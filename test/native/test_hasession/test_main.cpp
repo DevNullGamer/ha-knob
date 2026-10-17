@@ -2554,6 +2554,67 @@ static void test_fetching_malformed_small_message_changes_nothing() {
     balanced(t);
 }
 
+// ---- Step 6.8: msSinceSubscribe ------------------------------------------------------------
+
+static void test_ms_since_subscribe_none_before_connect_and_authenticating() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    TEST_ASSERT_FALSE(s.msSinceSubscribe(0).has_value());
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {"light.a"}, 0);
+    TEST_ASSERT_FALSE(s.msSinceSubscribe(10).has_value());  // Connecting
+    feed(s, kAuthRequired, 20);
+    TEST_ASSERT_EQUAL(S::Authenticating, s.state());
+    TEST_ASSERT_FALSE(s.msSinceSubscribe(30).has_value());
+}
+
+static void test_ms_since_subscribe_pending_and_active() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toAuthenticated(s, t, 1000, {"light.a"});  // subscribe sent at 1000, pending
+    TEST_ASSERT_EQUAL(S::Subscribing, s.state());
+    TEST_ASSERT_TRUE(s.msSinceSubscribe(1000).has_value());
+    TEST_ASSERT_EQUAL_UINT32(0, *s.msSinceSubscribe(1000));
+    TEST_ASSERT_EQUAL_UINT32(250, *s.msSinceSubscribe(1250));
+    feed(s, resultOk(1), 1300);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL_UINT32(2000, *s.msSinceSubscribe(3000));  // still counts from the send
+}
+
+static void test_ms_since_subscribe_restarts_on_resubscribe() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 1000, {"light.a"});
+    TEST_ASSERT_EQUAL_UINT32(4000, *s.msSinceSubscribe(5000));
+    reconfigure(s, {"light.b"}, 5000);
+    TEST_ASSERT_TRUE(s.msSinceSubscribe(5000).has_value());
+    TEST_ASSERT_EQUAL_UINT32(0, *s.msSinceSubscribe(5000));
+    TEST_ASSERT_EQUAL_UINT32(700, *s.msSinceSubscribe(5700));
+}
+
+static void test_ms_since_subscribe_none_after_failed_result() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toAuthenticated(s, t, 0, {"light.a"});
+    TEST_ASSERT_TRUE(s.msSinceSubscribe(5).has_value());
+    feed(s, resultFail(1, "bad"), 10);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_FALSE(s.msSinceSubscribe(20).has_value());
+}
+
+static void test_ms_since_subscribe_none_after_disconnect_and_empty_ids() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    TEST_ASSERT_TRUE(s.msSinceSubscribe(10).has_value());
+    reconfigure(s, {}, 20);
+    TEST_ASSERT_FALSE(s.msSinceSubscribe(30).has_value());  // ids -> empty
+    reconfigure(s, {"light.a"}, 40);
+    TEST_ASSERT_TRUE(s.msSinceSubscribe(50).has_value());
+    s.onClosed("gone", 60);
+    TEST_ASSERT_FALSE(s.msSinceSubscribe(70).has_value());  // disconnected (Backoff)
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_state_names);
@@ -2664,5 +2725,10 @@ int main(int, char **) {
     RUN_TEST(test_fetching_failing_subscribe_result_id_last);
     RUN_TEST(test_fetching_pong_id_not_first_clears_ping);
     RUN_TEST(test_fetching_malformed_small_message_changes_nothing);
+    RUN_TEST(test_ms_since_subscribe_none_before_connect_and_authenticating);
+    RUN_TEST(test_ms_since_subscribe_pending_and_active);
+    RUN_TEST(test_ms_since_subscribe_restarts_on_resubscribe);
+    RUN_TEST(test_ms_since_subscribe_none_after_failed_result);
+    RUN_TEST(test_ms_since_subscribe_none_after_disconnect_and_empty_ids);
     return UNITY_END();
 }

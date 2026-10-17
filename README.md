@@ -4,12 +4,12 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.6.0, Step 6.7 (live entity state, entity picker in the web UI).** The firmware
+**Status: v0.6.1, Step 6.8 (control screens with live entity state, entity picker in the web UI).** The firmware
 drives the hardware (display, touch swipes, encoder, button, buzzer), loads its configuration
 from NVS, joins Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home
 Assistant, controls and device settings, keeps an authenticated, self-healing WebSocket
-connection to Home Assistant and keeps the configured controls' entities live. The control
-screens and encoder control come in later steps.
+connection to Home Assistant and shows the configured controls' entities live on read-only
+control screens (see "Screens"). Encoder control of entities comes in Step 7.
 
 ## First-time setup
 
@@ -113,6 +113,8 @@ BTN long                                 held 600 ms (fired while held; no "shor
 BTN verylong                             held 10 s
 BTN up                                   release after long / verylong
 TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
+UI page=<i>/<n> | no_controls | status   page shown after a swipe / long press
+UI view page=<i>/<n> value=<v><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1> title=<t>   the shown control page changed
 HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes> loopmax=<ms> ent=<n>/<ids> cat=<state> stack=<bytes> psram_free=<bytes>   every 5 s
 WIFI ap ssid=<HA-Knob-XXXX> ip=192.168.4.1   setup access point up
 WIFI ap off                              setup access point shut down
@@ -518,6 +520,33 @@ the LAN, about 0.9 s for a public host, at most about 6 s (2 s TCP + 4 s handsha
 - **Encoder:** 2 valid quadrature transitions per detent (rest positions AB = 00 and 11),
   clockwise = positive. Confirmed on hardware.
 
+## Screens
+
+After the boot screen the device shows a ring of pages: one **control page** per configured
+control (or a **No controls yet** page with the web UI address while there are none),
+followed by the **Status page** (Wi-Fi, web UI addresses, HA state, encoder count, last
+input). The **setup screen** replaces them while the setup access point is up and the
+station is not connected.
+
+| Input | Step 6 behaviour |
+|---|---|
+| Swipe left / long press | Next page (wrapping) |
+| Swipe right | Previous page (wrapping) |
+| Short press, rotation | Nothing yet (shown on the Status page); encoder control comes in Step 7 |
+| Tap | Never does anything |
+
+A control page is read-only: the title (label, else HA's `friendly_name`, else the entity
+id), a 270° arc for the value, the value with its unit, a state line and the page
+indicator `i/N` (of the controls). Values: brightness in % (0 % when the light is off),
+hue in °, colour temperature in K, target temperature in the control's step (state line
+"heat, now 20.3°"), cover position, fan percentage and volume in %; the action `none`
+shows the entity state as the value and no arc (`unavailable` / `unknown`: `--`, the state
+in the state line; long states in a smaller font). A value HA does not report shows `--`.
+Dimmed: HA not connected (last values, state line "HA offline"), the entity `unavailable`
+or `unknown`, or the entity missing ("waiting..." until the subscription's first state
+snapshot arrives or for 3 s, then "not found"). A page stays selected across a config
+change while its number still exists, otherwise the first page is shown.
+
 ## Input handling
 
 | Input | Rule |
@@ -536,14 +565,15 @@ built-in Montserrat fonts are disabled.
 
 | Font | Size | Glyphs | Flash |
 |---|---|---|---|
-| `ui_font_20` | 20 px | text ranges + LVGL symbols (380 glyphs) | 47.0 KB |
-| `ui_font_28` | 28 px | text ranges + LVGL symbols (380 glyphs) | 80.8 KB |
-| `ui_font_56` | 56 px | text ranges only (320 glyphs) | 207.8 KB |
+| `ui_font_20` | 20 px | text ranges + LVGL symbols (388 glyphs) | 47.6 KB |
+| `ui_font_28` | 28 px | text ranges + LVGL symbols (388 glyphs) | 81.6 KB |
+| `ui_font_56` | 56 px | text ranges only (328 glyphs) | 209.8 KB |
 
 Text ranges: `0x20-0x7E` (ASCII), `0xA0-0xFF` (Latin-1: æ ø å Æ Ø Å, °, ...),
-`0x100-0x17F` (Latin Extended-A), `0x2022` (bullet). LVGL symbols: the `LV_SYMBOL_*`
-glyphs of LVGL's built-in fonts (FontAwesome 5 Free, from LVGL 9.2.2's
-`scripts/built_in_font/`). All fonts are 4 bpp, uncompressed.
+`0x100-0x17F` (Latin Extended-A), `0x2013-0x2014` (en / em dash), `0x2018-0x2019`,
+`0x201C-0x201D` (curly quotes), `0x2022` (bullet), `0x2026` (ellipsis), `0x20AC` (euro).
+LVGL symbols: the `LV_SYMBOL_*` glyphs of LVGL's built-in fonts (FontAwesome 5 Free, from
+LVGL 9.2.2's `scripts/built_in_font/`). All fonts are 4 bpp, uncompressed.
 
 To regenerate (needs Node.js; run from the repository root after
 `pio pkg install -e t-encoder-pro`, which provides the source fonts):
@@ -558,7 +588,7 @@ The script runs, for each size (shown for 20 px; 56 px omits the second `--font`
 npx -y lv_font_conv@1.5.3 --no-compress --no-prefilter --bpp 4 --format lvgl \
     --force-fast-kern-format --size 20 \
     --font .pio/libdeps/t-encoder-pro/lvgl/scripts/built_in_font/Montserrat-Medium.ttf \
-    -r 0x20-0x7E,0xA0-0xFF,0x100-0x17F,0x2022 \
+    -r 0x20-0x7E,0xA0-0xFF,0x100-0x17F,0x2013-0x2014,0x2018-0x2019,0x201C-0x201D,0x2022,0x2026,0x20AC \
     --font .pio/libdeps/t-encoder-pro/lvgl/scripts/built_in_font/FontAwesome5-Solid+Brands+Regular.woff \
     -r <LV_SYMBOL code points, listed in the script> \
     -o src/ui/fonts/ui_font_20.c
@@ -609,7 +639,7 @@ src/config/       ConfigStore (NVS persistence, mutex)
 src/util/         Log.h (non-blocking serial logging)
 src/net/          WifiManager (STA, setup AP, captive DNS, mDNS), WebServer (REST API, static files)
 src/ha/           HaClient (HaSession wiring, logging), WsTransport (WebSocket client on WiFiClient / WiFiClientSecure)
-src/ui/           Ui (screen manager), Widgets, screens/ (Boot, Setup, Status), fonts/ (generated)
+src/ui/           Ui (screen manager, pages), Widgets, screens/ (Boot, Setup, Status, Control, NoControls), fonts/ (generated)
 data/             web UI (index.html, app.js, style.css), flashed with uploadfs
 lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the host
   src/config/     ConfigModel (schema, JSON, validation, redaction, patch merge)
@@ -617,7 +647,7 @@ lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the h
   src/ha/         HaUrl (URL -> WebSocket endpoint), HaProtocol (messages), HaSession (state machine),
                   EntityAttrs, EntityStore (live entities), EntityCatalog (entity list)
   src/input/      QuadratureDecoder, ButtonFsm, Acceleration, SwipeClassifier
-  src/ui/         Presenter (number formatting)
+  src/ui/         Presenter (number formatting, control views), PageRing (page navigation)
   src/web/        RequestGuard (Host allow-list, CSRF, body limit, Basic auth check)
   src/util/       MathUtil, Sha1, Base64, JsonScan, StdAllocator (STL allocator on an injected allocator)
   src/ws/         WsHandshake, WsFrame, WsReceiver (WebSocket client codec, RFC 6455)

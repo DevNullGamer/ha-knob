@@ -12,7 +12,10 @@ lv_obj_t *createScreen();
 lv_obj_t *addCenteredLabel(lv_obj_t *parent, const lv_font_t *font, int32_t yOffset,
                            const char *text);
 
-// Like addCenteredLabel, but at most maxWidth px wide; longer text ends in "...".
+// Like addCenteredLabel, but a single line maxWidth px wide (text centred in it) and one
+// line of `font` high; text that does not fit shows its first wrapped line ending in "..."
+// (LVGL wraps at spaces). For single-line texts; a later font change must set the height
+// again.
 lv_obj_t *addClippedLabel(lv_obj_t *parent, const lv_font_t *font, int32_t yOffset,
                           int32_t maxWidth, const char *text);
 

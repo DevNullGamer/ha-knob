@@ -1,0 +1,21 @@
+#pragma once
+
+#include <cstddef>
+#include <lvgl.h>
+
+#include "ui/Presenter.h"
+
+// Control screen (plan-step6.md §3.7), read-only in Step 6: the control's title, a 270°
+// arc (not clickable), the value with its unit, the state line and the page indicator
+// "i/N". One screen object serves every control page; labels and the arc are only touched
+// when what they show changes.
+namespace ui {
+namespace controlScreen {
+
+lv_obj_t *create();
+
+// Shows the view of control `index` (0-based) of `count`.
+void show(const core::presenter::ControlView &view, size_t index, size_t count);
+
+}  // namespace controlScreen
+}  // namespace ui

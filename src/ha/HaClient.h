@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -81,6 +82,9 @@ const Status &status();
 const core::ha::EntityStore &entities();
 // Unique entity ids configured (the subscription's size when subscribed).
 size_t subscribedCount();
+// Milliseconds since the current subscribe_entities was sent (nullopt: none active or
+// pending), for the screens' "waiting..." / "not found".
+std::optional<uint32_t> msSinceSubscribe(uint32_t nowMs);
 
 // The entity list fetch: state, error (Failed) and, while Ready, the catalog as the
 // GET /api/ha/entities body (nullptr otherwise) with its number of entities.

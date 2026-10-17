@@ -25,6 +25,9 @@ lv_obj_t *addClippedLabel(lv_obj_t *parent, const lv_font_t *font, int32_t yOffs
                           int32_t maxWidth, const char *text) {
     lv_obj_t *label = addCenteredLabel(parent, font, yOffset, text);
     lv_obj_set_width(label, maxWidth);
+    // One line high: with the content height LONG_DOT would wrap onto further lines instead
+    // of cutting the text.
+    lv_obj_set_height(label, lv_font_get_line_height(font));
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
     lv_obj_align(label, LV_ALIGN_CENTER, 0, yOffset);
     return label;

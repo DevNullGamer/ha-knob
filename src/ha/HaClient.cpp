@@ -228,6 +228,8 @@ const hc::EntityStore &entities() { return session.entities(); }
 
 size_t subscribedCount() { return session.entityIds().size(); }
 
+std::optional<uint32_t> msSinceSubscribe(uint32_t nowMs) { return session.msSinceSubscribe(nowMs); }
+
 hc::StatesState catalogState() {
     const hc::StatesState state = session.statesState();
     // the session is Ready once the catalog is built; the JSON may still be in progress

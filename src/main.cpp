@@ -20,6 +20,9 @@
 //   WIFI ...  Wi-Fi events (see src/net/WifiManager.h)
 //   WEB ...   web server events (see src/net/WebServer.h)
 //   HA ...    Home Assistant connection events (see src/ha/HaClient.h)
+//   UI page=<i>/<n> | no_controls | status        page changed (swipe / long press)
+//   UI view page=<i>/<n> value=<value><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1>
+//           title=<t>   (one line) the selected control page shows something new
 //   SYS reboot | SYS factory reset
 
 #include <Arduino.h>
@@ -29,6 +32,7 @@
 #include <lvgl.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -73,6 +77,25 @@ uint32_t catalogHiddenChange = 0;  // ha::catalogChangeCount() when it was hidde
 size_t shownEntities = 0;
 size_t shownSubscribed = 0;
 bool entityCountsPublished = false;
+// Control pages (plan-step6.md §3.7): the configured controls, and what the shown control
+// page was last built from (rebuilt only when one of these changes).
+std::vector<core::config::Control> controls;
+uint32_t controlsGeneration = 0;  // +1 whenever `controls` is replaced
+struct ViewKey {
+    int page = -1;
+    uint32_t controlsGeneration = 0;
+    uint32_t storeVersion = 0;
+    core::ha::State haState = core::ha::State::NoConfig;
+    bool waitOver = false;
+
+    bool operator==(const ViewKey &o) const {
+        return page == o.page && controlsGeneration == o.controlsGeneration &&
+               storeVersion == o.storeVersion && haState == o.haState && waitOver == o.waitOver;
+    }
+};
+ViewKey shownViewKey;
+bool viewBuilt = false;
+core::presenter::ControlView shownControlView;
 net::web::SystemRequest pendingSystem = net::web::SystemRequest::None;
 uint32_t pendingSystemAtMs = 0;
 
@@ -147,6 +170,96 @@ std::vector<std::string> controlEntityIds(const core::config::Config &config) {
     return ids;
 }
 
+// Takes the configured controls for the pages (after boot and after every config re-read).
+void applyControls(const core::config::Config &config) {
+    if (config.controls == controls && controlsGeneration != 0) {
+        return;
+    }
+    controls = config.controls;
+    ++controlsGeneration;
+    if (displayOk) {
+        ui::setControlCount(controls.size());
+    }
+}
+
+// HA-supplied text for a log line: control characters become '?', cut to at most maxBytes
+// on a UTF-8 character boundary.
+std::string logText(const std::string &text, size_t maxBytes) {
+    size_t length = text.size();
+    if (length > maxBytes) {
+        length = maxBytes;
+        while (length > 0 && (static_cast<unsigned char>(text[length]) & 0xC0) == 0x80) {
+            --length;  // text[length] continues a character: cut before that character
+        }
+    }
+    std::string out = text.substr(0, length);
+    for (char &c : out) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7F) {
+            c = '?';
+        }
+    }
+    return out;
+}
+
+// Logs the selected page after a swipe / long press changed it.
+void logPage() {
+    const int page = ui::controlPage();
+    if (page >= 0) {
+        util::logPrintf("UI page=%d/%u\n", page + 1, static_cast<unsigned>(controls.size()));
+    } else {
+        util::logPrintf("UI page=%s\n", ui::statusPage() ? "status" : "no_controls");
+    }
+}
+
+// Builds the view of the selected control page when the store, the controls, the HA state,
+// the page or the "waiting..." timer changed, and hands it to the screen.
+void publishControlView(uint32_t nowMs) {
+    if (!displayOk) {
+        return;
+    }
+    const core::ha::EntityStore &store = ha::entities();
+    const core::ha::State haState = ha::status().state;
+    core::presenter::PresentContext context;
+    context.haReady = haState == core::ha::State::Ready;
+    context.snapshotSeen = store.snapshotSeen();
+    // No subscription (none sent, or it failed): a missing entity is "not found" at once.
+    context.msSinceSubscribe = ha::msSinceSubscribe(nowMs).value_or(UINT32_MAX);
+
+    ViewKey key;
+    key.page = ui::controlPage();
+    key.controlsGeneration = controlsGeneration;
+    key.storeVersion = store.version();
+    key.haState = haState;
+    key.waitOver = core::presenter::waitOver(context);
+    if (viewBuilt && key == shownViewKey) {
+        return;
+    }
+    const bool pageChanged = !viewBuilt || key.page != shownViewKey.page;
+    shownViewKey = key;
+    viewBuilt = true;
+    if (key.page < 0 || static_cast<size_t>(key.page) >= controls.size()) {
+        return;
+    }
+
+    const core::config::Control &control = controls[static_cast<size_t>(key.page)];
+    const core::presenter::ControlView view =
+        core::presenter::present(control, store.find(control.entityId), context);
+    ui::showControl(view);
+    if (pageChanged || view != shownControlView) {
+        char arc[48] = "-";
+        if (view.hasArc) {
+            snprintf(arc, sizeof(arc), "%g[%g,%g]", view.arcValue, view.arcMin, view.arcMax);
+        }
+        util::logPrintf("UI view page=%d/%u value=%s%s state=%s arc=%s dimmed=%d title=%s\n",
+                        key.page + 1, static_cast<unsigned>(controls.size()),
+                        logText(view.value, 32).c_str(), view.unit.c_str(),
+                        logText(view.stateText, 40).c_str(), arc, view.dimmed ? 1 : 0,
+                        logText(view.title, 48).c_str());
+    }
+    shownControlView = view;
+}
+
 // Publishes Home Assistant connection changes to the web server snapshot and the screens.
 void publishHa() {
     const ha::Status &status = ha::status();
@@ -209,6 +322,7 @@ void handleWebRequests(uint32_t nowMs) {
                                nowMs);
         ha::configure(config.ha.url, configStore.haToken(), haTlsSettings(config), controlEntityIds(config),
                       nowMs);
+        applyControls(config);
     }
 
     if (net::web::takeHaRetry()) {
@@ -303,9 +417,16 @@ void handleButton(uint32_t nowMs) {
     if (!displayOk) {
         return;
     }
+    // Step 6 (Q6-1): a long press shows the next page (Step 7 turns it into the Select
+    // list); a short press only shows up on the Status page.
     switch (event) {
         case Event::ShortPress: ui::showLastInput("short press"); break;
-        case Event::LongPress: ui::showLastInput("long press"); break;
+        case Event::LongPress:
+            ui::showLastInput("long press");
+            if (ui::nextPage()) {
+                logPage();
+            }
+            break;
         case Event::VeryLongPress: ui::showLastInput("very long press"); break;
         default: break;
     }
@@ -317,8 +438,13 @@ void handleTouch(uint32_t nowMs) {
         return;
     }
     util::logPrintf("TOUCH swipe=%s\n", core::swipeName(swipe));
-    if (displayOk) {
-        ui::showLastInput(swipe == core::Swipe::Left ? "swipe left" : "swipe right");
+    if (!displayOk) {
+        return;
+    }
+    // Swipe left = next page, swipe right = previous page (wrapping). Taps never act.
+    ui::showLastInput(swipe == core::Swipe::Left ? "swipe left" : "swipe right");
+    if (swipe == core::Swipe::Left ? ui::nextPage() : ui::previousPage()) {
+        logPage();
     }
 }
 
@@ -359,6 +485,7 @@ void setup() {
     ha::begin();
     ha::configure(config.ha.url, configStore.haToken(), haTlsSettings(config), controlEntityIds(config),
                   millis());
+    applyControls(config);
     publishHa();
     publishCatalog();
     net::web::begin(configStore, hal::touch::variantName());
@@ -380,6 +507,7 @@ void loop() {
     ha::loop();
     publishHa();
     publishCatalog();
+    publishControlView(nowMs);
 
     if (nowMs - lastHeartbeatMs >= kHeartbeatMs) {
         lastHeartbeatMs = nowMs;

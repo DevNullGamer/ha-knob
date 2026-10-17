@@ -2,7 +2,10 @@
 
 #include <lvgl.h>
 
+#include "ui/PageRing.h"
 #include "ui/screens/BootScreen.h"
+#include "ui/screens/ControlScreen.h"
+#include "ui/screens/NoControlsScreen.h"
 #include "ui/screens/SetupScreen.h"
 #include "ui/screens/StatusScreen.h"
 
@@ -15,12 +18,22 @@ constexpr uint32_t kBootScreenMs = 1500;
 lv_obj_t *bootScr = nullptr;
 lv_obj_t *statusScr = nullptr;
 lv_obj_t *setupScr = nullptr;
+lv_obj_t *controlScr = nullptr;
+lv_obj_t *noControlsScr = nullptr;
 lv_obj_t *shownScr = nullptr;  // screen loaded after boot
 bool booting = false;
 uint32_t bootStartMs = 0;
 bool wantSetup = false;
 
-lv_obj_t *targetScreen() { return wantSetup ? setupScr : statusScr; }
+core::ui::PageRing pages;  // the selected page
+
+lv_obj_t *targetScreen() {
+    if (wantSetup) return setupScr;
+    if (pages.onStatus()) return statusScr;
+    return pages.onNoControls() ? noControlsScr : controlScr;
+}
+
+bool canNavigate() { return !booting && !wantSetup; }
 
 }  // namespace
 
@@ -34,6 +47,8 @@ void begin(uint32_t nowMs) {
     bootScr = bootScreen::create();
     statusScr = statusScreen::create();
     setupScr = setupScreen::create();
+    controlScr = controlScreen::create();
+    noControlsScr = noControlsScreen::create();
     lv_obj_t *defaultScr = lv_screen_active();  // empty screen made by lv_display_create()
     lv_screen_load(bootScr);
     lv_obj_delete(defaultScr);
@@ -54,6 +69,35 @@ void tick(uint32_t nowMs) {
     if (shownScr != targetScreen()) {
         shownScr = targetScreen();
         lv_screen_load(shownScr);
+    }
+}
+
+void setControlCount(size_t count) { pages.setControlCount(count); }
+
+bool nextPage() {
+    if (!canNavigate()) {
+        return false;
+    }
+    pages.next();
+    return true;
+}
+
+bool previousPage() {
+    if (!canNavigate()) {
+        return false;
+    }
+    pages.previous();
+    return true;
+}
+
+int controlPage() { return pages.controlPage(); }
+
+bool statusPage() { return pages.onStatus(); }
+
+void showControl(const core::presenter::ControlView &view) {
+    const int page = controlPage();
+    if (page >= 0) {
+        controlScreen::show(view, static_cast<size_t>(page), pages.controlCount());
     }
 }
 
@@ -80,6 +124,12 @@ void showNetwork(const NetworkView &view) {
         wifiLine = "Wi-Fi: connecting to " + view.ssid;
     }
     statusScreen::setNetwork(wifiLine.c_str(), ipLine.c_str(), hostLine.c_str());
+
+    // The NoControls page is never shown while the setup screen wins (AP up, station down).
+    const std::string addressLine = view.staConnected ? "Open http://" + view.staIp
+                                    : view.ssid.empty() ? std::string("Set up Wi-Fi first")
+                                                        : std::string("Waiting for Wi-Fi...");
+    noControlsScreen::setAddress(addressLine.c_str());
 }
 
 void showHa(const HaView &view) {
@@ -112,6 +162,7 @@ void showHa(const HaView &view) {
             break;
     }
     statusScreen::setHa(line.c_str());
+    noControlsScreen::setHa(line.c_str());
 }
 
 void showEncoderCount(int32_t count) {

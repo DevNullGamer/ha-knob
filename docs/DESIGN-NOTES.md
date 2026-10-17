@@ -668,3 +668,65 @@ in 16 KB fragments): 100 KB / 300 entities 46-47 ms, 435 KB / 1200 entities 45 m
   text so far (up to 2 MB for a 3 MB message) if it cannot grow in place; the JSON
   writer's regrowth / `shrink_to_fit` copy the JSON (rare, only for escape-heavy names);
   a single element up to 256 KB is parsed in one unit (6.3 known limit).
+
+## Step 6.8 (2026-10-17)
+
+Spec: `plan-step6.md` §3.7, §4 Step 6.8 (Q6-1, Q6-4). Read-only control screens and page
+navigation; v0.6.1. The encoder still sends nothing to HA (Step 7).
+
+- `core::presenter::present(control, entity, context) -> ControlView` (pure): title =
+  label, else `friendly_name`, else entity id. Brightness `round(b * 100 / 255)` % and 0 %
+  when the state is `off` or the value is absent; hue `hs_color[0]` ° (0-360); color_temp K
+  (arc `min/max_color_temp_kelvin`, else 2000-6500); target_temp
+  `formatStepped(temperature, control.step)` ° (step <= 0 falls back to
+  `target_temp_step`, then 0.5; arc `min_temp`-`max_temp`, else HA's 7-35; state line
+  `<state>, now <current>°` with max(step decimals, 1)); position / percentage / volume
+  (`volume_level * 100`, `, muted` after the state) %, arcs 0-100; `none` (and an action
+  this version does not know) shows the state as the value, no arc; for `unavailable` /
+  `unknown` (or no state) the value is `--` and the state goes to the state line
+  ("unavailable" is ~327 px in font 56, wider than the 300 px label). Choices beyond §3.7:
+  any other absent value is `--` with no unit and the arc at its minimum; the value keeps
+  its unit as a separate field, the screen draws `value + unit` in the 56 px label.
+- Missing entity: value `--`, dimmed, state `waiting...` until `snapshotSeen()` or
+  `kNotFoundAfterMs` (3 s) since the subscription started, whichever comes first
+  (`waitOver()`), then `not found` (so a dropped snapshot cannot leave it waiting forever).
+  Not Ready: last values dimmed, state `HA offline` (the store is kept during Backoff).
+  `unavailable` / `unknown` are dimmed with the computed value.
+- Subscription start: `HaSession::msSinceSubscribe(now)` (via `ha::msSinceSubscribe`) counts
+  from the sending of the current subscribe_entities (active or pending; set in
+  `subscribe()`, also for a resubscribe). nullopt when there is none (not connected, no ids,
+  failed subscribe); main then passes `UINT32_MAX`, so a missing entity is "not found" at
+  once. (Round 1 reconstructed this in main.cpp; moved into the session in round 2.)
+- Rebuild key (main.cpp): selected page, controls generation (bumped when
+  `config.controls` differs), `store.version()`, HA state and `waitOver()`. The view is
+  built only for the selected control page; `UI view ...` is logged when it differs from the
+  last one or the page changed. `ControlScreen::show` sets a label, the arc value, the arc
+  visibility or the dim colours only when they change.
+- Pages: pure `core::ui::PageRing` (`lib/core/src/ui/PageRing.h`; `ui::` holds one and
+  only adds the boot / setup navigation lock). Ring = controls (or the NoControls page) +
+  Status; Status stays Status across `setControlCount`, a control index out of range goes
+  to page 0. Navigation is ignored (and not logged) while the boot or setup screen is shown;
+  the content of the control screen is still kept current behind the setup screen. After
+  boot the first control page (or NoControls) is shown. The page indicator is `i/N` of the
+  controls (Status not counted).
+- Input: swipe left and long press = next, swipe right = previous; the short press, the
+  very long press and rotation keep their Status-page feedback only. The arc has no knob and
+  is not clickable. `UI page=<i>/<n>|no_controls|status` is logged per page change.
+- Layout (390 px round panel): arc 360 px / 14 px wide, rotation 135°, 270° sweep (gap at the
+  bottom for the page indicator at +150), title 28 px at -95 (250 px wide), value 56 px at
+  -10 (300 px), state 20 px at +50 (270 px). A value wider than 300 px in font 56
+  (`lv_text_get_size`, e.g. `none` with "heat_cool") is drawn in font 28; still too wide
+  ends in "...". `addClippedLabel` labels are one line of their font high
+  (`lv_font_get_line_height`), otherwise LONG_DOT with the content height wraps instead of
+  cutting (affects the Status / Setup lines too: same look for texts that fit; a too long
+  one shows its first wrapped line + "..."). NoControls: "No
+  controls yet", "Open http://<ip>" / "to add controls" (two lines: one would not fit), the
+  HA line of the Status page; without a station link "Waiting for Wi-Fi..." / "Set up Wi-Fi
+  first".
+- `UI view` log: HA texts (value, state, title) through `logText()`: control characters
+  -> `?`, cut at 32 / 40 / 48 bytes on a UTF-8 boundary.
+- Fonts: `TEXT_RANGE` gains en / em dash, curly single / double quotes, ellipsis and euro
+  (common in HA friendly names), regenerated with `tools/gen_fonts.sh`; +8 glyphs per font,
+  flash +3572 bytes in total for round 2 (fonts ~3.4 KB: 47.6 / 81.6 / 209.8 KB).
+- Build (v0.6.1, round 2): RAM 55116 bytes (16.8 %), flash 1816277 bytes (28.0 %); round 1
+  was 1812705 bytes.
