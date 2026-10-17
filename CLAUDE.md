@@ -57,7 +57,7 @@ line, not only on `BOOT`.
   `PsramAllocator::instance()` (`src/hal/PsramAllocator.h`).
 - `lib/core/src/control/DomainActions` is the single source of truth for per-domain
   encoder actions, presses and step ranges, and of which actions an entity supports
-  (`availableActions`, `stepDefaultFor`). Do not duplicate that table elsewhere (the web
+  (`availableActions`, `stepDefaultFor`), value math and service calls. Do not duplicate that table elsewhere (the web
   UI gets it from `metaJson()` via `/api/meta/actions`).
 - `src/config/ConfigStore`: the only code that touches NVS namespace `haknob`. All public
   methods lock its mutex; never call LVGL or the HA socket while holding it.

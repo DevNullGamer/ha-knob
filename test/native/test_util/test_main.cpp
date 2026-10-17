@@ -2,12 +2,15 @@
 #include <unity.h>
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include "util/Base64.h"
+#include "util/MathUtil.h"
 #include "util/Sha1.h"
+#include "util/Text.h"
 
 namespace u = core::util;
 
@@ -165,6 +168,74 @@ static void test_b64_roundtrip_all_lengths() {
     }
 }
 
+// ---- Text: truncateUtf8 / logSafe ----
+
+static void test_logsafe_control_chars() {
+    TEST_ASSERT_EQUAL_STRING("a?b?c", u::logSafe("a\nb\x7f" "c", 10).c_str());
+    TEST_ASSERT_EQUAL_STRING("?", u::logSafe("\x1f", 10).c_str());
+    TEST_ASSERT_EQUAL_STRING("?x", u::logSafe("\x01x", 10).c_str());
+    TEST_ASSERT_EQUAL_STRING("a?b", u::logSafe("a\rb", 10).c_str());
+    TEST_ASSERT_EQUAL_UINT32(3, (uint32_t)u::logSafe(std::string("a\0b", 3), 10).size());
+    TEST_ASSERT_EQUAL_STRING("a?b", u::logSafe(std::string("a\0b", 3), 10).c_str());
+}
+
+static void test_logsafe_keeps_utf8() {
+    TEST_ASSERT_EQUAL_STRING("K\xC3\xB8kken", u::logSafe("K\xC3\xB8kken", 20).c_str());
+    TEST_ASSERT_EQUAL_STRING("a~", u::logSafe("a~", 5).c_str());
+}
+
+static void test_truncate_utf8_boundaries() {
+    TEST_ASSERT_EQUAL_STRING("ab", u::logSafe("ab\xC2\xB0", 3).c_str());  // cut inside 2-byte
+    TEST_ASSERT_EQUAL_STRING("ab\xC2\xB0", u::logSafe("ab\xC2\xB0", 4).c_str());
+    const char *three = "a\xE2\x82\xAC";  // euro sign
+    TEST_ASSERT_EQUAL_STRING("a", u::truncateUtf8(three, 2).c_str());
+    TEST_ASSERT_EQUAL_STRING("a", u::truncateUtf8(three, 3).c_str());
+    TEST_ASSERT_EQUAL_STRING(three, u::truncateUtf8(three, 4).c_str());
+    const char *four = "a\xF0\x9F\x98\x80";  // emoji
+    TEST_ASSERT_EQUAL_STRING("a", u::truncateUtf8(four, 2).c_str());
+    TEST_ASSERT_EQUAL_STRING("a", u::truncateUtf8(four, 3).c_str());
+    TEST_ASSERT_EQUAL_STRING("a", u::truncateUtf8(four, 4).c_str());
+    TEST_ASSERT_EQUAL_STRING(four, u::truncateUtf8(four, 5).c_str());
+    TEST_ASSERT_EQUAL_STRING("", u::truncateUtf8("\xF0\x9F\x98\x80", 3).c_str());
+    TEST_ASSERT_EQUAL_STRING("abc", u::truncateUtf8("abcdef", 3).c_str());
+    TEST_ASSERT_EQUAL_STRING("abc", u::truncateUtf8("abc", 3).c_str());
+    TEST_ASSERT_EQUAL_STRING("abc", u::truncateUtf8("abc", 100).c_str());
+}
+
+static void test_text_zero_and_empty() {
+    TEST_ASSERT_EQUAL_STRING("", u::logSafe("abc", 0).c_str());
+    TEST_ASSERT_EQUAL_STRING("", u::truncateUtf8("abc", 0).c_str());
+    TEST_ASSERT_EQUAL_STRING("", u::logSafe("", 10).c_str());
+    TEST_ASSERT_EQUAL_STRING("", u::truncateUtf8("", 0).c_str());
+}
+
+// ---- MathUtil: decimalsForStep / roundToDecimals ----
+
+static void test_math_decimals_for_step() {
+    TEST_ASSERT_EQUAL_INT(0, core::decimalsForStep(1));
+    TEST_ASSERT_EQUAL_INT(0, core::decimalsForStep(100));
+    TEST_ASSERT_EQUAL_INT(1, core::decimalsForStep(0.5));
+    TEST_ASSERT_EQUAL_INT(1, core::decimalsForStep(0.1));
+    TEST_ASSERT_EQUAL_INT(1, core::decimalsForStep(0.3));
+    TEST_ASSERT_EQUAL_INT(2, core::decimalsForStep(0.25));
+    TEST_ASSERT_EQUAL_INT(3, core::decimalsForStep(0.125));
+    TEST_ASSERT_EQUAL_INT(3, core::decimalsForStep(33.333333));
+    TEST_ASSERT_EQUAL_INT(0, core::decimalsForStep(0));
+    TEST_ASSERT_EQUAL_INT(0, core::decimalsForStep(-0.5));
+    TEST_ASSERT_EQUAL_INT(0, core::decimalsForStep(std::nan("")));
+}
+
+static void test_math_round_to_decimals() {
+    TEST_ASSERT_EQUAL_FLOAT(3, core::roundToDecimals(2.5, 0));
+    TEST_ASSERT_EQUAL_FLOAT(-3, core::roundToDecimals(-2.5, 0));
+    TEST_ASSERT_EQUAL_FLOAT(21.25, core::roundToDecimals(21.2500001, 2));
+    TEST_ASSERT_EQUAL_FLOAT(1.234568, core::roundToDecimals(1.23456789, 9));  // clamped to 6
+    TEST_ASSERT_EQUAL_FLOAT(2, core::roundToDecimals(1.6, -3));               // clamped to 0
+    TEST_ASSERT_FALSE(std::signbit(core::roundToDecimals(-0.0001, 1)));
+    TEST_ASSERT_FALSE(std::signbit(core::roundToDecimals(-0.0, 1)));
+    TEST_ASSERT_TRUE(core::roundToDecimals(30.000000000000004, 1) == 30.0);
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_sha1_empty);
@@ -179,5 +250,11 @@ int main(int, char **) {
     RUN_TEST(test_b64_decode_ignores_crlf);
     RUN_TEST(test_b64_decode_rejects);
     RUN_TEST(test_b64_roundtrip_all_lengths);
+    RUN_TEST(test_logsafe_control_chars);
+    RUN_TEST(test_logsafe_keeps_utf8);
+    RUN_TEST(test_truncate_utf8_boundaries);
+    RUN_TEST(test_text_zero_and_empty);
+    RUN_TEST(test_math_decimals_for_step);
+    RUN_TEST(test_math_round_to_decimals);
     return UNITY_END();
 }

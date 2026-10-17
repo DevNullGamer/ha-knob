@@ -1,9 +1,12 @@
 #include "control/DomainActions.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 #include "config/ConfigModel.h"
+#include "util/MathUtil.h"
 
 namespace core {
 namespace domain_actions {
@@ -76,8 +79,63 @@ constexpr DomainSpec kDomains[] = {
      countOf(kSwitchPresses)},
 };
 
+// Value ranges used when the entity reports none (HA's climate defaults for target_temp).
+constexpr double kDefaultMinKelvin = 2000;
+constexpr double kDefaultMaxKelvin = 6500;
+constexpr double kDefaultMinTemp = 7;
+constexpr double kDefaultMaxTemp = 35;
+constexpr double kHueCycle = 360;
+constexpr double kPercentFloorSlack = 1e-6;  // 99.9999999 (step 33.33333333) -> 100
+
 bool isAction(const ActionSpec &action, const char *name) {
     return std::strcmp(action.name, name) == 0;
+}
+
+bool isFinite(const std::optional<double> &v) { return v.has_value() && std::isfinite(*v); }
+
+// The entity's range if it is usable, else the default one.
+ValueRange rangeOr(const std::optional<double> &lo, const std::optional<double> &hi,
+                   double defaultLo, double defaultHi) {
+    if (isFinite(lo) && isFinite(hi) && *hi > *lo) {
+        return {*lo, *hi, false};
+    }
+    return {defaultLo, defaultHi, false};
+}
+
+std::optional<double> finiteOrNull(const std::optional<double> &v) {
+    return isFinite(v) ? v : std::nullopt;
+}
+
+bool isUnavailableState(std::string_view state) {
+    return state.empty() || state == "unavailable" || state == "unknown";
+}
+
+int toInt(double v) { return static_cast<int>(std::lround(v)); }
+
+// The common part of encoderCall / pressCall: NotFound and Unavailable.
+NoCall entityProblem(const ha::EntityState *entity) {
+    if (entity == nullptr) {
+        return NoCall::NotFound;
+    }
+    const std::string_view state(entity->state.data(), entity->state.size());
+    return isUnavailableState(state) ? NoCall::Unavailable : NoCall::None;
+}
+
+CallBuild noCall(NoCall reason) {
+    CallBuild build;
+    build.reason = reason;
+    return build;
+}
+
+CallBuild makeCall(const char *domain, const char *service, const std::string &entityId,
+                   JsonDocument data = JsonDocument()) {
+    CallBuild build;
+    build.call.emplace();
+    build.call->domain = domain;
+    build.call->service = service;
+    build.call->entityId = entityId;
+    build.call->data = std::move(data);
+    return build;
 }
 
 bool actionAvailable(const DomainSpec &domain, const ActionSpec &action,
@@ -177,13 +235,198 @@ double stepDefaultFor(const ActionSpec &action, const ha::EntityAttrs &attrs) {
         if (!step || !std::isfinite(*step) || *step <= 0) {
             return action.stepDefault;
         }
-        // HA reports 100/count, e.g. 33.333..; the tolerance keeps 25.0000001 at 25
-        const double rounded = std::ceil(*step - kStepTolerance);
-        return rounded < action.stepMin   ? action.stepMin
-               : rounded > action.stepMax ? action.stepMax
-                                          : rounded;
+        // HA reports 100/count, e.g. 33.333..; kept exact so one detent is one speed
+        // (Amendment A1), only clamped to the action range
+        return *step < action.stepMin   ? action.stepMin
+               : *step > action.stepMax ? action.stepMax
+                                        : *step;
     }
     return action.stepDefault;
+}
+
+ValueRange valueRange(const ActionSpec &action, const ha::EntityAttrs &attrs) {
+    if (isAction(action, "brightness") || isAction(action, "position") ||
+        isAction(action, "percentage") || isAction(action, "volume")) {
+        return {0, 100, false};
+    }
+    if (isAction(action, "hue")) {
+        return {0, kHueCycle, true};
+    }
+    if (isAction(action, "color_temp")) {
+        return rangeOr(attrs.minColorTempKelvin, attrs.maxColorTempKelvin, kDefaultMinKelvin,
+                       kDefaultMaxKelvin);
+    }
+    if (isAction(action, "target_temp")) {
+        return rangeOr(attrs.minTemp, attrs.maxTemp, kDefaultMinTemp, kDefaultMaxTemp);
+    }
+    return {0, 0, false};
+}
+
+std::optional<double> currentValue(const ActionSpec &action, const ha::EntityState &entity) {
+    const ha::EntityAttrs &attrs = entity.attrs;
+    const std::string_view state(entity.state.data(), entity.state.size());
+    if (isAction(action, "brightness")) {
+        if (state == "off" || !isFinite(attrs.brightness)) {
+            return 0.0;
+        }
+        return std::min(std::max(std::round(*attrs.brightness * 100.0 / 255.0), 0.0), 100.0);
+    }
+    if (isAction(action, "hue")) {
+        return finiteOrNull(attrs.hue);
+    }
+    if (isAction(action, "color_temp")) {
+        return finiteOrNull(attrs.colorTempKelvin);
+    }
+    if (isAction(action, "target_temp")) {
+        return finiteOrNull(attrs.temperature);
+    }
+    if (isAction(action, "position")) {
+        return finiteOrNull(attrs.currentPosition);
+    }
+    if (isAction(action, "percentage")) {
+        if (isFinite(attrs.percentage)) {
+            return attrs.percentage;
+        }
+        return state == "off" ? std::optional<double>(0.0) : std::nullopt;
+    }
+    if (isAction(action, "volume")) {
+        if (!isFinite(attrs.volumeLevel)) {
+            return std::nullopt;
+        }
+        return *attrs.volumeLevel * 100.0;
+    }
+    return std::nullopt;
+}
+
+std::optional<double> baseValue(const ActionSpec &action, const ha::EntityState &entity,
+                                double step) {
+    const std::optional<double> current = currentValue(action, entity);
+    if (current) {
+        return current;
+    }
+    if (isAction(action, "hue")) {
+        return 0.0;
+    }
+    if (isAction(action, "color_temp")) {
+        const ValueRange range = valueRange(action, entity.attrs);
+        return stepValue((range.min + range.max) / 2, 0, step, range);
+    }
+    return std::nullopt;
+}
+
+double stepValue(double base, int steps, double step, const ValueRange &range) {
+    const bool validStep = step > 0 && std::isfinite(step);
+    const double span = range.max - range.min;
+    double v = std::isfinite(base) ? base : range.min;
+    if (validStep) {
+        v += steps * step;
+        if (!range.wrap) {
+            v = std::round(v / step) * step;  // Q7-4: back on the step grid
+        }
+    }
+    if (range.wrap) {
+        if (span > 0) {
+            v = std::fmod(v - range.min, span);
+            if (v < 0) v += span;
+            v += range.min;
+        }
+    } else {
+        v = std::min(std::max(v, range.min), range.max);
+    }
+    if (validStep) {
+        v = roundToDecimals(v, decimalsForStep(step));
+    }
+    if (range.wrap && span > 0 && v >= range.max) {
+        v -= span;  // e.g. 359.9996 rounded up to 360
+    }
+    return v;
+}
+
+CallBuild encoderCall(const DomainSpec &domain, const ActionSpec &action,
+                      const std::string &entityId, double value, const ha::EntityState *entity) {
+    if (!action.hasStep || findAction(domain, action.name) == nullptr) {
+        return noCall(NoCall::NoAction);
+    }
+    const NoCall problem = entityProblem(entity);
+    if (problem != NoCall::None) {
+        return noCall(problem);
+    }
+    if (!std::isfinite(value) || !baseValue(action, *entity, action.stepDefault)) {
+        return noCall(NoCall::NoValue);
+    }
+
+    JsonDocument data;
+    if (isAction(action, "brightness")) {
+        const int percent = toInt(value);
+        if (percent <= 0) {
+            return makeCall(domain.domain, "turn_off", entityId);
+        }
+        data["brightness_pct"] = percent;
+        return makeCall(domain.domain, "turn_on", entityId, std::move(data));
+    }
+    if (isAction(action, "hue")) {
+        int hue = toInt(value);
+        if (hue >= static_cast<int>(kHueCycle)) hue = 0;
+        const std::optional<double> &saturation = entity->attrs.saturation;
+        JsonArray hs = data["hs_color"].to<JsonArray>();
+        hs.add(hue);
+        hs.add(isFinite(saturation) && *saturation > 0 ? *saturation : 100.0);
+        return makeCall(domain.domain, "turn_on", entityId, std::move(data));
+    }
+    if (isAction(action, "color_temp")) {
+        data["color_temp_kelvin"] = toInt(value);
+        return makeCall(domain.domain, "turn_on", entityId, std::move(data));
+    }
+    if (isAction(action, "target_temp")) {
+        data["temperature"] = value;
+        return makeCall(domain.domain, "set_temperature", entityId, std::move(data));
+    }
+    if (isAction(action, "position")) {
+        data["position"] = toInt(value);
+        return makeCall(domain.domain, "set_cover_position", entityId, std::move(data));
+    }
+    if (isAction(action, "percentage")) {
+        // HA's speed percentages are int(k * 100 // count) (33, 66, 100): floor, not round,
+        // so a value on the 100/count grid maps to that speed (Amendment A1)
+        data["percentage"] = static_cast<int>(std::floor(value + kPercentFloorSlack));
+        return makeCall(domain.domain, "set_percentage", entityId, std::move(data));
+    }
+    if (isAction(action, "volume")) {
+        data["volume_level"] = std::round(value) / 100.0;
+        return makeCall(domain.domain, "volume_set", entityId, std::move(data));
+    }
+    return noCall(NoCall::NoAction);  // an action without a mapping
+}
+
+CallBuild pressCall(const DomainSpec &domain, std::string_view press,
+                    const std::string &entityId, const ha::EntityState *entity) {
+    if (press == "none" || !hasPress(domain, press)) {
+        return noCall(NoCall::NoAction);
+    }
+    const NoCall problem = entityProblem(entity);
+    if (problem != NoCall::None) {
+        return noCall(problem);
+    }
+
+    if (press == "toggle") {
+        if (std::string_view(domain.domain) == "climate") {
+            const std::string_view state(entity->state.data(), entity->state.size());
+            return makeCall(domain.domain, state == "off" ? "turn_on" : "turn_off", entityId);
+        }
+        return makeCall(domain.domain, "toggle", entityId);
+    }
+    if (press == "stop") {
+        return makeCall(domain.domain, "stop_cover", entityId);
+    }
+    if (press == "play_pause") {
+        return makeCall(domain.domain, "media_play_pause", entityId);
+    }
+    if (press == "mute") {
+        JsonDocument data;
+        data["is_volume_muted"] = !entity->attrs.isVolumeMuted.value_or(false);
+        return makeCall(domain.domain, "volume_mute", entityId, std::move(data));
+    }
+    return noCall(NoCall::NoAction);  // a press without a mapping
 }
 
 std::string metaJson(ArduinoJson::Allocator *allocator) {

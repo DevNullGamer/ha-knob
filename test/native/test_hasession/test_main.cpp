@@ -2615,6 +2615,32 @@ static void test_ms_since_subscribe_none_after_disconnect_and_empty_ids() {
     TEST_ASSERT_FALSE(s.msSinceSubscribe(70).has_value());  // disconnected (Backoff)
 }
 
+static bool validUtf8(const std::string &s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = (unsigned char)s[i];
+        size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+        if (n == 0 || i + n > s.size()) return false;
+        for (size_t j = 1; j < n; ++j) {
+            if (((unsigned char)s[i + j] & 0xC0) != 0x80) return false;
+        }
+        i += n;
+    }
+    return true;
+}
+
+static void test_last_error_cut_on_utf8_boundary() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toAuthenticated(s, t, 0, {"light.a"});
+    std::string message;
+    for (int i = 0; i < 100; ++i) message += "\xC3\xB8";  // 200 bytes of 2-byte characters
+    feed(s, "{\"id\":1,\"type\":\"result\",\"success\":false,\"error\":{\"code\":\"x\",\"message\":\"" + message + "\"}}", 10);
+    TEST_ASSERT_TRUE(s.lastError().size() <= 120);
+    TEST_ASSERT_TRUE(s.lastError().size() >= 100);
+    TEST_ASSERT_TRUE(validUtf8(s.lastError()));
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_state_names);
@@ -2730,5 +2756,6 @@ int main(int, char **) {
     RUN_TEST(test_ms_since_subscribe_restarts_on_resubscribe);
     RUN_TEST(test_ms_since_subscribe_none_after_failed_result);
     RUN_TEST(test_ms_since_subscribe_none_after_disconnect_and_empty_ids);
+    RUN_TEST(test_last_error_cut_on_utf8_boundary);
     return UNITY_END();
 }

@@ -306,7 +306,7 @@ static void test_fixture_actions_and_steps() {
         {"climate.notemp", "none", 0},
         {"cover.pos", "position,none", 10},
         {"cover.nopos", "none", 0},
-        {"fan.f", "percentage,none", 34},
+        {"fan.f", "percentage,none", 33.33},
         {"media_player.tv", "volume,none", 2},
         {"switch.sw", "none", 0},
         {"input_boolean.ib", "none", 0},

@@ -185,13 +185,18 @@ static void test_step_default_climate() {
 
 static void test_step_default_fan() {
     const da::ActionSpec *a = action("fan", "percentage");
-    TEST_ASSERT_EQUAL_FLOAT(34.0, da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":33.33}")));
+    TEST_ASSERT_EQUAL_FLOAT(33.33, da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":33.33}")));
+    {
+        const double third = 100.0 / 3;  // kept unrounded (Amendment A1)
+        const double got = da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":33.333333333333336}"));
+        TEST_ASSERT_TRUE(got == third);
+    }
     TEST_ASSERT_EQUAL_FLOAT(10.0, da::stepDefaultFor(*a, attrsFrom("{}")));
     TEST_ASSERT_EQUAL_FLOAT(25.0, da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":25}")));
     TEST_ASSERT_EQUAL_FLOAT(1.0, da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":1}")));
     TEST_ASSERT_EQUAL_FLOAT(50.0, da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":100}")));  // clamp
     TEST_ASSERT_EQUAL_FLOAT(50.0, da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":50}")));
-    TEST_ASSERT_EQUAL_FLOAT(1.0, da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":0.5}")));   // ceil -> 1
+    TEST_ASSERT_EQUAL_FLOAT(1.0, da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":0.5}")));   // clamp to min 1
     TEST_ASSERT_EQUAL_FLOAT(10.0, da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":0}")));    // invalid
     TEST_ASSERT_EQUAL_FLOAT(10.0, da::stepDefaultFor(*a, attrsFrom("{\"percentage_step\":-5}")));   // invalid
 }

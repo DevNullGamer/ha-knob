@@ -5,38 +5,25 @@
 #include <cstdio>
 #include <optional>
 
+#include "control/DomainActions.h"
+#include "util/MathUtil.h"
+
 namespace core {
 namespace presenter {
 
 namespace {
-constexpr int kMaxStepDecimals = 3;
 constexpr int kMaxDecimals = 6;
-constexpr double kStepEpsilon = 1e-6;
 }  // namespace
 
 int decimalsForStep(double step) {
-    if (!(step > 0.0)) {
-        return 0;
-    }
-    double scaled = step;
-    for (int decimals = 0; decimals < kMaxStepDecimals; ++decimals) {
-        if (std::fabs(scaled - std::round(scaled)) < kStepEpsilon * scaled + kStepEpsilon) {
-            return decimals;
-        }
-        scaled *= 10.0;
-    }
-    return kMaxStepDecimals;
+    return core::decimalsForStep(step);
 }
 
 std::string formatNumber(double value, int decimals) {
     if (decimals < 0) decimals = 0;
     if (decimals > kMaxDecimals) decimals = kMaxDecimals;
 
-    const double scale = std::pow(10.0, decimals);
-    double rounded = std::round(value * scale) / scale;
-    if (rounded == 0.0) {
-        rounded = 0.0;  // turns -0.0 into 0.0
-    }
+    const double rounded = roundToDecimals(value, decimals);
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%.*f", decimals, rounded);
     return buf;
@@ -54,23 +41,23 @@ namespace {
 
 constexpr const char *kNoValue = "--";
 constexpr const char *kDegree = "\xC2\xB0";  // U+00B0, in the project fonts
-constexpr double kDefaultMinKelvin = 2000;
-constexpr double kDefaultMaxKelvin = 6500;
-constexpr double kDefaultMinTemp = 7;   // HA's climate defaults
-constexpr double kDefaultMaxTemp = 35;
 constexpr double kDefaultTempStep = 0.5;
 
 bool isFinite(const std::optional<double> &v) { return v.has_value() && std::isfinite(*v); }
 
-// The configured range if it is usable, else the default one.
-void setRange(ControlView &view, const std::optional<double> &lo, const std::optional<double> &hi,
-              double defaultLo, double defaultHi) {
-    if (isFinite(lo) && isFinite(hi) && *hi > *lo) {
-        view.arcMin = *lo;
-        view.arcMax = *hi;
-    } else {
-        view.arcMin = defaultLo;
-        view.arcMax = defaultHi;
+// The action's arc range from the DomainActions table (domain_actions::valueRange); the
+// action is looked up by name in any domain, like present() treats it.
+void setRange(ControlView &view, const std::string &action, const ha::EntityAttrs &attrs) {
+    size_t count = 0;
+    const domain_actions::DomainSpec *specs = domain_actions::domains(count);
+    for (size_t i = 0; i < count; ++i) {
+        const domain_actions::ActionSpec *spec = domain_actions::findAction(specs[i], action);
+        if (spec != nullptr && spec->hasStep) {
+            const domain_actions::ValueRange range = domain_actions::valueRange(*spec, attrs);
+            view.arcMin = range.min;
+            view.arcMax = range.max;
+            return;
+        }
     }
 }
 
@@ -133,13 +120,8 @@ ControlView present(const config::Control &control, const ha::EntityState *entit
     // Ranges first: they do not depend on a value.
     const ha::EntityAttrs empty;
     const ha::EntityAttrs &attrs = entity != nullptr ? entity->attrs : empty;
-    if (isHue) {
-        view.arcMax = 360;
-    } else if (isColorTemp) {
-        setRange(view, attrs.minColorTempKelvin, attrs.maxColorTempKelvin, kDefaultMinKelvin,
-                 kDefaultMaxKelvin);
-    } else if (isTargetTemp) {
-        setRange(view, attrs.minTemp, attrs.maxTemp, kDefaultMinTemp, kDefaultMaxTemp);
+    if (view.hasArc) {
+        setRange(view, action, attrs);
     }
 
     if (entity == nullptr) {

@@ -1045,7 +1045,8 @@ function controlRow(control, index) {
     if (!range) return;
     step.min = String(range.min);
     step.max = String(range.max);
-    step.step = String(range.min);
+    // a fan's percentage step is HA's exact 100/speeds (e.g. 33.333..), not a multiple of 1
+    step.step = control.action === 'percentage' ? 'any' : String(range.min);
     stepLabel.firstChild.textContent = 'Step (' + range.min + ' to ' + range.max + ')';
     step.value = Number.isFinite(control.step) ? String(control.step) : '';
   };

@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include "ha/HaProtocol.h"
+#include "util/Text.h"
 
 namespace core {
 namespace ha {
@@ -13,14 +14,6 @@ namespace {
 
 constexpr uint32_t kBackoffMs[] = {1000, 2000, 4000, 8000, 16000, 30000};
 constexpr size_t kBackoffSteps = sizeof(kBackoffMs) / sizeof(kBackoffMs[0]);
-
-// Cuts s to at most maxLen bytes without splitting a UTF-8 sequence.
-std::string truncateUtf8(const std::string &s, size_t maxLen) {
-    if (s.size() <= maxLen) return s;
-    size_t len = maxLen;
-    while (len > 0 && (static_cast<unsigned char>(s[len]) & 0xC0) == 0x80) --len;
-    return s.substr(0, len);
-}
 
 // Same ids regardless of order (both lists are de-duplicated).
 bool sameIdSet(std::vector<std::string> a, std::vector<std::string> b) {
@@ -410,7 +403,7 @@ void HaSession::setState(State state) {
 }
 
 void HaSession::setError(const std::string &error) {
-    std::string cut = truncateUtf8(error, kMaxErrorLen);
+    std::string cut = util::truncateUtf8(error, kMaxErrorLen);
     if (cut != lastError_) {
         lastError_ = std::move(cut);
         ++changeCount_;
@@ -690,7 +683,7 @@ void HaSession::setStatesState(StatesState state) {
 }
 
 void HaSession::setStatesError(const std::string &error) {
-    std::string cut = truncateUtf8(error, kMaxErrorLen);
+    std::string cut = util::truncateUtf8(error, kMaxErrorLen);
     if (cut != statesError_) {
         statesError_ = std::move(cut);
         ++statesChangeCount_;

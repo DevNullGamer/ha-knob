@@ -567,6 +567,73 @@ static void test_accel_millis_wraparound() {
     TEST_ASSERT_EQUAL_INT(4, acc.onDetent(0x0000000Eu));  // 30 ms later, wrapped
 }
 
+// onDetents (plan-step7.md Q7-2): detents spread evenly over the time since the last call.
+static void test_accel_ondetents_first_call_is_x1() {
+    Acceleration acc;
+    TEST_ASSERT_EQUAL_INT(3, acc.onDetents(3, 1000));
+}
+
+static void test_accel_ondetents_batches() {
+    Acceleration acc;
+    acc.onDetents(1, 1000);
+    TEST_ASSERT_EQUAL_INT(12, acc.onDetents(3, 1030));    // 10 ms each
+    TEST_ASSERT_EQUAL_INT(8, acc.onDetents(4, 1270));     // 240 ms / 4 = 60 ms each
+    TEST_ASSERT_EQUAL_INT(4, acc.onDetents(4, 1590));     // 320 ms / 4 = 80 ms each
+    TEST_ASSERT_EQUAL_INT(-12, acc.onDetents(-3, 1620));  // 30 ms / 3
+}
+
+static void test_accel_ondetents_zero_changes_nothing() {
+    Acceleration acc;
+    acc.onDetent(1000);
+    TEST_ASSERT_EQUAL_INT(0, acc.onDetents(0, 1020));
+    TEST_ASSERT_EQUAL_INT(4, acc.onDetent(1030));  // still 30 ms after 1000
+    Acceleration fresh;
+    TEST_ASSERT_EQUAL_INT(0, fresh.onDetents(0, 500));
+    TEST_ASSERT_EQUAL_INT(2, fresh.onDetents(2, 510));  // zero call did not set a timestamp
+}
+
+static void test_accel_ondetents_single_detent_boundaries() {
+    Acceleration acc;
+    acc.onDetents(1, 0);
+    TEST_ASSERT_EQUAL_INT(4, acc.onDetents(1, 39));
+    TEST_ASSERT_EQUAL_INT(2, acc.onDetents(1, 79));    // 40 ms
+    TEST_ASSERT_EQUAL_INT(1, acc.onDetents(1, 159));   // 80 ms
+    TEST_ASSERT_EQUAL_INT(-4, acc.onDetents(-1, 160));
+}
+
+static void test_accel_ondetents_batch_boundary_x2() {
+    Acceleration acc;
+    acc.onDetents(1, 0);
+    TEST_ASSERT_EQUAL_INT(12, acc.onDetents(3, 119));  // 119 < 120
+    TEST_ASSERT_EQUAL_INT(6, acc.onDetents(3, 239));   // exactly 120: not x4
+    TEST_ASSERT_EQUAL_INT(6, acc.onDetents(3, 478));   // 239 < 240
+    TEST_ASSERT_EQUAL_INT(3, acc.onDetents(3, 718));   // exactly 240: x1
+}
+
+static void test_accel_ondetents_disabled_reset_and_mixed() {
+    Acceleration acc;
+    acc.setEnabled(false);
+    acc.onDetents(1, 0);
+    TEST_ASSERT_EQUAL_INT(3, acc.onDetents(3, 10));
+    TEST_ASSERT_EQUAL_INT(-3, acc.onDetents(-3, 20));
+    acc.setEnabled(true);
+    TEST_ASSERT_EQUAL_INT(12, acc.onDetents(3, 30));
+    acc.reset();
+    TEST_ASSERT_EQUAL_INT(3, acc.onDetents(3, 40));
+    // mixed: onDetent and onDetents share the timestamp
+    acc.reset();
+    acc.onDetent(1000);
+    TEST_ASSERT_EQUAL_INT(8, acc.onDetents(2, 1060));  // 60 ms / 2
+    TEST_ASSERT_EQUAL_INT(4, acc.onDetent(1090));      // 30 ms after the batch
+    TEST_ASSERT_EQUAL_INT(8, acc.onDetents(2, 1150));  // 60 ms / 2
+}
+
+static void test_accel_ondetents_millis_wraparound() {
+    Acceleration acc;
+    acc.onDetents(1, 0xFFFFFFF0u);
+    TEST_ASSERT_EQUAL_INT(8, acc.onDetents(2, 0x0000000Eu));  // 30 ms / 2
+}
+
 // ---------------------------------------------------------------------------
 // SwipeClassifier: >= 80 px horizontal, <= 700 ms, |dx| >= 2 |dy|. Taps never act.
 // ---------------------------------------------------------------------------
@@ -765,6 +832,13 @@ int main() {
     RUN_TEST(test_accel_disabled_always_one);
     RUN_TEST(test_accel_reset_makes_next_one);
     RUN_TEST(test_accel_millis_wraparound);
+    RUN_TEST(test_accel_ondetents_first_call_is_x1);
+    RUN_TEST(test_accel_ondetents_batches);
+    RUN_TEST(test_accel_ondetents_zero_changes_nothing);
+    RUN_TEST(test_accel_ondetents_single_detent_boundaries);
+    RUN_TEST(test_accel_ondetents_batch_boundary_x2);
+    RUN_TEST(test_accel_ondetents_disabled_reset_and_mixed);
+    RUN_TEST(test_accel_ondetents_millis_wraparound);
     // SwipeClassifier
     RUN_TEST(test_swipe_left);
     RUN_TEST(test_swipe_right);

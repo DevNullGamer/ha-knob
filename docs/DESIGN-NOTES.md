@@ -302,6 +302,8 @@ Spec: `plan-step6.md` §3.3, §3.4. Core only; nothing on the device uses it yet
   a 1e-9 tolerance (33.33 -> 34, 25.0000001 -> 25) and clamps to the action range;
   non-positive / non-finite steps take the table default. Fallbacks and clamps come from
   the table (no duplicated constants).
+  (Superseded in Step 7.1 round 2, plan-step7.md Amendment A1: the fan step is now HA's
+  exact `percentage_step`, no ceil; see "Step 7.1 / 7.2".)
 - `metaJson` takes `max_controls` / `max_label_bytes` from `config::kMaxControls` /
   `kMaxLabelBytes`; actions without a step have no `step` member.
 - `EntityStore` applies `a`, then `c` (`-.a` resets before `+` is applied, so `+` wins
@@ -730,3 +732,62 @@ navigation; v0.6.1. The encoder still sends nothing to HA (Step 7).
   flash +3572 bytes in total for round 2 (fonts ~3.4 KB: 47.6 / 81.6 / 209.8 KB).
 - Build (v0.6.1, round 2): RAM 55116 bytes (16.8 %), flash 1816277 bytes (28.0 %); round 1
   was 1812705 bytes.
+
+## Step 7.1 / 7.2 (2026-10-17)
+
+Spec: `plan-step7.md` §3.1, §3.2, §4 Steps 7.1 and 7.2 (Q7-2..Q7-5). Core only; nothing on
+the device uses it yet (Step 7.6).
+
+- `core::domain_actions` (DomainActions, still the only table): `valueRange` (0-100;
+  hue 0-360 wrap; color_temp `min/max_color_temp_kelvin` else 2000-6500; target_temp
+  `min_temp`/`max_temp` else 7-35; usable only if both finite and max > min),
+  `currentValue` (display units; brightness off / absent -> 0, fan absent + `off` -> 0),
+  `baseValue` (adds hue 0 and color_temp mid-range snapped), `stepValue`, `encoderCall`,
+  `pressCall` -> `CallBuild {optional<ServiceCall>, NoCall}`. The presenter's arc ranges
+  come from `valueRange` (action looked up by name in any domain, as `present()` treats
+  it); its value extraction is unchanged until Step 7.5.
+- `stepValue` (Q7-4): `round((base + steps*step) / step) * step`, clamp, round to
+  `decimalsForStep(step)`. **Deviation:** wrapping ranges (hue) are not snapped, only
+  wrapped (modulo, never negative, in [0, 360)): with the snap the spec's own tests
+  (355 + 2x10 -> 15, 5 - 1x10 -> 355) would give 20 / 350, and a 360 cycle is not a
+  multiple of every allowed hue step (1-60), so a grid would jump at the wrap. Rounding to
+  the step's decimals makes 100 steps up and down return exactly to the start (no drift).
+- `encoderCall` check order: `none` / action not in the domain -> NoAction (no toast for a
+  `none` control even if its entity is missing), entity nullptr -> NotFound, state
+  `unavailable` / `unknown` / `""` -> Unavailable, `baseValue()` nullopt or non-finite value
+  -> NoValue (climate `temperature` null, cover without position, player without volume).
+  Integers via `lround` (fan `percentage`: `floor(v + 1e-6)`, below); hue 360 -> 0; `temperature` is a double (ArduinoJson writes 22.0 as
+  `22`); `volume_level` `round(v) / 100` (0.42). `pressCall`: `none` / press not in the
+  domain -> NoAction, then NotFound / Unavailable; climate toggle `off` -> `turn_on`, any
+  other state -> `turn_off`.
+- `util/MathUtil`: `decimalsForStep`, `roundToDecimals` (moved from the presenter, which
+  keeps `decimalsForStep` / `formatNumber` as wrappers). `util/Text`: `truncateUtf8` (from
+  HaSession.cpp) and `logSafe` (same behaviour as main.cpp's `logText`; main.cpp switches
+  in Step 7.6 with the other device glue).
+- Multi-speed fans (Amendment A1, round 2; **changes Step 6.1's ceil**): `stepDefaultFor`
+  returns HA's exact `percentage_step` (100 / speeds, e.g. 33.333..), only clamped to 1-50,
+  so one detent is one speed (with the ceil, 34, a 3-speed fan at 33 went 33 -> 68 ->
+  speed 3). Config validation only checks the range, so a fractional step was already
+  valid; the web UI's step input uses `step="any"` for `percentage`. The call sends
+  `floor(v + 1e-6)`: HA reports speeds as `int(k * 100 // n)` (33/66/100) and maps a
+  percentage to speed `ceil(n * p / 100)`; the snapped grid value 66.667 must go out as 66,
+  and a step stored with 9 decimals (33.33333333 x 3 = 99.99999999) still reaches 100.
+  Checked by hand for 3, 6 and 7 speeds from HA's values (and 0 / 100), up and down: one
+  speed per detent. The displayed percentage stays an integer (the presenter shows HA's
+  value; Step 7.5's local value must also be shown floored, `formatPercent` would round
+  66.667 to 67). The catalog's `step_default` gets longer (`33.33333333`); the JSON writer
+  only regrows its reserve for that.
+- `core::control::Throttle` (Q7-1, Q7-3): leading edge at once, then the latest target at
+  most once per interval. Within one hold a target equal to the last sent value is not
+  sent again; a `change()` that starts a new hold (not holding before it) forgets the last
+  sent value, because HA's value may have moved since (round 2 fix: 60 sent, HA later 55,
+  +1 detent = 60 was never sent). `failed()` also forgets it at once but keeps the send
+  time, so the interval still applies after an error; `drop()` ends the hold, so the next
+  change forgets it too. In-flight calls stay counted (their answers still decrement).
+  The settle test `now - lastChange < settle` is modulo 2^32 ms: a control idle for
+  ~49.7 days would hold for 1.5 s once (left for Step 7.4: the engine can drop idle
+  throttles or reset them).
+- `Acceleration::onDetents(n, now)`: per-detent interval `(now - last) / |n|`, compared as
+  `interval < threshold * |n|` (no truncation); shares the state with `onDetent`; 0 detents
+  changes nothing. Note: the spec's test "4 in 240 ms -> x1" is 60 ms per detent, which is
+  x2 by Q7-2's thresholds; x1 needs >= 80 ms per detent (4 in >= 320 ms).
