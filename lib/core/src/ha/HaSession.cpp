@@ -691,7 +691,8 @@ void HaSession::handleResult(uint32_t id, bool success, const std::string &error
             setError(message.empty() ? std::string("subscribe_failed") : "subscribe_failed: " + message);
         }
     } else if (purpose == Purpose::Unsubscribe && !success) {
-        log(message.empty() ? std::string("unsubscribe failed") : "unsubscribe failed: " + message);
+        log(message.empty() ? std::string("unsubscribe failed")
+                            : "unsubscribe failed: " + util::logSafe(message, 60));
     }
 }
 

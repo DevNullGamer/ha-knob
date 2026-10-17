@@ -133,7 +133,7 @@ TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
 UI page=<i>/<n> | no_controls | status   page shown after a swipe, the Select list, or a long press without controls
 UI select open | choose=<i> | status     Select list opened / control page i or Status chosen
 UI select cancel reason=<long|idle|config|setup>   Select list closed without a change
-UI view page=<i>/<n> value=<v><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1> unconfirmed=<0|1> title=<t>   the shown control page changed (unconfirmed=1: a turned value HA has not confirmed yet)
+UI view page=<i>/<n> value=<v><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1> unconfirmed=<0|1> title=<t> banner=<0|1>   the shown control page changed (unconfirmed=1: a turned value HA has not confirmed yet; banner=1: HA not connected, state = the reason)
 UI toast text=<t>                        a control notice shown to the user for 3 s
 CTL press page=<i> press=<press>         short press on control page i
 CTL notice=<kind> page=<i> text=<t>      ha_offline / not_found / unavailable / no_value / busy / failed / timeout
@@ -176,7 +176,7 @@ HA protocol error reason=<r>             invalid WebSocket data from the server 
 HA rx stalled bytes=<n> ms=<n>           a message stopped arriving for 15 s (connection closed, rx_stalled)
 HA subscribe id=<n> ids=<k>              subscribe_entities for the k unique entity ids of the controls
 HA unsubscribe id=<n> subscription=<id>  the controls changed: old subscription ended (same connection)
-HA unsubscribe failed: <message>         Home Assistant refused it (or "timeout"); logged only
+HA unsubscribe failed[: <message>]       Home Assistant refused it (or "timeout"); logged only; message max 60 bytes, control characters as ?
 HA snapshot entities=<n>                 first state snapshot of a subscription
 HA event dropped error=<e>               an entity update that could not be applied (too_large or a JSON error)
 HA states request id=<n>                 entity list (get_states) requested
@@ -202,6 +202,9 @@ without the loop's own 5 ms delay) since the previous `HB`. `ent` is the number 
 entities / unique entity ids of the controls, `cat` the entity list fetch (`none`,
 `fetching`, `building`, `ready`, `failed`), `stack` the loop task stack never used since
 boot (bytes) and `psram_free` the free PSRAM. SSIDs are logged, passwords and tokens never.
+
+A log line is at most 318 characters plus the newline (longer lines are cut); the longest possible `HB`
+line is well below that.
 
 Serial output never blocks the firmware: when the board is plugged into a PC but no program
 reads the port, the 4 KB transmit buffer fills up and further lines are dropped (counted in
@@ -577,9 +580,13 @@ hue in °, colour temperature in K, target temperature in the control's step (st
 "heat, now 20.3°"), cover position, fan percentage and volume in %; the action `none`
 shows the entity state as the value and no arc (`unavailable` / `unknown`: `--`, the state
 in the state line; long states in a smaller font). A value HA does not report shows `--`.
-Dimmed: HA not connected (last values, state line "HA offline"), the entity `unavailable`
-or `unknown`, or the entity missing ("waiting..." until the subscription's first state
-snapshot arrives or for 3 s, then "not found"). A page stays selected across a config
+Dimmed: HA not connected, the entity `unavailable` or `unknown`, or the entity missing
+("waiting..." until the subscription's first state snapshot arrives or for 3 s, then "not
+found"). While HA is not connected the page keeps the last values dimmed and the state line
+becomes a dark red banner with the reason: "No Wi-Fi" (station not connected), "HA not set
+up" (no URL or token), "Connecting to HA..." (connecting, authenticating or subscribing),
+"HA token rejected" or "HA offline" (waiting to reconnect). An `unavailable` entity is only
+dimmed, without a banner. A page stays selected across a config
 change while its number still exists, otherwise the first page is shown.
 
 ## Control

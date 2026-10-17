@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "control/DomainActions.h"
+#include "ha/HaSession.h"
 #include "util/MathUtil.h"
 
 namespace core {
@@ -13,6 +14,12 @@ namespace presenter {
 
 namespace {
 constexpr int kMaxDecimals = 6;
+
+// The state text while HA is not Ready; "HA offline" if the caller gave no reason.
+const char *notReadyText(const PresentContext &context) {
+    return offlineText(context.offline == OfflineReason::None ? OfflineReason::Offline
+                                                              : context.offline);
+}
 }  // namespace
 
 int decimalsForStep(double step) {
@@ -86,7 +93,37 @@ bool ControlView::operator==(const ControlView &o) const {
     return title == o.title && value == o.value && unit == o.unit && hasArc == o.hasArc &&
            arcMin == o.arcMin && arcMax == o.arcMax && arcValue == o.arcValue &&
            stateText == o.stateText && dimmed == o.dimmed && unconfirmed == o.unconfirmed &&
-           arcRgb == o.arcRgb;
+           arcRgb == o.arcRgb && banner == o.banner;
+}
+
+OfflineReason offlineReason(ha::State state, bool wifiUp) {
+    if (state == ha::State::Ready) {
+        return OfflineReason::None;
+    }
+    if (!wifiUp) {
+        return OfflineReason::NoWifi;
+    }
+    switch (state) {
+        case ha::State::NoConfig: return OfflineReason::HaNotSetUp;
+        case ha::State::Connecting:
+        case ha::State::Authenticating:
+        case ha::State::Subscribing: return OfflineReason::Connecting;
+        case ha::State::AuthFailed: return OfflineReason::TokenRejected;
+        case ha::State::Backoff:
+        default: return OfflineReason::Offline;
+    }
+}
+
+const char *offlineText(OfflineReason reason) {
+    switch (reason) {
+        case OfflineReason::None: return "";
+        case OfflineReason::NoWifi: return "No Wi-Fi";
+        case OfflineReason::HaNotSetUp: return "HA not set up";
+        case OfflineReason::Connecting: return "Connecting to HA...";
+        case OfflineReason::TokenRejected: return "HA token rejected";
+        case OfflineReason::Offline:
+        default: return "HA offline";
+    }
 }
 
 uint32_t hueToRgb(double hue) {
@@ -142,7 +179,8 @@ ControlView present(const config::Control &control, const ha::EntityState *entit
         view.value = kNoValue;
         view.arcValue = view.arcMin;
         view.dimmed = true;
-        view.stateText = !context.haReady   ? "HA offline"
+        view.banner = !context.haReady;
+        view.stateText = !context.haReady   ? notReadyText(context)
                          : waitOver(context) ? "not found"
                                              : "waiting...";
         if (!view.hasArc) {
@@ -214,7 +252,8 @@ ControlView present(const config::Control &control, const ha::EntityState *entit
     // A local value is the user's own turn: dimmed only while HA is not Ready (Q7-6).
     view.dimmed = !context.haReady || (!useLocal && isUnavailable(state));
     if (!context.haReady) {
-        view.stateText = "HA offline";
+        view.banner = true;
+        view.stateText = notReadyText(context);
     }
     return view;
 }

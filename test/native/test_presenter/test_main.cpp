@@ -8,6 +8,7 @@
 #include <string>
 
 #include "control/DomainActions.h"
+#include "ha/HaSession.h"
 #include "ui/Presenter.h"
 #include "util/MathUtil.h"
 
@@ -722,8 +723,142 @@ static void test_percentage_helper_same_in_call_and_view() {
     }
 }
 
+// ---- Step 8.6: disconnected banner (offlineReason / offlineText / ControlView::banner) ----
+// Presenter.h only forward-declares ha::State, so the full enum comes from HaSession.h.
+using core::presenter::OfflineReason;
+using core::presenter::offlineReason;
+using core::presenter::offlineText;
+using HaState = core::ha::State;
+
+static void test_offline_reason_every_state_wifi_up() {
+    TEST_ASSERT_EQUAL((int)OfflineReason::HaNotSetUp, (int)offlineReason(HaState::NoConfig, true));
+    TEST_ASSERT_EQUAL((int)OfflineReason::Connecting, (int)offlineReason(HaState::Connecting, true));
+    TEST_ASSERT_EQUAL((int)OfflineReason::Connecting, (int)offlineReason(HaState::Authenticating, true));
+    TEST_ASSERT_EQUAL((int)OfflineReason::Connecting, (int)offlineReason(HaState::Subscribing, true));
+    TEST_ASSERT_EQUAL((int)OfflineReason::None, (int)offlineReason(HaState::Ready, true));
+    TEST_ASSERT_EQUAL((int)OfflineReason::TokenRejected, (int)offlineReason(HaState::AuthFailed, true));
+    TEST_ASSERT_EQUAL((int)OfflineReason::Offline, (int)offlineReason(HaState::Backoff, true));
+}
+
+static void test_offline_reason_every_state_wifi_down() {
+    // Ready wins over a missing Wi-Fi; every other state says "No Wi-Fi"
+    TEST_ASSERT_EQUAL((int)OfflineReason::None, (int)offlineReason(HaState::Ready, false));
+    const HaState others[] = {HaState::NoConfig, HaState::Connecting, HaState::Authenticating,
+                              HaState::Subscribing, HaState::AuthFailed, HaState::Backoff};
+    for (HaState s : others) {
+        TEST_ASSERT_EQUAL((int)OfflineReason::NoWifi, (int)offlineReason(s, false));
+    }
+}
+
+static void test_offline_text_each_reason() {
+    TEST_ASSERT_EQUAL_STRING("", offlineText(OfflineReason::None));
+    TEST_ASSERT_EQUAL_STRING("No Wi-Fi", offlineText(OfflineReason::NoWifi));
+    TEST_ASSERT_EQUAL_STRING("HA not set up", offlineText(OfflineReason::HaNotSetUp));
+    TEST_ASSERT_EQUAL_STRING("Connecting to HA...", offlineText(OfflineReason::Connecting));
+    TEST_ASSERT_EQUAL_STRING("HA token rejected", offlineText(OfflineReason::TokenRejected));
+    TEST_ASSERT_EQUAL_STRING("HA offline", offlineText(OfflineReason::Offline));
+}
+
+static void test_present_banner_per_reason() {
+    const OfflineReason reasons[] = {OfflineReason::NoWifi, OfflineReason::HaNotSetUp,
+                                     OfflineReason::Connecting, OfflineReason::TokenRejected,
+                                     OfflineReason::Offline};
+    for (OfflineReason r : reasons) {
+        core::ha::EntityState e = ent("on");
+        e.attrs.brightness = 255;
+        PresentContext c = ready();
+        c.haReady = false;
+        c.offline = r;
+        ControlView v = present(ctl("brightness"), &e, c);
+        ASSERT_STR(offlineText(r), v.stateText);
+        TEST_ASSERT_TRUE(v.banner);
+        TEST_ASSERT_TRUE(v.dimmed);
+        ASSERT_STR("100", v.value);  // the last values stay, only dimmed
+    }
+}
+
+static void test_present_ready_has_no_banner() {
+    core::ha::EntityState e = ent("on");
+    e.attrs.brightness = 255;
+    ControlView v = present(ctl("brightness"), &e, ready());
+    TEST_ASSERT_FALSE(v.banner);
+    TEST_ASSERT_FALSE(v.dimmed);
+    ASSERT_STR("on", v.stateText);
+    // an ignored offline reason while Ready
+    PresentContext c = ready();
+    c.offline = OfflineReason::NoWifi;
+    v = present(ctl("brightness"), &e, c);
+    TEST_ASSERT_FALSE(v.banner);
+    ASSERT_STR("on", v.stateText);
+    // Ready with an unavailable entity: dimmed, but no banner
+    core::ha::EntityState u = ent("unavailable");
+    v = present(ctl("brightness"), &u, ready());
+    TEST_ASSERT_TRUE(v.dimmed);
+    TEST_ASSERT_FALSE(v.banner);
+    // Ready, entity missing after the grace time: "not found", no banner
+    PresentContext m = ready();
+    m.msSinceSubscribe = core::presenter::kNotFoundAfterMs;
+    v = present(ctl("brightness"), nullptr, m);
+    ASSERT_STR("not found", v.stateText);
+    TEST_ASSERT_FALSE(v.banner);
+}
+
+static void test_present_local_not_ready_has_banner() {
+    core::ha::EntityState e = ent("on");
+    PresentContext c = readyLocal(40);
+    c.haReady = false;
+    c.offline = OfflineReason::Connecting;
+    ControlView v = present(ctl("brightness"), &e, c);
+    TEST_ASSERT_TRUE(v.banner);
+    TEST_ASSERT_TRUE(v.dimmed);
+    ASSERT_STR("Connecting to HA...", v.stateText);
+    ASSERT_STR("40", v.value);
+}
+
+static void test_present_not_ready_missing_entity_banner() {
+    PresentContext c;
+    c.haReady = false;
+    c.offline = OfflineReason::NoWifi;
+    ControlView v = present(ctl("brightness"), nullptr, c);
+    TEST_ASSERT_TRUE(v.banner);
+    TEST_ASSERT_TRUE(v.dimmed);
+    ASSERT_STR("No Wi-Fi", v.stateText);
+}
+
+static void test_present_not_ready_reason_none_falls_back_to_offline() {
+    core::ha::EntityState e = ent("on");
+    PresentContext c;
+    c.haReady = false;
+    c.offline = OfflineReason::None;  // caller inconsistency
+    ControlView v = present(ctl("brightness"), &e, c);
+    ASSERT_STR("HA offline", v.stateText);
+    TEST_ASSERT_TRUE(v.banner);
+    // the default context still gives "HA offline"
+    v = present(ctl("brightness"), &e, PresentContext());
+    ASSERT_STR("HA offline", v.stateText);
+    TEST_ASSERT_TRUE(v.banner);
+}
+
+static void test_view_equality_includes_banner() {
+    core::ha::EntityState e = ent("on");
+    ControlView a = present(ctl("brightness"), &e, ready());
+    ControlView b = a;
+    TEST_ASSERT_TRUE(a == b);
+    b.banner = !b.banner;
+    TEST_ASSERT_FALSE(a == b);
+}
+
 int main() {
     UNITY_BEGIN();
+    RUN_TEST(test_offline_reason_every_state_wifi_up);
+    RUN_TEST(test_offline_reason_every_state_wifi_down);
+    RUN_TEST(test_offline_text_each_reason);
+    RUN_TEST(test_present_banner_per_reason);
+    RUN_TEST(test_present_ready_has_no_banner);
+    RUN_TEST(test_present_local_not_ready_has_banner);
+    RUN_TEST(test_present_not_ready_missing_entity_banner);
+    RUN_TEST(test_present_not_ready_reason_none_falls_back_to_offline);
+    RUN_TEST(test_view_equality_includes_banner);
     RUN_TEST(test_brightness);
     RUN_TEST(test_brightness_off_and_absent);
     RUN_TEST(test_brightness_unavailable_dimmed);

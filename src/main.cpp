@@ -25,7 +25,8 @@
 //   UI select open | choose=<i> | status | cancel reason=<long|idle|config|setup>
 //                                                 the Select list (src/ui/Ui.h)
 //   UI view page=<i>/<n> value=<value><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1>
-//           unconfirmed=<0|1> title=<t>   (one line) the selected control page shows something new
+//           unconfirmed=<0|1> title=<t> banner=<0|1>   (one line) the selected control page
+//           shows something new (banner=1: HA not Ready, state = the offline reason)
 //   UI toast text=<t>                             a control notice (src/ui/Ui.h)
 //   CTL ...   control presses and notices (see src/app/Control.h)
 //   TIN <cmd> | TIN bad <cmd>   test builds only (-DHAKNOB_TEST_INPUT): injected input
@@ -99,11 +100,13 @@ struct ViewKey {
     core::ha::State haState = core::ha::State::NoConfig;
     bool waitOver = false;
     uint32_t controlVersion = 0;  // app::control::version(): a local value can have changed
+    // The banner text; depends on the Wi-Fi link too (e.g. Backoff -> "No Wi-Fi").
+    core::presenter::OfflineReason offline = core::presenter::OfflineReason::None;
 
     bool operator==(const ViewKey &o) const {
         return page == o.page && controlsGeneration == o.controlsGeneration &&
                storeVersion == o.storeVersion && haState == o.haState && waitOver == o.waitOver &&
-               controlVersion == o.controlVersion;
+               controlVersion == o.controlVersion && offline == o.offline;
     }
 };
 ViewKey shownViewKey;
@@ -220,6 +223,7 @@ void publishControlView(uint32_t nowMs) {
     const core::ha::State haState = ha::status().state;
     core::presenter::PresentContext context;
     context.haReady = haState == core::ha::State::Ready;
+    context.offline = core::presenter::offlineReason(haState, net::wifi::status().staConnected);
     context.snapshotSeen = store.snapshotSeen();
     // No subscription (none sent, or it failed): a missing entity is "not found" at once.
     context.msSinceSubscribe = ha::msSinceSubscribe(nowMs).value_or(UINT32_MAX);
@@ -231,6 +235,7 @@ void publishControlView(uint32_t nowMs) {
     key.haState = haState;
     key.waitOver = core::presenter::waitOver(context);
     key.controlVersion = app::control::version();
+    key.offline = context.offline;
     if (viewBuilt && key == shownViewKey) {
         return;
     }
@@ -252,11 +257,12 @@ void publishControlView(uint32_t nowMs) {
             snprintf(arc, sizeof(arc), "%g[%g,%g]", view.arcValue, view.arcMin, view.arcMax);
         }
         using core::util::logSafe;
-        util::logPrintf("UI view page=%d/%u value=%s%s state=%s arc=%s dimmed=%d unconfirmed=%d title=%s\n",
+        util::logPrintf("UI view page=%d/%u value=%s%s state=%s arc=%s dimmed=%d unconfirmed=%d title=%s "
+                        "banner=%d\n",
                         key.page + 1, static_cast<unsigned>(controls.size()),
                         logSafe(view.value, 32).c_str(), view.unit.c_str(),
                         logSafe(view.stateText, 40).c_str(), arc, view.dimmed ? 1 : 0,
-                        view.unconfirmed ? 1 : 0, logSafe(view.title, 48).c_str());
+                        view.unconfirmed ? 1 : 0, logSafe(view.title, 48).c_str(), view.banner ? 1 : 0);
     }
     shownControlView = view;
 }

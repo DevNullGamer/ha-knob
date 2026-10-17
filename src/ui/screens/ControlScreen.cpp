@@ -23,6 +23,13 @@ constexpr uint32_t kArcColor = 0xFFA000;
 constexpr uint32_t kArcUnconfirmedColor = 0xFFFFFF;  // a local value HA has not confirmed (Q7-6)
 constexpr uint32_t kArcDimColor = 0x505050;
 constexpr uint32_t kArcTrackColor = 0x282828;
+constexpr int32_t kStateY = 50;
+constexpr int32_t kStateWidth = 270;
+// The state line as the "HA not Ready" banner (plan-step8.md Q8-15): a pill in the same slot.
+constexpr uint32_t kBannerColor = 0x7A1F1F;
+constexpr int32_t kBannerRadius = 12;
+constexpr int32_t kBannerPadHor = 12;
+constexpr int32_t kBannerPadVer = 4;
 
 lv_obj_t *arc = nullptr;
 lv_obj_t *titleLabel = nullptr;
@@ -38,6 +45,7 @@ std::string shownPage;
 int32_t shownArcValue = -1;
 bool shownArcVisible = true;
 bool shownDimmed = false;
+bool shownBanner = false;
 uint32_t shownArcColor = kArcColor;
 const lv_font_t *shownValueFont = &ui_font_56;
 
@@ -76,11 +84,27 @@ int32_t arcPosition(const core::presenter::ControlView &view) {
     return static_cast<int32_t>(std::lround(fraction * kArcSteps));
 }
 
-void setDimmed(bool dimmed) {
+// Title, value and (unless it is the banner, which is always white) the state line.
+void setDimmed(bool dimmed, bool banner) {
     const lv_color_t text = lv_color_hex(dimmed ? kDimColor : kTextColor);
     lv_obj_set_style_text_color(titleLabel, text, 0);
     lv_obj_set_style_text_color(valueLabel, text, 0);
-    lv_obj_set_style_text_color(stateLabel, text, 0);
+    lv_obj_set_style_text_color(stateLabel, banner ? lv_color_hex(kTextColor) : text, 0);
+}
+
+// Shows or hides the pill behind the state line. Background colour and radius are set once
+// in create(); the height grows by the padding so the text keeps its one-line height and
+// the line stays centred at kStateY.
+void setBanner(bool banner) {
+    const int32_t padHor = banner ? kBannerPadHor : 0;
+    const int32_t padVer = banner ? kBannerPadVer : 0;
+    lv_obj_set_style_bg_opa(stateLabel, banner ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_left(stateLabel, padHor, 0);
+    lv_obj_set_style_pad_right(stateLabel, padHor, 0);
+    lv_obj_set_style_pad_top(stateLabel, padVer, 0);
+    lv_obj_set_style_pad_bottom(stateLabel, padVer, 0);
+    lv_obj_set_height(stateLabel, lv_font_get_line_height(&ui_font_20) + 2 * padVer);
+    lv_obj_align(stateLabel, LV_ALIGN_CENTER, 0, kStateY);
 }
 
 // The arc indicator (plan-step7.md §3.6, Q7-6): a hue's own colour, else grey when dimmed
@@ -117,7 +141,9 @@ lv_obj_t *create() {
 
     titleLabel = addClippedLabel(scr, &ui_font_28, -95, 250, "");
     valueLabel = addClippedLabel(scr, &ui_font_56, kValueY, kValueWidth, "");
-    stateLabel = addClippedLabel(scr, &ui_font_20, 50, 270, "");
+    stateLabel = addClippedLabel(scr, &ui_font_20, kStateY, kStateWidth, "");
+    lv_obj_set_style_bg_color(stateLabel, lv_color_hex(kBannerColor), 0);
+    lv_obj_set_style_radius(stateLabel, kBannerRadius, 0);
     pageLabel = addCenteredLabel(scr, &ui_font_20, 150, "");
     return scr;
 }
@@ -147,9 +173,13 @@ void show(const core::presenter::ControlView &view, size_t index, size_t count) 
         shownArcValue = position;
         lv_arc_set_value(arc, position);
     }
-    if (view.dimmed != shownDimmed) {
+    if (view.banner != shownBanner) {
+        setBanner(view.banner);
+    }
+    if (view.dimmed != shownDimmed || view.banner != shownBanner) {
         shownDimmed = view.dimmed;
-        setDimmed(view.dimmed);
+        shownBanner = view.banner;
+        setDimmed(view.dimmed, view.banner);
     }
     const uint32_t color = arcColor(view);
     if (color != shownArcColor) {

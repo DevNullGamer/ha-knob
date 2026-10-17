@@ -3281,8 +3281,81 @@ static void test_call_logs_never_contain_token() {
     TEST_ASSERT_FALSE(anyLogContains(logs, "SECRETTOKEN123"));
 }
 
+// ---- Step 8.3: "unsubscribe failed" goes through logSafe(message, 60) ----
+static void unsubscribeFailLine(const std::string &jsonMessage, std::string &lineOut) {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0, {"light.a"});
+    reconfigure(s, {}, 1000);  // unsubscribe id 2
+    feed(s, resultFail(2, jsonMessage), 1001);
+    for (const std::string &l : logs.lines) {
+        if (l.compare(0, 18, "unsubscribe failed") == 0) lineOut = l;
+    }
+}
+
+static bool validUtf8Line(const std::string &s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = (unsigned char)s[i];
+        size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+        if (n == 0 || i + n > s.size()) return false;
+        for (size_t k = 1; k < n; ++k) {
+            if (((unsigned char)s[i + k] >> 6) != 2) return false;
+        }
+        i += n;
+    }
+    return true;
+}
+
+static void test_unsubscribe_failed_message_is_sanitised_and_cut() {
+    // 200+ bytes: a newline, a tab, then 3-byte characters so the 60-byte cut lands mid-character
+    std::string msg = "ab\\ncd\\t";  // JSON escapes: newline and tab inside the text
+    for (int i = 0; i < 70; ++i) msg += "\xE2\x82\xAC";  // euro sign, 3 bytes each
+    std::string line;
+    unsubscribeFailLine(msg, line);
+    const std::string prefix = "unsubscribe failed: ";
+    TEST_ASSERT_TRUE(line.compare(0, prefix.size(), prefix) == 0);
+    const std::string shown = line.substr(prefix.size());
+    TEST_ASSERT_TRUE(shown.size() <= 60);
+    TEST_ASSERT_TRUE(shown.size() > 40);
+    for (unsigned char c : shown) {
+        TEST_ASSERT_TRUE(c >= 0x20 && c != 0x7F);
+    }
+    TEST_ASSERT_TRUE(validUtf8Line(shown));
+    TEST_ASSERT_EQUAL_STRING("ab?cd?", shown.substr(0, 6).c_str());
+    TEST_ASSERT_TRUE(line.find('\n') == std::string::npos);
+}
+
+static void test_unsubscribe_failed_two_byte_cut() {
+    std::string msg = "x";
+    for (int i = 0; i < 120; ++i) msg += "\xC3\xB8";  // o-slash, 2 bytes: 241 bytes in total
+    std::string line;
+    unsubscribeFailLine(msg, line);
+    const std::string shown = line.substr(std::string("unsubscribe failed: ").size());
+    TEST_ASSERT_TRUE(shown.size() <= 60);
+    TEST_ASSERT_TRUE(validUtf8Line(shown));
+}
+
+static void test_unsubscribe_failed_empty_message() {
+    std::string line;
+    unsubscribeFailLine("", line);
+    TEST_ASSERT_EQUAL_STRING("unsubscribe failed", line.c_str());
+}
+
+static void test_unsubscribe_failed_short_message_unchanged() {
+    std::string line;
+    unsubscribeFailLine("boom", line);
+    TEST_ASSERT_EQUAL_STRING("unsubscribe failed: boom", line.c_str());
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
+    RUN_TEST(test_unsubscribe_failed_message_is_sanitised_and_cut);
+    RUN_TEST(test_unsubscribe_failed_two_byte_cut);
+    RUN_TEST(test_unsubscribe_failed_empty_message);
+    RUN_TEST(test_unsubscribe_failed_short_message_unchanged);
     RUN_TEST(test_state_names);
     RUN_TEST(test_initial_and_empty_config);
     RUN_TEST(test_auth_flow_empty_entities_ready);

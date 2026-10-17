@@ -75,6 +75,14 @@ data=<json>"; the default answer is HA's success result with a context)
                       set_percentage, volume_set, volume_mute, media_play_pause
   --echo-stale        first send the previous value of the changed attributes, then the new one
                       --echo-stale-gap S (default 0.5) later
+Step 8.3 options
+  --auth-invalid-message TEXT  the auth_invalid message (default "Invalid access token or password");
+                      JSON-escaped, so a real newline can be sent from a Python string
+  --auth-ok-delay S   wait S seconds before answering a valid auth with auth_ok (device stays
+                      Authenticating)
+  --set-state-after S ENTITY STATE  S seconds after each subscribe, send a "c" diff that sets the
+                      entity's state (e.g. unavailable)
+  --unsubscribe-error TEXT  answer unsubscribe_events with success=false and this message
 Logs: "RX get_states", "SENT states <bytes> in <s>", "SENT c-diff", "RX unsubscribe_events".
 It answers subscribe_entities with a success result (and, with a fixture, an "a" event). The access token is never printed (only
 its length).
@@ -496,6 +504,8 @@ def handle(c, addr, args):
         t = msg.get("type")
         if t == "auth":
             if msg.get("access_token") == args.token:
+                if args.auth_ok_delay:
+                    time.sleep(args.auth_ok_delay)
                 ok = json.dumps({"type": "auth_ok", "ha_version": "2099.1.0-mock"}).encode()
                 if args.fragment_auth_ok:
                     a, b, cc = ok[:5], ok[5:12], ok[12:]
@@ -506,7 +516,8 @@ def handle(c, addr, args):
                     send(frame(1, ok))
                 threading.Thread(target=after_auth, daemon=True).start()
             else:
-                send(text({"type": "auth_invalid", "message": "Invalid access token or password"}))
+                send(text({"type": "auth_invalid",
+                           "message": args.auth_invalid_message or "Invalid access token or password"}))
                 time.sleep(0.2)
                 return
         elif t == "subscribe_entities":
@@ -520,13 +531,27 @@ def handle(c, addr, args):
                 if args.rm_add_every and len(added) > 1:
                     last = [e for e in states if e["entity_id"] in ids][-1]
                     threading.Thread(target=rm_add_loop, args=(msg["id"], last), daemon=True).start()
+                if args.set_state_after and args.set_state_after[1] in added:
+                    def set_state(sid=msg["id"]):
+                        time.sleep(float(args.set_state_after[0]))
+                        eid, st = args.set_state_after[1], args.set_state_after[2]
+                        try:
+                            send(text({"id": sid, "type": "event", "event": {"c": {eid: {"+": {"s": st}}}}}))
+                            log(f"SENT c-diff sid={sid} {eid} state={st}")
+                        except OSError:
+                            pass
+                    threading.Thread(target=set_state, daemon=True).start()
                 if args.change_every and added:
                     threading.Thread(target=change_loop, args=(msg["id"], next(iter(added))),
                                      daemon=True).start()
         elif t == "unsubscribe_events":
             log(f"RX unsubscribe_events subscription={msg.get('subscription')}")
             subs.pop(msg.get("subscription"), None)
-            send(text({"id": msg["id"], "type": "result", "success": True, "result": None}))
+            if args.unsubscribe_error is not None:
+                send(text({"id": msg["id"], "type": "result", "success": False,
+                           "error": {"code": "unknown_error", "message": args.unsubscribe_error}}))
+            else:
+                send(text({"id": msg["id"], "type": "result", "success": True, "result": None}))
         elif t == "get_states":
             threading.Thread(target=send_states, args=(msg["id"],), daemon=True).start()
         elif t == "call_service":
@@ -651,6 +676,10 @@ def main():
     ap.add_argument("--rm-add-every", type=float, default=0.0, metavar="S")
     ap.add_argument("--stdin-commands", action="store_true")
     ap.add_argument("--deep-result", type=int, nargs="+", default=[], metavar="N")
+    ap.add_argument("--auth-ok-delay", type=float, default=0.0, metavar="S")
+    ap.add_argument("--set-state-after", nargs=3, default=None, metavar=("S", "ENTITY", "STATE"))
+    ap.add_argument("--auth-invalid-message", default=None, metavar="TEXT")
+    ap.add_argument("--unsubscribe-error", default=None, metavar="TEXT")
     ap.add_argument("--call-log", default=None, metavar="FILE")
     ap.add_argument("--call-delay", type=float, default=0.0, metavar="S")
     ap.add_argument("--call-error", default=None, metavar="CODE:MSG")

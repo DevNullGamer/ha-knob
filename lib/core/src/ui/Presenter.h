@@ -9,6 +9,10 @@
 #include "ha/EntityStore.h"
 
 namespace core {
+namespace ha {
+enum class State : uint8_t;  // ha/HaSession.h
+}  // namespace ha
+
 namespace presenter {
 
 // Number of decimals needed to show multiples of step exactly (0 to 3).
@@ -30,9 +34,23 @@ std::string formatPercent(double value);
 // arrived or for this long after subscribing, whichever comes first; then "not found".
 constexpr uint32_t kNotFoundAfterMs = 3000;
 
+// Why HA is not usable, shown on the control page's state line while it is not Ready
+// (plan-step8.md §3.3, Q8-15).
+enum class OfflineReason : uint8_t { None, NoWifi, HaNotSetUp, Connecting, TokenRejected, Offline };
+
+// Ready -> None (whatever wifiUp says); else !wifiUp -> NoWifi; NoConfig -> HaNotSetUp;
+// Connecting / Authenticating / Subscribing -> Connecting; AuthFailed -> TokenRejected;
+// Backoff (and anything else) -> Offline.
+OfflineReason offlineReason(ha::State state, bool wifiUp);
+
+// "", "No Wi-Fi", "HA not set up", "Connecting to HA...", "HA token rejected", "HA offline".
+const char *offlineText(OfflineReason reason);
+
 // What present() needs besides the control and its entity.
 struct PresentContext {
     bool haReady = false;           // HA session state Ready
+    // Why HA is not Ready; used only while !haReady. The default (and None) gives "HA offline".
+    OfflineReason offline = OfflineReason::Offline;
     bool snapshotSeen = false;      // EntityStore::snapshotSeen()
     uint32_t msSinceSubscribe = 0;  // since the current subscription was started
     // The control's local value while it holds (ControlEngine::local(), plan-step7.md Q7-1);
@@ -53,8 +71,9 @@ struct ControlView {
     double arcMin = 0;
     double arcMax = 100;
     double arcValue = 0;    // within [arcMin, arcMax]; arcMin when there is no value
-    std::string stateText;  // entity state / "HA offline" / "waiting..." / "not found"
+    std::string stateText;  // entity state / offlineText() / "waiting..." / "not found"
     bool dimmed = false;    // HA not Ready, entity missing, unavailable or unknown
+    bool banner = false;    // HA not Ready: the state line is shown as the highlighted pill
     bool unconfirmed = false;  // the value is a local one not yet confirmed by HA (Q7-6)
     std::optional<uint32_t> arcRgb;  // hue action: the arc colour 0xRRGGBB of the shown hue
 
@@ -84,7 +103,8 @@ std::string titleFor(const config::Control &control, const ha::EntityState *enti
 //   none        no arc, value = the entity state; for unavailable / unknown (or no state)
 //               the value is "--" and the state goes to the state text
 // An absent value (other than brightness) shows "--" with the arc at its minimum. Not
-// Ready: the last values dimmed, state text "HA offline". Unknown actions show as "none".
+// Ready: the last values dimmed, banner set and the state text offlineText(context.offline)
+// ("HA offline" by default). Unknown actions show as "none".
 // HA's values come from domain_actions::currentValue (fan: absent and state "off" -> 0 %).
 // context.local (Step 7.5, Q7-6): the action's value is the local one, formatted like HA's
 // (fan percentage floored like the call sends it: 66.667 -> "66"), unconfirmed is copied,

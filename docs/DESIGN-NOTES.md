@@ -1031,3 +1031,69 @@ Spec: `plan-step7.md` §3.5, §3.6 (ui), §4 Steps 7.7 and 7.8 (Q7-6, Q7-8, Q7-9
   leaves `held` true until a TIN up / short press, so the screen stays On meanwhile.
   Callers must `ResetConfirm::tick()` before reading `secondsLeft()`, else the display shows
   "0" at the deadline.
+
+## Step 8.3: log carry-overs (2026-10-17)
+
+- `util::logPrintf` (`src/util/Log.h`): `kMaxLine` 256 -> 320 (buffer incl. NUL: at most 318 chars +
+  `\n`; longer lines are still cut to that with the newline kept). The line buffer is on the caller's stack, so every
+  `logPrintf` call costs 64 B more stack than before (loop task: HB `stack=` gate >= 2048
+  stays; Tester checks it with the mock and 24 controls).
+- `HA unsubscribe failed: <message>` now goes through `core::util::logSafe(message, 60)`
+  (UTF-8-safe cut at 60 bytes, control characters as `?`); empty message: `unsubscribe
+  failed`. `logText` no longer exists (Step 7.6 replaced it with `core::util::logSafe`;
+  `grep logText src lib` is empty). No `Serial.print*` in `src` / `lib`.
+- Worst-case HB line, field by field (prefix incl. the leading space + the longest value),
+  with the `disp=` field Step 8.4 appends:
+
+  | Field | Prefix | Longest value | Sum |
+  |---|---|---|---|
+  | `HB up=` | 6 | 7 (`millis()/1000` <= 4294967) | 13 |
+  | ` psram=` | 7 | 10 (uint32; 7 on this board) | 17 |
+  | ` flash=` | 7 | 10 (uint32; 8 on this board) | 17 |
+  | ` touch=` | 7 | 8 (`CHSC5816`) | 15 |
+  | ` count=` | 7 | 11 (int32 `-2147483648`) | 18 |
+  | ` ctl=` | 5 | 2 (<= `kMaxControls` 24) | 7 |
+  | ` cfg=` | 5 | 8 (`defaults`) | 13 |
+  | ` wifi=` | 6 | 6 (`ap_sta`) | 12 |
+  | ` ip=` | 4 | 15 (IPv4 dotted) | 19 |
+  | ` ha=` | 4 | 14 (`authenticating`) | 18 |
+  | ` heap=` | 6 | 10 | 16 |
+  | ` heap_min=` | 10 | 10 | 20 |
+  | ` loopmax=` | 9 | 10 | 19 |
+  | ` ent=` | 5 | 5 (store <= 64 `/` ids <= 24) | 10 |
+  | ` cat=` | 5 | 8 (`fetching`, `building`) | 13 |
+  | ` stack=` | 7 | 10 | 17 |
+  | ` psram_free=` | 12 | 10 | 22 |
+  | ` disp=` (8.4) | 6 | 3 (`dim`, `off`) | 9 |
+  | newline | | | 1 |
+
+  Total 276 bytes incl. the newline (275 chars) <= 300. Even with every number at its type
+  maximum (`up`, `ctl`, both `ent` counts 10 digits) the line is 302 chars + newline, still
+  within the 318-char limit.
+- `UI view` (Step 8.6 adds ` banner=<0|1>`): page 5 + value 32 + unit 2 + state 40 + arc
+  47 + title 48 (logSafe byte limits) + fixed text 72 = 246 bytes incl. the newline.
+
+## Step 8.6: disconnected banner (2026-10-17)
+
+- Core (`lib/core/src/ui/Presenter.{h,cpp}`, plan-step8.md §3.3): `OfflineReason`,
+  `offlineReason(ha::State, wifiUp)` (Ready -> None even without Wi-Fi; then no Wi-Fi ->
+  NoWifi before any HA state, so an unconfigured device without Wi-Fi says "No Wi-Fi"),
+  `offlineText`. `PresentContext::offline` defaults to `Offline`, so a default context
+  still gives "HA offline" and the Step 6.8 / 7.5 presenter tests are unchanged.
+  `ControlView::banner` = `!haReady` (both the entity-missing and the normal path) and is
+  part of `operator==`. With `!haReady` and `offline = None` (a caller inconsistency; main
+  never does it) the state text falls back to "HA offline" (`offlineText(None)` stays `""`).
+- `main`: `context.offline = offlineReason(ha state, net::wifi::status().staConnected)`;
+  the reason is part of `ViewKey`, so a Wi-Fi drop during Backoff rebuilds the page
+  ("HA offline" -> "No Wi-Fi") without an HA state change. `UI view ... title=<t>
+  banner=<0|1>`: banner is the last field and the title can contain spaces, so match it
+  with ` banner=[01]$`.
+- `ControlScreen`: the state label (270 px slot at y +50, font 20) gets bg colour
+  `0x7A1F1F` and radius 12 once in `create()`; `setBanner` (only when `view.banner`
+  changes) switches bg opacity, padding 12 / 4 px and the height (line height + 8, the text
+  keeps its one-line content height, re-aligned at y +50). The pill spans the whole 270 px
+  slot (corners at x +-135, y +35..+65: about 150 px from the centre, inside the arc's
+  inner radius of 166 px; the page indicator is at y +150). Banner text is always white;
+  title and value stay dimmed. Select, NoControls and Status get no banner (Q8-15).
+- Build: normal RAM 55316 bytes (16.9 %), flash 1842725 bytes (28.4 %, +820 B for 8.3 +
+  8.6); test build RAM 55348, flash 1843861.

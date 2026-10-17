@@ -117,7 +117,7 @@ line, not only on `BOOT`.
 - **Serial: always log with `util::logPrintf()` (`src/util/Log.h`), never `Serial.print*`**
   (core 2.0.17's `HWCDC::write()` can busy-loop forever; DESIGN-NOTES "Serial logging").
   Keep `setTxTimeoutMs(1)` (never 0) and the 4 KB TX buffer set before `Serial.begin`.
-  `logPrintf` drops lines that do not fit (`LOG dropped=N`), max 255 chars per line;
+  `logPrintf` drops lines that do not fit (`LOG dropped=N`), max 318 chars per line;
   header-only, not ISR-safe.
 - **The screen is the knob cap**: pressing it also clicks the button (touch ~120 ms before
   `BTN down`). User decision: all press actions come from the button; touch gives swipes

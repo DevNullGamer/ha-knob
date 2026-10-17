@@ -11,6 +11,7 @@
 #include "ha/WsTransport.h"
 #include "hal/PsramAllocator.h"
 #include "util/Log.h"
+#include "util/Text.h"
 
 namespace ha {
 
@@ -69,8 +70,10 @@ void refreshStatus() {
         snprintf(extra, sizeof(extra), " retry_in_ms=%d", static_cast<int>(waitMs > 0 ? waitMs : 0));
     }
     util::logPrintf("HA state=%s%s%s%s%s%s\n", hc::stateName(status_.state),
-                    status_.haVersion.empty() ? "" : " ha_version=", status_.haVersion.c_str(),
-                    status_.lastError.empty() ? "" : " error=", status_.lastError.c_str(), extra);
+                    status_.haVersion.empty() ? "" : " ha_version=",
+                    core::util::logSafe(status_.haVersion, 32).c_str(),
+                    status_.lastError.empty() ? "" : " error=",
+                    core::util::logSafe(status_.lastError, 120).c_str(), extra);
 
 #if defined(HAKNOB_STATES_ON_READY)
     // Test builds only (-DHAKNOB_STATES_ON_READY): fetch the entity list on every Ready,
