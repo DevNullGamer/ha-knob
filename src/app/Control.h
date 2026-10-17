@@ -19,8 +19,9 @@
 namespace app {
 namespace control {
 
-// device.accel (batched acceleration, plan-step7.md Q7-2), device.send_interval_ms and the
-// controls (a change resets every hold and unsent value). After boot and every config re-read.
+// device.accel (batched acceleration, plan-step7.md Q7-2), device.send_interval_ms,
+// device.buzzer (the error beep, Q7-8) and the controls (a change resets every hold and
+// unsent value). After boot and every config re-read.
 void applyConfig(const core::config::DeviceConfig &device,
                  const std::vector<core::config::Control> &controls);
 
@@ -31,7 +32,8 @@ void rotate(size_t page, int detents, uint32_t nowMs);
 void press(size_t page, uint32_t nowMs);
 
 // Every loop pass after ha::loop(): drains ha::takeCallResults() into the engine, sends
-// due values, and shows the newest notice (log + ui::showToast).
+// due values, and shows the newest notice (log + ui::showToast + a 150 ms error beep if
+// device.buzzer, at most one per 2 s).
 void loop(uint32_t nowMs);
 
 // The control's local value while it holds (presenter::PresentContext::local).

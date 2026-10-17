@@ -20,6 +20,7 @@ constexpr int32_t kValueY = -10;
 constexpr uint32_t kTextColor = 0xFFFFFF;
 constexpr uint32_t kDimColor = 0x707070;
 constexpr uint32_t kArcColor = 0xFFA000;
+constexpr uint32_t kArcUnconfirmedColor = 0xFFFFFF;  // a local value HA has not confirmed (Q7-6)
 constexpr uint32_t kArcDimColor = 0x505050;
 constexpr uint32_t kArcTrackColor = 0x282828;
 
@@ -37,6 +38,7 @@ std::string shownPage;
 int32_t shownArcValue = -1;
 bool shownArcVisible = true;
 bool shownDimmed = false;
+uint32_t shownArcColor = kArcColor;
 const lv_font_t *shownValueFont = &ui_font_56;
 
 void setText(lv_obj_t *label, std::string &shown, const std::string &text) {
@@ -79,7 +81,18 @@ void setDimmed(bool dimmed) {
     lv_obj_set_style_text_color(titleLabel, text, 0);
     lv_obj_set_style_text_color(valueLabel, text, 0);
     lv_obj_set_style_text_color(stateLabel, text, 0);
-    lv_obj_set_style_arc_color(arc, lv_color_hex(dimmed ? kArcDimColor : kArcColor), LV_PART_INDICATOR);
+}
+
+// The arc indicator (plan-step7.md §3.6, Q7-6): a hue's own colour, else grey when dimmed
+// (also mid-turn, e.g. HA dropped), else white while the value is unconfirmed, else amber.
+uint32_t arcColor(const core::presenter::ControlView &view) {
+    if (view.arcRgb) {
+        return *view.arcRgb;
+    }
+    if (view.dimmed) {
+        return kArcDimColor;
+    }
+    return view.unconfirmed ? kArcUnconfirmedColor : kArcColor;
 }
 
 }  // namespace
@@ -137,6 +150,11 @@ void show(const core::presenter::ControlView &view, size_t index, size_t count) 
     if (view.dimmed != shownDimmed) {
         shownDimmed = view.dimmed;
         setDimmed(view.dimmed);
+    }
+    const uint32_t color = arcColor(view);
+    if (color != shownArcColor) {
+        shownArcColor = color;
+        lv_obj_set_style_arc_color(arc, lv_color_hex(color), LV_PART_INDICATOR);
     }
 }
 

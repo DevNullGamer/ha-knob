@@ -960,6 +960,54 @@ Spec: `plan-step7.md` §3.6, §4 Step 7.6 (Q7-2, Q7-8..Q7-10). Device glue, v0.7
 - Build: normal RAM 55260 bytes (16.9 %), flash 1838229 bytes (28.3 %); test build RAM
   55292, flash 1839549.
 
+## Step 7.7 / 7.8 (2026-10-17)
+
+Spec: `plan-step7.md` §3.5, §3.6 (ui), §4 Steps 7.7 and 7.8 (Q7-6, Q7-8, Q7-9). v0.7.1.
+
+- Toast (`ui::showToast`): one label on `lv_layer_top()` (created in `ui::begin`, hidden,
+  not clickable), font 20, white on dark red `0x8B0000`, radius 18, padding 10, centred
+  100 px below the centre, moved up so its bottom stays at +136 px. The box is sized from
+  `lv_text_get_size` at the 240 px text width: as wide as the widest line (+2 px so the
+  label wraps where the measurement did) and 1-3 lines high; longer texts end in "..."
+  (`LV_LABEL_LONG_DOT`). **Deviation (round 2):** at most 260 px wide instead of the spec's
+  300 px: a 300 px box reaches the 195 px panel radius at its bottom corners, while the
+  largest 260 x 98 px box (3 lines, y 38..136) keeps its rounded corners within 180 px of
+  the centre and stays below the value label. `ui::tick` hides it
+  3 s after it was shown, before the boot check (also during boot). A new toast replaces
+  the old one and restarts the 3 s. The text is HA's message already cut to 60 bytes by the
+  engine; LVGL only draws it.
+- Arc colour (`ControlScreen`): `view.arcRgb` (hue) wins, else grey when dimmed (before
+  white, so HA dropping mid-turn shows grey), else white `0xFFFFFF` while `unconfirmed`,
+  else amber; set only on change. The hue arc keeps
+  its colour also when dimmed (spec: "always the hue's colour"); the texts still dim.
+- Buzzer: the click on `BTN down` and the 150 ms error beep only with `device.buzzer`
+  (`main` / `app::control` keep their own copy from the config apply). The error beep comes
+  with a notice, at most one per 2 s overall (`app::control`, round 2): the engine's repeat
+  limit exempts Failed / Timeout, so a rejecting HA would beep with every answer (up to
+  4/s); the toast still updates with every notice. A new beep restarts the buzzer's end time (`hal::buzzer` unchanged).
+- Select list: `ui::` owns a `core::ui::SelectModel` and `SelectScreen` (`lv_roller`, not
+  clickable, font 28, 300 px, 5 rows, `LV_ROLLER_MODE_NORMAL`, selection set without
+  animation to keep the pass short). Items: `presenter::titleFor` of every control (built by
+  `main` from the store at open time), first cut UTF-8-safely to 64 bytes
+  (`core::util::truncateUtf8`; the width loop below measures once per removed character, so
+  255-byte ids would cost quadratic time), control characters as spaces, then cut with "…"
+  to the width; last item "Status". Selected on open: the current control page, or "Status".
+  `ui::targetScreen()` holds the precedence (boot is handled before it): setup > Select >
+  pages; Step 8's reset confirmation goes first. `canNavigate()` / `pagesActive()` are false
+  while the list is open, so swipes do nothing and rotation / presses never reach
+  `app::control`; `app::control::loop` keeps sending the held values.
+- Routing in `main`: rotation -> `ui::selectMove` (raw detents, no acceleration, clamped by
+  the model); short press -> `ui::selectChoose()` (logs `UI select choose=<i>` 1-based or
+  `UI select status`; `UI page=...` follows only when the page changed); long press ->
+  cancel while open, else with zero controls next page (NoControls <-> Status, as before),
+  else open (only while `pagesActive()`). Closing: long press, 8 s idle (`ui::tick`), every
+  config re-read (`takeConfigDirty`, also when the controls did not change; the spec's
+  "config change"), the setup screen (`showNetwork` with the setup screen wanted). Log:
+  `UI select cancel reason=<long|idle|config|setup>` (the reason is an addition to the
+  spec's `cancel`).
+- Build (round 2): normal RAM 55316 bytes (16.9 %), flash 1841905 bytes (28.4 %); test
+  build RAM 55348, flash 1843069.
+
 ## Step 8.1 / 8.2: IdleTimer and ResetConfirm (core)
 
 - `core::ui::IdleTimer` (`lib/core/src/ui/IdleTimer.{h,cpp}`): level On / Dim / Off from the

@@ -4,7 +4,7 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.7.0, Step 7.6 (knob and button control Home Assistant entities).** The firmware
+**Status: v0.7.1, Step 7.8 (knob and button control Home Assistant entities; Select list).** The firmware
 drives the hardware (display, touch swipes, encoder, button, buzzer), loads its configuration
 from NVS, joins Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home
 Assistant, controls and device settings, keeps an authenticated, self-healing WebSocket
@@ -124,15 +124,17 @@ CFG unchanged                            accepted patch that changes nothing (no
 CFG secrets wifi_pw_set=<0|1> ha_token_set=<0|1> web_pw_set=<0|1> ap_pw_set=<0|1>[ token_set len=<n>]
 CFG factory reset ok=<0|1>
 ENC d=<+1|-1> count=<n>                  one line per detent, clockwise = +1 (-1 with encoder_reverse)
-BTN down                                 debounced press (the buzzer clicks)
+BTN down                                 debounced press (the buzzer clicks if device.buzzer)
 BTN up + BTN short                       release before 600 ms
 BTN long                                 held 600 ms (fired while held; no "short" after it)
 BTN verylong                             held 10 s
 BTN up                                   release after long / verylong
 TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
-UI page=<i>/<n> | no_controls | status   page shown after a swipe / long press
+UI page=<i>/<n> | no_controls | status   page shown after a swipe, the Select list, or a long press without controls
+UI select open | choose=<i> | status     Select list opened / control page i or Status chosen
+UI select cancel reason=<long|idle|config|setup>   Select list closed without a change
 UI view page=<i>/<n> value=<v><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1> unconfirmed=<0|1> title=<t>   the shown control page changed (unconfirmed=1: a turned value HA has not confirmed yet)
-UI toast text=<t>                        a control notice shown to the user (Step 7.6: logged only)
+UI toast text=<t>                        a control notice shown to the user for 3 s
 CTL press page=<i> press=<press>         short press on control page i
 CTL notice=<kind> page=<i> text=<t>      ha_offline / not_found / unavailable / no_value / busy / failed / timeout
 HA call id=<n> <domain>.<service> entity=<id> data=<json>   a service call sent
@@ -554,11 +556,19 @@ station is not connected.
 
 | Input | Behaviour |
 |---|---|
-| Swipe left / long press | Next page (wrapping; the long press opens a Select list from Step 7.8) |
+| Swipe left | Next page (wrapping) |
 | Swipe right | Previous page (wrapping) |
+| Long press | Opens the Select list; without controls: toggles the No controls / Status page |
 | Rotation | Control page: changes the value (see Control); Status page: the encoder count |
 | Short press | Control page: the control's press action (see Control) |
 | Tap | Never does anything |
+
+**Select list** (long press): the control titles plus "Status", the current page selected.
+Rotation moves one item per detent (no acceleration, stops at both ends), a short press
+shows the selected page, a long press or 8 s without turning closes it without a change;
+swipes are ignored. A config change and the setup screen close it. Calls of a control turned
+just before keep being sent while the list is open. Screen precedence: boot, setup, Select
+list, pages.
 
 A control page shows the title (label, else HA's `friendly_name`, else the entity
 id), a 270° arc for the value, the value with its unit, a state line and the page
@@ -604,8 +614,12 @@ Presses: `toggle` = `<domain>.toggle` (climate: `turn_on` when off, else `turn_o
 - HA not connected: turns and presses do nothing (notice "HA offline", at most every 2 s);
   values not yet sent are dropped, never sent after a reconnect.
 - Notices (HA's error message, "No answer from HA", "Entity not found", "Unavailable",
-  "No value to change", "Busy, try again") are logged as `CTL notice=`; the on-screen
-  toast and the error beep follow in Step 7.7.
+  "No value to change", "Busy, try again") are logged as `CTL notice=` and shown for 3 s
+  as a toast (white on dark red, below the value, at most 3 lines; a new one replaces the
+  old one), with a 150 ms error beep (at most one per 2 s) when `device.buzzer` is on (the button click on press
+  follows `device.buzzer` too).
+- Arc colour: amber; white while the shown value is a local one HA has not confirmed;
+  grey when dimmed (also mid-turn); for a hue control always the colour of the shown hue.
 - Some lights restore their previous level when turned on from 0 %; accepted.
 
 ## Input handling
@@ -701,7 +715,7 @@ src/config/       ConfigStore (NVS persistence, mutex)
 src/util/         Log.h (non-blocking serial logging)
 src/net/          WifiManager (STA, setup AP, captive DNS, mDNS), WebServer (REST API, static files)
 src/ha/           HaClient (HaSession wiring, logging), WsTransport (WebSocket client on WiFiClient / WiFiClientSecure)
-src/ui/           Ui (screen manager, pages), Widgets, screens/ (Boot, Setup, Status, Control, NoControls), fonts/ (generated)
+src/ui/           Ui (screen manager, pages, toast), Widgets, screens/ (Boot, Setup, Status, Control, NoControls, Select), fonts/ (generated)
 data/             web UI (index.html, app.js, style.css), flashed with uploadfs
 lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the host
   src/config/     ConfigModel (schema, JSON, validation, redaction, patch merge)

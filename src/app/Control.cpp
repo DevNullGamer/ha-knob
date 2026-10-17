@@ -4,6 +4,7 @@
 
 #include "control/ControlEngine.h"
 #include "ha/HaClient.h"
+#include "hal/Buzzer.h"
 #include "input/Acceleration.h"
 #include "ui/Ui.h"
 #include "util/Log.h"
@@ -15,6 +16,9 @@ namespace control {
 namespace {
 
 namespace cc = core::control;
+
+constexpr uint32_t kErrorBeepMs = 150;       // plan-step7.md Q7-8
+constexpr uint32_t kErrorBeepRepeatMs = 2000;  // at most one error beep per 2 s overall
 
 // Sends the engine's calls on the HA socket (ha::callService reads millis() itself).
 class HaSender : public cc::CallSender {
@@ -28,6 +32,9 @@ HaSender sender;
 cc::ControlEngine engine(sender);  // after `sender` (same translation unit: declaration order)
 core::Acceleration acceleration;
 std::vector<core::config::Control> controls;  // as given to the engine
+bool buzzerEnabled = true;                    // device.buzzer
+bool errorBeeped = false;                     // an error beep was given (at lastErrorBeepMs)
+uint32_t lastErrorBeepMs = 0;
 
 bool haReady() { return ha::status().state == core::ha::State::Ready; }
 
@@ -40,6 +47,7 @@ const core::ha::EntityState *entityFor(size_t page) {
 void applyConfig(const core::config::DeviceConfig &device,
                  const std::vector<core::config::Control> &newControls) {
     acceleration.setEnabled(device.accel);
+    buzzerEnabled = device.buzzer;
     cc::EngineOptions options;
     options.sendIntervalMs = device.sendIntervalMs;
     engine.setOptions(options);
@@ -77,6 +85,13 @@ void loop(uint32_t nowMs) {
                         static_cast<unsigned>(notice->control + 1),
                         core::util::logSafe(notice->text, 60).c_str());
         ui::showToast(notice->text, nowMs);
+        // Error beep (Q7-8): at most one per 2 s overall. The engine's repeat limit exempts
+        // Failed / Timeout, so a rejecting HA would otherwise beep with every call answer.
+        if (buzzerEnabled && (!errorBeeped || nowMs - lastErrorBeepMs >= kErrorBeepRepeatMs)) {
+            hal::buzzer::beep(nowMs, kErrorBeepMs);
+            errorBeeped = true;
+            lastErrorBeepMs = nowMs;
+        }
     }
 }
 

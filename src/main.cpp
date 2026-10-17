@@ -20,7 +20,10 @@
 //   WIFI ...  Wi-Fi events (see src/net/WifiManager.h)
 //   WEB ...   web server events (see src/net/WebServer.h)
 //   HA ...    Home Assistant connection events (see src/ha/HaClient.h)
-//   UI page=<i>/<n> | no_controls | status        page changed (swipe / long press)
+//   UI page=<i>/<n> | no_controls | status        page changed (swipe, long press without
+//                                                 controls, Select list)
+//   UI select open | choose=<i> | status | cancel reason=<long|idle|config|setup>
+//                                                 the Select list (src/ui/Ui.h)
 //   UI view page=<i>/<n> value=<value><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1>
 //           unconfirmed=<0|1> title=<t>   (one line) the selected control page shows something new
 //   UI toast text=<t>                             a control notice (src/ui/Ui.h)
@@ -88,6 +91,7 @@ bool entityCountsPublished = false;
 std::vector<core::config::Control> controls;
 uint32_t controlsGeneration = 0;  // +1 whenever `controls` is replaced
 bool encoderReverse = false;      // device.encoder_reverse
+bool buzzerEnabled = true;        // device.buzzer (the click on BTN down)
 struct ViewKey {
     int page = -1;
     uint32_t controlsGeneration = 0;
@@ -183,6 +187,7 @@ std::vector<std::string> controlEntityIds(const core::config::Config &config) {
 // after every config re-read).
 void applyControls(const core::config::Config &config) {
     encoderReverse = config.device.encoderReverse;
+    buzzerEnabled = config.device.buzzer;
     app::control::applyConfig(config.device, config.controls);
     if (config.controls == controls && controlsGeneration != 0) {
         return;
@@ -194,7 +199,7 @@ void applyControls(const core::config::Config &config) {
     }
 }
 
-// Logs the selected page after a swipe / long press changed it.
+// Logs the selected page after a swipe, a long press or the Select list changed it.
 void logPage() {
     const int page = ui::controlPage();
     if (page >= 0) {
@@ -313,6 +318,7 @@ void handleWebRequests(uint32_t nowMs) {
         const core::config::Config config = configStore.config();
         if (displayOk) {
             hal::display::setBrightnessPercent(config.device.brightness);
+            ui::selectCancel("config");  // its titles and pages may be stale (Q7-9)
         }
         net::wifi::applyConfig(config.wifi.ssid, configStore.wifiPassword(), config.device.hostname,
                                nowMs);
@@ -385,8 +391,9 @@ void handleWebRequests(uint32_t nowMs) {
 int32_t testDelta = 0;  // detents injected by "TIN rot" since the last handleEncoder()
 #endif
 
-// The detents of this pass (one batch, plan-step7.md Q7-2): counted for the Status page and
-// turned on the selected control page.
+// The detents of this pass (one batch, plan-step7.md Q7-2): counted for the Status page;
+// they move the Select list while it is open (1 item per detent), else turn the selected
+// control page.
 void handleEncoder(uint32_t nowMs) {
     int32_t delta = hal::encoder::takeDelta();
 #if defined(HAKNOB_TEST_INPUT)
@@ -407,7 +414,9 @@ void handleEncoder(uint32_t nowMs) {
     if (displayOk) {
         ui::showEncoderCount(shownCount);
         const int page = ui::controlPage();
-        if (page >= 0 && ui::pagesActive()) {
+        if (ui::selectIsOpen()) {
+            ui::selectMove(static_cast<int>(delta), nowMs);
+        } else if (page >= 0 && ui::pagesActive()) {
             app::control::rotate(static_cast<size_t>(page), static_cast<int>(delta), nowMs);
         }
     }
@@ -418,7 +427,7 @@ void handleButtonEvent(core::ButtonFsm::Event event, uint32_t nowMs) {
     if (event == Event::None) {
         return;
     }
-    if (event == Event::Pressed) {
+    if (event == Event::Pressed && buzzerEnabled) {
         hal::buzzer::beep(nowMs);
     }
     if (event == Event::ShortPress) {
@@ -429,21 +438,37 @@ void handleButtonEvent(core::ButtonFsm::Event event, uint32_t nowMs) {
     if (!displayOk) {
         return;
     }
-    // Step 6 (Q6-1): a long press shows the next page (Step 7.8 turns it into the Select
-    // list); a short press runs the control page's press action (plan-step7.md §3.6).
+    // plan-step7.md Q7-9: a long press opens / cancels the Select list (without controls it
+    // toggles NoControls <-> Status); a short press chooses in the Select list, else runs the
+    // control page's press action (§3.6).
     switch (event) {
         case Event::ShortPress: {
             ui::showLastInput("short press");
             const int page = ui::controlPage();
-            if (page >= 0 && ui::pagesActive()) {
+            if (ui::selectIsOpen()) {
+                if (ui::selectChoose()) {
+                    logPage();
+                }
+            } else if (page >= 0 && ui::pagesActive()) {
                 app::control::press(static_cast<size_t>(page), nowMs);
             }
             break;
         }
         case Event::LongPress:
             ui::showLastInput("long press");
-            if (ui::nextPage()) {
-                logPage();
+            if (ui::selectIsOpen()) {
+                ui::selectCancel("long");
+            } else if (controls.empty()) {
+                if (ui::nextPage()) {
+                    logPage();
+                }
+            } else if (ui::pagesActive()) {
+                std::vector<std::string> titles;
+                titles.reserve(controls.size());
+                for (const core::config::Control &control : controls) {
+                    titles.push_back(core::presenter::titleFor(control, ha::entities().find(control.entityId)));
+                }
+                ui::selectOpen(titles, nowMs);
             }
             break;
         case Event::VeryLongPress: ui::showLastInput("very long press"); break;
@@ -461,7 +486,8 @@ void handleSwipe(core::Swipe swipe) {
     if (!displayOk) {
         return;
     }
-    // Swipe left = next page, swipe right = previous page (wrapping). Taps never act.
+    // Swipe left = next page, swipe right = previous page (wrapping); ignored while the
+    // Select list is open (ui:: refuses to navigate). Taps never act.
     ui::showLastInput(swipe == core::Swipe::Left ? "swipe left" : "swipe right");
     if (swipe == core::Swipe::Left ? ui::nextPage() : ui::previousPage()) {
         logPage();
