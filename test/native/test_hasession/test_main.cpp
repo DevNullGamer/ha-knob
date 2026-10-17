@@ -2641,6 +2641,646 @@ static void test_last_error_cut_on_utf8_boundary() {
     TEST_ASSERT_TRUE(validUtf8(s.lastError()));
 }
 
+// ============================================================================================
+// Step 7.3: call_service (plan-step7.md section 3.3)
+// ============================================================================================
+
+namespace {
+
+using CO = ha::CallOutcome;
+
+core::domain_actions::ServiceCall mkCall(const std::string &domain, const std::string &service,
+                                         const std::string &entity, const std::string &dataJson = "") {
+    core::domain_actions::ServiceCall c;
+    c.domain = domain;
+    c.service = service;
+    c.entityId = entity;
+    if (!dataJson.empty()) deserializeJson(c.data, dataJson);
+    return c;
+}
+
+core::domain_actions::ServiceCall lightOn() {
+    return mkCall("light", "turn_on", "light.a", "{\"brightness\":128}");
+}
+
+std::string callResultFail(uint32_t id, const std::string &code, const std::string &message) {
+    return "{\"id\":" + std::to_string(id) + ",\"type\":\"result\",\"success\":false,\"error\":{\"code\":\"" + code +
+           "\",\"message\":\"" + message + "\"}}";
+}
+
+bool anyLogContains(const Logs &logs, const std::string &needle) {
+    for (const std::string &l : logs.lines) {
+        if (l.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+std::string lastLogWith(const Logs &logs, const std::string &prefix) {
+    for (size_t i = logs.lines.size(); i > 0; --i) {
+        if (logs.lines[i - 1].compare(0, prefix.size(), prefix) == 0) return logs.lines[i - 1];
+    }
+    return "";
+}
+
+}  // namespace
+
+// 1
+static void test_call_only_in_ready() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    // NoConfig
+    TEST_ASSERT_EQUAL_UINT32(0, s.callService(lightOn(), 1, 0));
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, "tok", ha::TlsSettings(), {"light.a"}, 0);  // Connecting
+    TEST_ASSERT_EQUAL(S::Connecting, s.state());
+    TEST_ASSERT_EQUAL_UINT32(0, s.callService(lightOn(), 1, 1));
+    feed(s, kAuthRequired, 2);  // Authenticating
+    TEST_ASSERT_EQUAL(S::Authenticating, s.state());
+    TEST_ASSERT_EQUAL_UINT32(0, s.callService(lightOn(), 1, 3));
+    feed(s, kAuthOk, 4);  // Subscribing
+    TEST_ASSERT_EQUAL(S::Subscribing, s.state());
+    const size_t sent = t.sent.size();
+    TEST_ASSERT_EQUAL_UINT32(0, s.callService(lightOn(), 1, 5));
+    TEST_ASSERT_EQUAL((int)sent, (int)t.sent.size());
+    feed(s, resultOk(1), 6);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    s.onClosed("x", 7);  // Backoff
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    const size_t sent2 = t.sent.size();
+    TEST_ASSERT_EQUAL_UINT32(0, s.callService(lightOn(), 1, 8));
+    TEST_ASSERT_EQUAL((int)sent2, (int)t.sent.size());
+    TEST_ASSERT_EQUAL(0, (int)s.callsPending());
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+
+    // AuthFailed
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    s2.setNetworkUp(true, 0);
+    s2.configure(kUrl, "bad", ha::TlsSettings(), {}, 0);
+    feed(s2, kAuthRequired, 0);
+    feed(s2, kAuthInvalid, 0);
+    TEST_ASSERT_EQUAL(S::AuthFailed, s2.state());
+    const size_t sent3 = t2.sent.size();
+    TEST_ASSERT_EQUAL_UINT32(0, s2.callService(lightOn(), 1, 1));
+    TEST_ASSERT_EQUAL((int)sent3, (int)t2.sent.size());
+    TEST_ASSERT_TRUE(s2.takeCallResults().empty());
+}
+
+// 1
+static void test_call_frames_in_ready() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});  // subscribe used id 1
+    TEST_ASSERT_EQUAL_UINT32(2, s.callService(lightOn(), 7, 10));
+    TEST_ASSERT_EQUAL_STRING(
+        "{\"id\":2,\"type\":\"call_service\",\"domain\":\"light\",\"service\":\"turn_on\","
+        "\"service_data\":{\"brightness\":128},\"target\":{\"entity_id\":\"light.a\"}}",
+        t.sent.back().c_str());
+    TEST_ASSERT_EQUAL(1, (int)s.callsPending());
+    // without service_data
+    TEST_ASSERT_EQUAL_UINT32(3, s.callService(mkCall("light", "turn_off", "light.a"), 8, 11));
+    TEST_ASSERT_EQUAL_STRING(
+        "{\"id\":3,\"type\":\"call_service\",\"domain\":\"light\",\"service\":\"turn_off\","
+        "\"target\":{\"entity_id\":\"light.a\"}}",
+        t.sent.back().c_str());
+    // empty entity: no target
+    TEST_ASSERT_EQUAL_UINT32(4, s.callService(mkCall("script", "reload", "", "{\"x\":1}"), 9, 12));
+    TEST_ASSERT_TRUE(t.sent.back().find("target") == std::string::npos);
+    TEST_ASSERT_TRUE(t.sent.back().find("\"service_data\":{\"x\":1}") != std::string::npos);
+    TEST_ASSERT_EQUAL(3, (int)s.callsPending());
+}
+
+// 2, 17
+static void test_call_success_rtt_and_log() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    const uint32_t id = s.callService(lightOn(), 42, 1000);
+    TEST_ASSERT_EQUAL_UINT32(1, id);
+    TEST_ASSERT_TRUE(hasLog(logs, "call id=1 light.turn_on entity=light.a data={\"brightness\":128}"));
+    feed(s, resultOk(id), 1237);
+    TEST_ASSERT_EQUAL(0, (int)s.callsPending());
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(1, (int)r.size());
+    TEST_ASSERT_EQUAL_UINT32(42, r[0].tag);
+    TEST_ASSERT_EQUAL((int)CO::Ok, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL_UINT32(237, r[0].rttMs);
+    TEST_ASSERT_EQUAL_STRING("", r[0].code.c_str());
+    TEST_ASSERT_EQUAL_STRING("", r[0].message.c_str());
+    TEST_ASSERT_TRUE(hasLog(logs, "call ok id=1 ms=237"));
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+}
+
+// 3
+static void test_call_failure_variants() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    const uint32_t a = s.callService(lightOn(), 1, 100);
+    const uint32_t b = s.callService(lightOn(), 2, 100);
+    const uint32_t c = s.callService(lightOn(), 3, 100);
+    const uint32_t d = s.callService(lightOn(), 4, 100);
+    feed(s, callResultFail(a, "not_found", "Service not found."), 150);
+    feed(s, "{\"id\":" + std::to_string(b) + ",\"type\":\"result\",\"success\":false}", 160);
+    feed(s, "{\"id\":" + std::to_string(c) + ",\"type\":\"result\",\"result\":null}", 170);       // no success
+    feed(s, "{\"id\":" + std::to_string(d) + ",\"type\":\"result\",\"success\":\"yes\"}", 180);  // not a bool
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(4, (int)r.size());
+    TEST_ASSERT_EQUAL((int)CO::Failed, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL_STRING("not_found", r[0].code.c_str());
+    TEST_ASSERT_EQUAL_STRING("Service not found.", r[0].message.c_str());
+    TEST_ASSERT_EQUAL_UINT32(50, r[0].rttMs);
+    TEST_ASSERT_EQUAL((int)CO::Failed, (int)r[1].outcome);
+    TEST_ASSERT_EQUAL_STRING("unknown", r[1].code.c_str());
+    TEST_ASSERT_EQUAL_STRING("", r[1].message.c_str());
+    TEST_ASSERT_EQUAL((int)CO::Failed, (int)r[2].outcome);
+    TEST_ASSERT_EQUAL((int)CO::Failed, (int)r[3].outcome);
+    TEST_ASSERT_TRUE(hasLog(logs, "call failed id=1 error=not_found: Service not found."));
+    TEST_ASSERT_TRUE(hasLog(logs, "call failed id=2 error=unknown"));  // no ": "
+    TEST_ASSERT_EQUAL(0, (int)s.callsPending());
+}
+
+// 4
+static void test_call_log_cuts_and_control_chars() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    const uint32_t id = s.callService(lightOn(), 1, 0);
+    std::string msg = "ab\\ncd\\te";  // JSON escapes -> control chars in the message
+    msg += std::string(100, 'z');
+    feed(s, callResultFail(id, "boom", msg), 5);
+    const std::string expected = "ab?cd?e" + std::string(53, 'z');  // 60 bytes
+    TEST_ASSERT_EQUAL_STRING(("call failed id=1 error=boom: " + expected).c_str(),
+                             lastLogWith(logs, "call failed").c_str());
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(1, (int)r.size());
+    TEST_ASSERT_EQUAL(107, (int)r[0].message.size());  // full message
+    TEST_ASSERT_EQUAL('\n', r[0].message[2]);
+
+    // call line cuts: domain 32 / service 48 / entity 96 / data 96, no control chars
+    logs.lines.clear();
+    const std::string dom(40, 'd'), svc(60, 's'), ent(120, 'e');
+    const std::string big = "{\"k\":\"" + std::string(200, 'v') + "\"}";
+    const uint32_t id2 = s.callService(mkCall(dom, svc, ent, big), 2, 10);
+    TEST_ASSERT_TRUE(id2 != 0);
+    const std::string line = lastLogWith(logs, "call id=");
+    const std::string expect = "call id=" + std::to_string(id2) + " " + std::string(32, 'd') + "." +
+                               std::string(48, 's') + " entity=" + std::string(96, 'e') + " data=" +
+                               big.substr(0, 96);
+    TEST_ASSERT_EQUAL_STRING(expect.c_str(), line.c_str());
+    // error code cut at 48
+    feed(s, callResultFail(id2, std::string(70, 'c'), "m"), 11);
+    TEST_ASSERT_EQUAL_STRING(("call failed id=" + std::to_string(id2) + " error=" + std::string(48, 'c') + ": m").c_str(),
+                             lastLogWith(logs, "call failed").c_str());
+    // no service_data -> data=null
+    const uint32_t id3 = s.callService(mkCall("light", "turn_off", "light.a"), 3, 12);
+    TEST_ASSERT_EQUAL_STRING(("call id=" + std::to_string(id3) + " light.turn_off entity=light.a data=null").c_str(),
+                             lastLogWith(logs, "call id=").c_str());
+}
+
+// 5
+static void test_call_limit_8_and_subscribe_still_works() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    for (int i = 0; i < 8; ++i) TEST_ASSERT_TRUE(s.callService(lightOn(), (uint32_t)i, 100) != 0);
+    TEST_ASSERT_EQUAL(8, (int)s.callsPending());
+    const size_t sent = t.sent.size();
+    TEST_ASSERT_EQUAL_UINT32(0, s.callService(lightOn(), 99, 100));
+    TEST_ASSERT_EQUAL((int)sent, (int)t.sent.size());
+    TEST_ASSERT_EQUAL(8, (int)s.callsPending());
+    // id-set change: unsubscribe + subscribe still go out and the session stays Ready
+    reconfigure(s, {"light.b"}, 200);
+    TEST_ASSERT_EQUAL((int)sent + 2, (int)t.sent.size());
+    TEST_ASSERT_TRUE(t.sent[sent].find("unsubscribe_events") != std::string::npos);
+    TEST_ASSERT_TRUE(t.sent[sent + 1].find("subscribe_entities") != std::string::npos);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(8, (int)s.callsPending());
+    // the subscribe still expires at 15 s (the calls timed out at 10 s before)
+    s.tick(200 + 9000);  // calls at 100 expire at 10100
+    s.tick(10100);
+    TEST_ASSERT_EQUAL(8, (int)s.takeCallResults().size());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    s.tick(200 + 14999);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    s.tick(200 + 15000);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("subscribe_timeout", s.lastError().c_str());
+}
+
+// 6
+static void test_call_refused_when_map_full_of_unsubscribes_calls_never_evicted() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.0"});
+    for (int i = 1; i <= 20; ++i) {
+        reconfigure(s, {"light." + std::to_string(i)}, 1000);
+        if (i < 20) feed(s, resultOk(lastId(t)), 1000);
+    }
+    TEST_ASSERT_EQUAL((int)ha::HaSession::kMaxPending, (int)s.pendingCount());
+    const size_t sent = t.sent.size();
+    TEST_ASSERT_EQUAL_UINT32(0, s.callService(lightOn(), 1, 1000));
+    TEST_ASSERT_EQUAL((int)sent, (int)t.sent.size());
+    TEST_ASSERT_EQUAL(0, (int)s.callsPending());
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+
+    // with calls pending, subscribes evict unsubscribes and never a call
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    toReady(s2, t2, 0, {"light.0"});
+    for (int i = 0; i < 3; ++i) TEST_ASSERT_TRUE(s2.callService(lightOn(), (uint32_t)i, 10) != 0);
+    for (int i = 1; i <= 20; ++i) {
+        const size_t before = t2.sent.size();
+        reconfigure(s2, {"light." + std::to_string(i)}, 20);
+        TEST_ASSERT_EQUAL((int)before + 2, (int)t2.sent.size());
+        TEST_ASSERT_EQUAL(3, (int)s2.callsPending());
+        TEST_ASSERT_TRUE((int)s2.pendingCount() <= (int)ha::HaSession::kMaxPending);
+        feed(s2, resultOk(lastId(t2)), 20);
+    }
+    TEST_ASSERT_TRUE(s2.takeCallResults().empty());
+    s2.tick(10 + 10000);
+    std::vector<ha::CallResult> r = s2.takeCallResults();
+    TEST_ASSERT_EQUAL(3, (int)r.size());
+    for (const ha::CallResult &x : r) TEST_ASSERT_EQUAL((int)CO::Timeout, (int)x.outcome);
+}
+
+// 7
+static void test_call_timeout_exact_and_late_result_ignored() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    const uint32_t id = s.callService(lightOn(), 5, 1000);
+    s.tick(1000 + 9999);
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    TEST_ASSERT_EQUAL(1, (int)s.callsPending());
+    s.tick(1000 + 10000);
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(1, (int)r.size());
+    TEST_ASSERT_EQUAL_UINT32(5, r[0].tag);
+    TEST_ASSERT_EQUAL((int)CO::Timeout, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL_STRING("timeout", r[0].code.c_str());
+    TEST_ASSERT_EQUAL_UINT32(10000, r[0].rttMs);
+    TEST_ASSERT_TRUE(hasLog(logs, "call timeout id=" + std::to_string(id)));
+    TEST_ASSERT_EQUAL(0, (int)s.callsPending());
+    s.tick(1000 + 10001);
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    // later result ignored
+    feed(s, resultOk(id), 1000 + 10500);
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(1, countLog(logs, "call timeout"));
+}
+
+// 8
+static void test_call_timeout_and_pong_timeout_same_tick() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    s.tick(30000);  // ping id 1
+    const uint32_t a = s.callService(lightOn(), 1, 30000);
+    const uint32_t b = s.callService(lightOn(), 2, 31000);
+    TEST_ASSERT_TRUE(a != 0 && b != 0);
+    s.tick(40000);  // call 1 expires and the pong is missing
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("pong_timeout", s.lastError().c_str());
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(2, (int)r.size());
+    TEST_ASSERT_EQUAL_UINT32(1, r[0].tag);
+    TEST_ASSERT_EQUAL((int)CO::Timeout, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL_UINT32(2, r[1].tag);
+    TEST_ASSERT_EQUAL((int)CO::ConnectionLost, (int)r[1].outcome);
+    TEST_ASSERT_EQUAL(1, countLog(logs, "call timeout"));
+    TEST_ASSERT_EQUAL(1, countLog(logs, "calls dropped"));
+    TEST_ASSERT_TRUE(hasLog(logs, "calls dropped n=1 reason=connection_lost"));
+}
+
+static void test_call_timeout_and_subscribe_timeout_same_tick() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0, {"light.a"});
+    s.callService(lightOn(), 1, 100);            // id 2, expires 10100
+    reconfigure(s, {"light.b"}, 101);            // unsub 3, sub 4 (expires 15101)
+    s.callService(lightOn(), 2, 6000);           // id 5, not expired at 15101
+    s.tick(15101);
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("subscribe_timeout", s.lastError().c_str());
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(2, (int)r.size());
+    TEST_ASSERT_EQUAL((int)CO::Timeout, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL((int)CO::ConnectionLost, (int)r[1].outcome);
+    TEST_ASSERT_EQUAL(1, countLog(logs, "calls dropped n=1"));
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+}
+
+// 9
+static void expectTwoLostOnce(ha::HaSession &s, uint32_t firstTag = 1) {
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(2, (int)r.size());
+    TEST_ASSERT_EQUAL_UINT32(firstTag, r[0].tag);
+    TEST_ASSERT_EQUAL_UINT32(firstTag + 1, r[1].tag);
+    for (const ha::CallResult &x : r) {
+        TEST_ASSERT_EQUAL((int)CO::ConnectionLost, (int)x.outcome);
+        TEST_ASSERT_EQUAL_STRING("connection_lost", x.code.c_str());
+    }
+    TEST_ASSERT_EQUAL(0, (int)s.callsPending());
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+}
+
+static void test_call_connection_lost_exactly_once_per_path() {
+    const uint32_t kBase = 100;
+    // onClosed, then the reconnect
+    {
+        FakeTransport t;
+        ha::HaSession s(t);
+        toReady(s, t, kBase);
+        s.callService(lightOn(), 1, kBase + 1);
+        s.callService(lightOn(), 2, kBase + 2);
+        s.onClosed("x", kBase + 3);
+        expectTwoLostOnce(s);
+        s.tick(kBase + 3 + 1000);  // reconnect: connect() clears nothing more
+        TEST_ASSERT_TRUE(s.takeCallResults().empty());
+        s.onClosed("y", kBase + 5000);
+        TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    }
+    // pong timeout
+    {
+        FakeTransport t;
+        ha::HaSession s(t);
+        toReady(s, t, 0);
+        s.tick(30000);
+        s.callService(lightOn(), 1, 30500);
+        s.callService(lightOn(), 2, 31000);
+        s.tick(40000);
+        TEST_ASSERT_EQUAL(S::Backoff, s.state());
+        expectTwoLostOnce(s);
+        s.tick(41000);
+        TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    }
+    // network down
+    {
+        FakeTransport t;
+        ha::HaSession s(t);
+        toReady(s, t, kBase);
+        s.callService(lightOn(), 1, kBase + 1);
+        s.callService(lightOn(), 2, kBase + 2);
+        s.setNetworkUp(false, kBase + 3);
+        expectTwoLostOnce(s);
+        s.setNetworkUp(true, kBase + 10000);
+        s.tick(kBase + 20000);
+        TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    }
+    // configure: new URL / token / TLS / empty URL
+    for (int variant = 0; variant < 4; ++variant) {
+        FakeTransport t;
+        ha::HaSession s(t);
+        Logs logs;
+        attachLogs(s, logs);
+        toReady(s, t, kBase);
+        s.callService(lightOn(), 1, kBase + 1);
+        s.callService(lightOn(), 2, kBase + 2);
+        if (variant == 0) s.configure("http://192.168.1.11:8123", "tok", ha::TlsSettings(), {}, kBase + 3);
+        if (variant == 1) s.configure(kUrl, "tok2", ha::TlsSettings(), {}, kBase + 3);
+        if (variant == 2) {
+            ha::TlsSettings tls;
+            tls.insecure = true;
+            s.configure(kUrl, "tok", tls, {}, kBase + 3);
+        }
+        if (variant == 3) s.configure("", "tok", ha::TlsSettings(), {}, kBase + 3);
+        expectTwoLostOnce(s);
+        TEST_ASSERT_EQUAL(1, countLog(logs, "calls dropped n=2"));
+        feed(s, kAuthRequired, kBase + 4);  // harmless in NoConfig
+        s.tick(kBase + 5000);
+        TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    }
+}
+
+// 10
+static void test_call_kept_when_only_entity_ids_change() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    const uint32_t id = s.callService(lightOn(), 3, 10);
+    reconfigure(s, {"light.a", "light.b"}, 20);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(1, (int)s.callsPending());
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    feed(s, resultOk(id), 30);
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(1, (int)r.size());
+    TEST_ASSERT_EQUAL((int)CO::Ok, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL_UINT32(20, r[0].rttMs);
+}
+
+// 11
+static void test_call_send_failure() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.callService(lightOn(), 1, 10);
+    s.callService(lightOn(), 2, 11);
+    t.sendResult = false;
+    TEST_ASSERT_EQUAL_UINT32(0, s.callService(lightOn(), 3, 12));
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    TEST_ASSERT_EQUAL_STRING("send_failed", s.lastError().c_str());
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(2, (int)r.size());
+    TEST_ASSERT_EQUAL_UINT32(1, r[0].tag);
+    TEST_ASSERT_EQUAL_UINT32(2, r[1].tag);
+    for (const ha::CallResult &x : r) TEST_ASSERT_EQUAL((int)CO::ConnectionLost, (int)x.outcome);
+    TEST_ASSERT_EQUAL(0, (int)s.callsPending());
+}
+
+// 12
+static void test_call_send_reports_close_then_true() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.callService(lightOn(), 1, 10);
+    t.onSend = [&]() {
+        t.onSend = nullptr;
+        s.onClosed("peer_closed", 12);
+    };
+    TEST_ASSERT_EQUAL_UINT32(0, s.callService(lightOn(), 2, 12));
+    TEST_ASSERT_EQUAL(S::Backoff, s.state());
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(1, (int)r.size());  // only the earlier call
+    TEST_ASSERT_EQUAL_UINT32(1, r[0].tag);
+    TEST_ASSERT_EQUAL((int)CO::ConnectionLost, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL(0, (int)s.callsPending());
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+}
+
+// 13
+static void test_call_result_while_fetching() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    const uint32_t a = s.callService(lightOn(), 1, 10);  // id 1
+    const uint32_t b = s.callService(lightOn(), 2, 10);  // id 2
+    const uint32_t c = s.callService(lightOn(), 3, 10);  // id 3
+    TEST_ASSERT_TRUE(s.requestStates(11));
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    feed(s, callResultFail(a, "not_found", "nope"), 20);  // id first
+    feed(s, "{\"type\":\"result\",\"success\":false,\"error\":{\"code\":\"bad\",\"message\":\"worse\"},\"id\":" +
+                std::to_string(b) + "}",
+         21);  // id not first
+    feed(s, "{\"success\":true,\"result\":null,\"type\":\"result\",\"id\":" + std::to_string(c) + "}", 22);
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(3, (int)r.size());
+    TEST_ASSERT_EQUAL((int)CO::Failed, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL_STRING("not_found", r[0].code.c_str());
+    TEST_ASSERT_EQUAL_STRING("nope", r[0].message.c_str());
+    TEST_ASSERT_EQUAL((int)CO::Failed, (int)r[1].outcome);
+    TEST_ASSERT_EQUAL_STRING("bad", r[1].code.c_str());
+    TEST_ASSERT_EQUAL_STRING("worse", r[1].message.c_str());
+    TEST_ASSERT_EQUAL((int)CO::Ok, (int)r[2].outcome);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    balanced(t);
+}
+
+// 14
+static void test_call_results_not_confused_with_other_ids() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});       // subscribe id 1
+    const uint32_t call1 = s.callService(lightOn(), 10, 5);  // 2
+    reconfigure(s, {"light.b"}, 6);      // unsubscribe 3, subscribe 4
+    s.requestStates(7);                  // get_states 5
+    const uint32_t call2 = s.callService(lightOn(), 11, 8);  // 6
+    TEST_ASSERT_EQUAL_UINT32(2, call1);
+    TEST_ASSERT_EQUAL_UINT32(6, call2);
+    feed(s, resultOk(3), 9);   // unsubscribe
+    feed(s, resultOk(4), 10);  // subscribe
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    TEST_ASSERT_EQUAL(2, (int)s.callsPending());
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    feed(s, callResultFail(6, "x", "y"), 11);
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(1, (int)r.size());
+    TEST_ASSERT_EQUAL_UINT32(11, r[0].tag);
+    feed(s, statesResult(5, 2), 12);  // get_states result
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    TEST_ASSERT_EQUAL(1, (int)s.callsPending());
+    feed(s, resultOk(2), 13);
+    r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(1, (int)r.size());
+    TEST_ASSERT_EQUAL_UINT32(10, r[0].tag);
+    TEST_ASSERT_EQUAL((int)CO::Ok, (int)r[0].outcome);
+    // a failed call result does not touch lastError (subscribe_failed only for subscribes)
+    TEST_ASSERT_TRUE(s.lastError().find("subscribe_failed") == std::string::npos);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+}
+
+// 15
+static void test_call_millis_wrap() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0xFFFFF000u - 10);
+    const uint32_t id = s.callService(lightOn(), 1, 0xFFFFF000u);
+    s.tick(0x00000800u);  // 6144 ms later: no timeout
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    feed(s, resultOk(id), 0x00000800u);
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(1, (int)r.size());
+    TEST_ASSERT_EQUAL((int)CO::Ok, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL_UINT32(0x1800u, r[0].rttMs);
+    // timeout across the wrap
+    const uint32_t id2 = s.callService(lightOn(), 2, 0xFFFFF000u + 100);
+    TEST_ASSERT_TRUE(id2 != 0);
+    s.tick(0xFFFFF000u + 100 + 9999);
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    s.tick(0xFFFFF000u + 100 + 10000);
+    r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(1, (int)r.size());
+    TEST_ASSERT_EQUAL((int)CO::Timeout, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL_UINT32(10000, r[0].rttMs);
+}
+
+// 16
+static void test_call_clock_going_backwards() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 1000);
+    const uint32_t id = s.callService(lightOn(), 1, 1000);
+    s.tick(500);
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+    TEST_ASSERT_EQUAL(1, (int)s.callsPending());
+    feed(s, resultOk(id), 900);
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(1, (int)r.size());
+    TEST_ASSERT_EQUAL((int)CO::Ok, (int)r[0].outcome);
+    TEST_ASSERT_EQUAL_UINT32(0, r[0].rttMs);
+
+    // subscribe expiry unchanged otherwise
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    toReady(s2, t2, 1000, {"light.a"});
+    reconfigure(s2, {"light.b"}, 2000);
+    s2.tick(2000 + 14999);
+    TEST_ASSERT_EQUAL(S::Ready, s2.state());
+    s2.tick(2000 + 15000);
+    TEST_ASSERT_EQUAL(S::Backoff, s2.state());
+    TEST_ASSERT_EQUAL_STRING("subscribe_timeout", s2.lastError().c_str());
+}
+
+// 17
+static void test_call_results_oldest_first() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    const uint32_t a = s.callService(lightOn(), 10, 0);
+    const uint32_t b = s.callService(lightOn(), 20, 0);
+    const uint32_t c = s.callService(lightOn(), 30, 0);
+    feed(s, resultOk(b), 5);
+    feed(s, resultOk(c), 6);
+    feed(s, resultOk(a), 7);
+    std::vector<ha::CallResult> r = s.takeCallResults();
+    TEST_ASSERT_EQUAL(3, (int)r.size());
+    TEST_ASSERT_EQUAL_UINT32(20, r[0].tag);
+    TEST_ASSERT_EQUAL_UINT32(30, r[1].tag);
+    TEST_ASSERT_EQUAL_UINT32(10, r[2].tag);
+    TEST_ASSERT_TRUE(s.takeCallResults().empty());
+}
+
+// 18
+static void test_call_logs_never_contain_token() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    s.setNetworkUp(true, 0);
+    s.configure(kUrl, "SECRETTOKEN123", ha::TlsSettings(), {}, 0);
+    feed(s, kAuthRequired, 0);
+    feed(s, kAuthOk, 0);
+    const uint32_t a = s.callService(lightOn(), 1, 1);
+    const uint32_t b = s.callService(lightOn(), 2, 1);
+    const uint32_t c = s.callService(lightOn(), 3, 1);
+    feed(s, resultOk(a), 2);
+    feed(s, callResultFail(b, "bad", "msg"), 3);
+    s.tick(20000);  // c times out
+    s.callService(lightOn(), 4, 20001);
+    s.onClosed("x", 20002);
+    TEST_ASSERT_TRUE(c != 0);
+    TEST_ASSERT_TRUE(logs.lines.size() >= 6);
+    TEST_ASSERT_FALSE(anyLogContains(logs, "SECRETTOKEN123"));
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_state_names);
@@ -2757,5 +3397,25 @@ int main(int, char **) {
     RUN_TEST(test_ms_since_subscribe_none_after_failed_result);
     RUN_TEST(test_ms_since_subscribe_none_after_disconnect_and_empty_ids);
     RUN_TEST(test_last_error_cut_on_utf8_boundary);
+    RUN_TEST(test_call_only_in_ready);
+    RUN_TEST(test_call_frames_in_ready);
+    RUN_TEST(test_call_success_rtt_and_log);
+    RUN_TEST(test_call_failure_variants);
+    RUN_TEST(test_call_log_cuts_and_control_chars);
+    RUN_TEST(test_call_limit_8_and_subscribe_still_works);
+    RUN_TEST(test_call_refused_when_map_full_of_unsubscribes_calls_never_evicted);
+    RUN_TEST(test_call_timeout_exact_and_late_result_ignored);
+    RUN_TEST(test_call_timeout_and_pong_timeout_same_tick);
+    RUN_TEST(test_call_timeout_and_subscribe_timeout_same_tick);
+    RUN_TEST(test_call_connection_lost_exactly_once_per_path);
+    RUN_TEST(test_call_kept_when_only_entity_ids_change);
+    RUN_TEST(test_call_send_failure);
+    RUN_TEST(test_call_send_reports_close_then_true);
+    RUN_TEST(test_call_result_while_fetching);
+    RUN_TEST(test_call_results_not_confused_with_other_ids);
+    RUN_TEST(test_call_millis_wrap);
+    RUN_TEST(test_call_clock_going_backwards);
+    RUN_TEST(test_call_results_oldest_first);
+    RUN_TEST(test_call_logs_never_contain_token);
     return UNITY_END();
 }

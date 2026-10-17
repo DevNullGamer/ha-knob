@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "control/DomainActions.h"
 #include "ha/EntityCatalog.h"
 #include "ha/EntityStore.h"
 #include "ha/HaUrl.h"
@@ -44,7 +45,7 @@
 //    without a pong it fails regardless.
 //  - Message ids are monotonic per connection and start at 1 on every connection.
 //    Requests waiting for a result are kept in a pending map (at most kMaxPending,
-//    expired after 15 s; an expired subscribe means Backoff).
+//    expired after 15 s, calls after 10 s; an expired subscribe means Backoff).
 //  - The token is kept only to build the auth message; it is never part of any status.
 //
 // Subscription (plan-step6.md §3.3): the de-duplicated entity ids are subscribed with
@@ -64,6 +65,13 @@
 // catalog is handed over once by takeCatalog()) or Failed (statesError()). A build in
 // progress finishes even if the connection drops; a URL / token / TLS change aborts it and
 // drops the catalog (possibly another HA instance).
+//
+// Service calls (plan-step7.md §3.3): callService() (Ready only) sends call_service and
+// tracks it in the pending map with the caller's tag; at most kMaxCallsPending calls are
+// unanswered at a time (the rest of kMaxPending stays free for (un)subscribe). Every call
+// ends in exactly one CallResult (takeCallResults()): Ok / Failed from HA's result,
+// Timeout after kCallTimeoutMs without one (a later result is an unknown id and ignored),
+// ConnectionLost when the connection ends or restarts first.
 namespace core {
 namespace ha {
 
@@ -172,6 +180,21 @@ enum class StatesState : uint8_t { None, Fetching, Building, Ready, Failed };
 // "none", "fetching", "building", "ready", "failed" (as in /api/status ha.catalog.state).
 const char *statesStateName(StatesState state);
 
+// How a service call ended:
+//  Ok              HA's result with success true
+//  Failed          success false; code / message = HA's error.code / error.message
+//  Timeout         no result within kCallTimeoutMs (code "timeout")
+//  ConnectionLost  the connection ended or restarted first (code "connection_lost")
+enum class CallOutcome : uint8_t { Ok, Failed, Timeout, ConnectionLost };
+
+struct CallResult {
+    uint32_t tag = 0;  // as passed to callService()
+    CallOutcome outcome = CallOutcome::Ok;
+    std::string code;     // "" for Ok
+    std::string message;  // Failed: HA's error.message (may be ""); "" otherwise
+    uint32_t rttMs = 0;   // sent -> result (Timeout / ConnectionLost: sent -> that moment)
+};
+
 struct SessionOptions {
     // Bytes of the retained get_states text the catalog builder works through per tick()
     // (whole elements, at least one per tick), and at most this many elements per tick.
@@ -199,6 +222,8 @@ public:
     // to be its result if it is longer than this.
     static constexpr size_t kStatesRetainMinBytes = 64u * 1024u;
     static constexpr size_t kMaxPending = 16;
+    static constexpr uint32_t kCallTimeoutMs = 10000;  // call_service sent -> Timeout
+    static constexpr size_t kMaxCallsPending = 8;      // of kMaxPending (room for subscribe)
     static constexpr size_t kMaxErrorLen = 120;           // lastError is cut to this length
 
     using Options = SessionOptions;
@@ -215,6 +240,12 @@ public:
     //   states retained len=<bytes>
     //   catalog failed error=<statesError>
     //   states late result dropped len=<bytes>  (a large result of an abandoned fetch)
+    //   call id=<n> <domain>.<service> entity=<id> data=<service_data JSON, or null>
+    //   call ok id=<n> ms=<rtt>
+    //   call failed id=<n> error=<code>[: <HA message, cut to 60 bytes>]
+    //   call timeout id=<n>
+    //   calls dropped n=<k> reason=connection_lost
+    //   (HA-supplied text in these lines is passed through util::logSafe)
     // The logger is called from inside session methods (also while the pending map is
     // being iterated): it must only log and never call back into the session.
     using Logger = std::function<void(const std::string &line)>;
@@ -256,6 +287,16 @@ public:
     // (Fetching / Building) is kept (coalesced, returns true); otherwise an untaken
     // catalog and the previous error are dropped. False when not Ready or the send failed.
     bool requestStates(uint32_t nowMs);
+
+    // Sends call_service for `call` with a new id and tracks it with `tag` (returned in its
+    // CallResult). Returns the message id, or 0 (nothing tracked, no result will follow)
+    // when not Ready, kMaxCallsPending calls are unanswered, the pending map is full or the
+    // send failed (the session is then in Backoff).
+    uint32_t callService(const domain_actions::ServiceCall &call, uint32_t tag, uint32_t nowMs);
+    // Unanswered calls (tracked in the pending map).
+    size_t callsPending() const;
+    // The results collected since the last take, oldest first. Drain every loop pass.
+    std::vector<CallResult> takeCallResults();
 
     StatesState statesState() const { return statesState_; }
     // Failed only: "states_too_large", "states_no_memory", "states_timeout",
@@ -318,7 +359,7 @@ private:
     struct Pending {
         uint32_t id;
         Purpose purpose;
-        int32_t tag;
+        uint32_t tag;
         uint32_t sentAtMs;
     };
 
@@ -330,10 +371,12 @@ private:
     void fail(const std::string &reason, uint32_t nowMs);
     void closeTransport();
     bool send(const std::string &text, uint32_t nowMs);
-    bool track(uint32_t id, Purpose purpose, int32_t tag, uint32_t nowMs);
+    bool track(uint32_t id, Purpose purpose, uint32_t tag, uint32_t nowMs);
+    void clearPending(uint32_t nowMs);
     void becomeReady();
     void onAuthenticated(uint32_t nowMs);
-    void handleResult(uint32_t id, bool success, const std::string &message);
+    void handleResult(uint32_t id, bool success, const std::string &errorCode, const std::string &message,
+                      uint32_t nowMs);
     void handleEvent(const Message &msg);
     void handleUnparsed(const Message &msg, const char *data, size_t length);
     bool active() const;
@@ -380,6 +423,7 @@ private:
     uint32_t pendingSubscribeId_ = 0;  // subscribe_entities sent, no result yet (0 = none)
     uint32_t subscribeSentMs_ = 0;     // when the current (active / pending) one was sent
     std::vector<Pending> pending_;
+    std::vector<CallResult> callResults_;  // not taken yet
     uint32_t changeCount_ = 0;
     uint32_t droppedMessages_ = 0;
     EntityStore store_;

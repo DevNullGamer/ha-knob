@@ -791,3 +791,37 @@ the device uses it yet (Step 7.6).
   `interval < threshold * |n|` (no truncation); shares the state with `onDetent`; 0 detents
   changes nothing. Note: the spec's test "4 in 240 ms -> x1" is 60 ms per detent, which is
   x2 by Q7-2's thresholds; x1 needs >= 80 ms per detent (4 in >= 320 ms).
+
+## Step 7.3 (2026-10-17)
+
+Spec: `plan-step7.md` §3.3, §4 Step 7.3. Core only (`HaSession`); nothing on the device
+calls it yet (Step 7.6).
+
+- API: `HaSession::callService(ServiceCall, tag, now)` -> message id or 0,
+  `callsPending()`, `takeCallResults()`; `CallOutcome {Ok, Failed, Timeout,
+  ConnectionLost}`, `CallResult {tag, outcome, code, message, rttMs}`;
+  `kCallTimeoutMs` 10 s, `kMaxCallsPending` 8. `Pending::tag` is `uint32_t`.
+  HaProtocol was unchanged: `buildCallService` and `Message::errorCode` already existed.
+- `callService` returns 0 (nothing tracked, no result follows) when not Ready (also
+  Subscribing), 8 calls are unanswered, the whole pending map (16) is full, or the send
+  failed (`send_failed` -> Backoff; the other pending calls then end as ConnectionLost).
+  It also returns 0 if the transport reported a close from inside a successful
+  `sendText` (defensive; the session is no longer Ready).
+- One helper, `clearPending(now)`, replaces every `pending_.clear()` (`fail`, `connect`,
+  restarting `configure`, `auth_invalid`): each CallService entry becomes one
+  ConnectionLost result, then the map is cleared, so a call ends exactly once.
+- Timeouts: in `tick()` (Subscribing / Ready) a CallService entry expires after 10 s, the
+  others still after 15 s. `rttMs` is sent -> result, or sent -> timeout / drop.
+- Result fields: Failed keeps HA's `error.code` (`"unknown"` if absent) and the full
+  `error.message` (the 60-byte cut for the toast is the engine's job, §3.4); Timeout /
+  ConnectionLost carry `code` `"timeout"` / `"connection_lost"`, `message` empty.
+- Log lines (§3.3): `data=` is the serialised `service_data`, `null` when the call has none
+  (e.g. `light.turn_off`); domain, service, entity, data, code and message are passed
+  through `util::logSafe` (data 96, message 60, code 48 bytes). `call failed` without an
+  HA message omits the `: <message>` part.
+- Clock guard (Auditor round 2): pending expiry and `rttMs` use `elapsedMs(sent, now)`,
+  which is 0 when `now` is before `sent` (`static_cast<int32_t>(now - sent) < 0`), so a
+  `nowMs` older than a call's send time neither expires it at once nor reports a huge rtt.
+  The same one-line guard applies to the subscribe / unsubscribe expiry in that loop
+  (otherwise unchanged); elapsed times above ~24.8 days count as 0 (never reached: every
+  entry expires after 10-15 s).

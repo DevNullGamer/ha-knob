@@ -23,6 +23,13 @@ bool sameIdSet(std::vector<std::string> a, std::vector<std::string> b) {
     return a == b;
 }
 
+// Milliseconds from sinceMs to nowMs (modulo 2^32); 0 if nowMs is before sinceMs (a
+// caller clock that went backwards must not expire a request at once).
+uint32_t elapsedMs(uint32_t sinceMs, uint32_t nowMs) {
+    const uint32_t d = nowMs - sinceMs;
+    return static_cast<int32_t>(d) < 0 ? 0 : d;
+}
+
 }  // namespace
 
 RetainedText &RetainedText::operator=(RetainedText &&other) noexcept {
@@ -127,7 +134,7 @@ void HaSession::configure(const std::string &url, const std::string &token, cons
     endpoint_ = url.empty() ? HaUrl() : parseHaUrl(url);
 
     closeTransport();
-    pending_.clear();
+    clearPending(nowMs);
     subscriptionId_ = 0;
     pendingSubscribeId_ = 0;
     store_.clear();
@@ -209,13 +216,21 @@ void HaSession::tick(uint32_t nowMs) {
     }
 
     for (auto it = pending_.begin(); it != pending_.end();) {
-        if (nowMs - it->sentAtMs < kRequestTimeoutMs) {
+        const uint32_t timeoutMs = it->purpose == Purpose::CallService ? kCallTimeoutMs : kRequestTimeoutMs;
+        const uint32_t elapsed = elapsedMs(it->sentAtMs, nowMs);
+        if (elapsed < timeoutMs) {
             ++it;
             continue;
         }
         const Purpose purpose = it->purpose;
         const uint32_t id = it->id;
+        const uint32_t tag = it->tag;
         it = pending_.erase(it);
+        if (purpose == Purpose::CallService) {
+            callResults_.push_back(CallResult{tag, CallOutcome::Timeout, "timeout", "", elapsed});
+            log("call timeout id=" + std::to_string(id));
+            continue;
+        }
         if (purpose == Purpose::Subscribe && id == pendingSubscribeId_) {
             fail("subscribe_timeout", nowMs);
             return;
@@ -307,7 +322,7 @@ void HaSession::onText(const char *data, size_t length, uint32_t nowMs) {
                 onAuthenticated(nowMs);
             } else if (msg.type == MessageType::AuthInvalid) {
                 closeTransport();
-                pending_.clear();
+                clearPending(nowMs);
                 setError(msg.message.empty() ? std::string("auth_invalid") : "auth_invalid: " + msg.message);
                 setState(State::AuthFailed);
             }
@@ -318,7 +333,7 @@ void HaSession::onText(const char *data, size_t length, uint32_t nowMs) {
                 if (statesState_ == StatesState::Fetching && msg.id == statesId_) {
                     retainStates(data, length, nowMs);  // fallback (normally recognised above)
                 } else {
-                    handleResult(msg.id, msg.success, msg.message);
+                    handleResult(msg.id, msg.success, msg.errorCode, msg.message, nowMs);
                 }
             } else if (msg.type == MessageType::Pong) {
                 if (pingOutstanding_ && msg.id == pingId_) {
@@ -382,6 +397,40 @@ bool HaSession::requestStates(uint32_t nowMs) {
     return true;
 }
 
+uint32_t HaSession::callService(const domain_actions::ServiceCall &call, uint32_t tag, uint32_t nowMs) {
+    if (state_ != State::Ready || !transportOpen_ || callsPending() >= kMaxCallsPending ||
+        pending_.size() >= kMaxPending) {
+        return 0;
+    }
+    const uint32_t id = nextId_++;
+    if (!send(buildCallService(id, call.domain, call.service, call.data.as<JsonVariantConst>(), call.entityId,
+                               allocator_),
+              nowMs)) {
+        return 0;  // send() failed the connection (Backoff); nothing tracked, no result
+    }
+    if (!transportOpen_ || state_ != State::Ready) {
+        return 0;  // closed during the send (reported through onClosed): no result follows
+    }
+    track(id, Purpose::CallService, tag, nowMs);  // room checked above
+    std::string data;
+    serializeJson(call.data, data);  // "null" without service_data
+    log("call id=" + std::to_string(id) + " " + util::logSafe(call.domain, 32) + "." +
+        util::logSafe(call.service, 48) + " entity=" + util::logSafe(call.entityId, 96) +
+        " data=" + util::logSafe(data, 96));
+    return id;
+}
+
+size_t HaSession::callsPending() const {
+    return static_cast<size_t>(std::count_if(pending_.begin(), pending_.end(),
+                                             [](const Pending &p) { return p.purpose == Purpose::CallService; }));
+}
+
+std::vector<CallResult> HaSession::takeCallResults() {
+    std::vector<CallResult> out;
+    out.swap(callResults_);
+    return out;
+}
+
 std::optional<EntityCatalog> HaSession::takeCatalog() {
     std::optional<EntityCatalog> out = std::move(catalog_);
     catalog_.reset();
@@ -421,7 +470,7 @@ void HaSession::connect(uint32_t nowMs) {
     closeTransport();
     ++attempts_;
     nextId_ = 1;
-    pending_.clear();
+    clearPending(nowMs);
     pingOutstanding_ = false;
     subscriptionId_ = 0;
     pendingSubscribeId_ = 0;
@@ -440,7 +489,7 @@ void HaSession::connect(uint32_t nowMs) {
 
 void HaSession::fail(const std::string &reason, uint32_t nowMs) {
     closeTransport();
-    pending_.clear();
+    clearPending(nowMs);
     pingOutstanding_ = false;
     subscriptionId_ = 0;
     pendingSubscribeId_ = 0;
@@ -473,12 +522,29 @@ bool HaSession::send(const std::string &text, uint32_t nowMs) {
     return false;
 }
 
-bool HaSession::track(uint32_t id, Purpose purpose, int32_t tag, uint32_t nowMs) {
+bool HaSession::track(uint32_t id, Purpose purpose, uint32_t tag, uint32_t nowMs) {
     if (pending_.size() >= kMaxPending) {
         return false;
     }
     pending_.push_back(Pending{id, purpose, tag, nowMs});
     return true;
+}
+
+void HaSession::clearPending(uint32_t nowMs) {
+    // Every unanswered call ends exactly once: as ConnectionLost here (the map is cleared
+    // right after, so a later path finds nothing to report).
+    size_t dropped = 0;
+    for (const Pending &p : pending_) {
+        if (p.purpose == Purpose::CallService) {
+            callResults_.push_back(CallResult{p.tag, CallOutcome::ConnectionLost, "connection_lost", "",
+                                              elapsedMs(p.sentAtMs, nowMs)});
+            ++dropped;
+        }
+    }
+    pending_.clear();
+    if (dropped > 0) {
+        log("calls dropped n=" + std::to_string(dropped) + " reason=connection_lost");
+    }
 }
 
 void HaSession::becomeReady() {
@@ -583,12 +649,30 @@ void HaSession::handleUnparsed(const Message &msg, const char *data, size_t leng
     }
 }
 
-void HaSession::handleResult(uint32_t id, bool success, const std::string &message) {
+void HaSession::handleResult(uint32_t id, bool success, const std::string &errorCode, const std::string &message,
+                             uint32_t nowMs) {
     auto it = std::find_if(pending_.begin(), pending_.end(), [id](const Pending &p) { return p.id == id; });
     Purpose purpose = Purpose::Subscribe;
     if (it != pending_.end()) {
         purpose = it->purpose;
+        const uint32_t tag = it->tag;
+        const uint32_t rtt = elapsedMs(it->sentAtMs, nowMs);
         pending_.erase(it);
+        if (purpose == Purpose::CallService) {
+            if (success) {
+                callResults_.push_back(CallResult{tag, CallOutcome::Ok, "", "", rtt});
+                log("call ok id=" + std::to_string(id) + " ms=" + std::to_string(rtt));
+            } else {
+                const std::string code = errorCode.empty() ? std::string("unknown") : errorCode;
+                callResults_.push_back(CallResult{tag, CallOutcome::Failed, code, message, rtt});
+                std::string line = "call failed id=" + std::to_string(id) + " error=" + util::logSafe(code, 48);
+                if (!message.empty()) {
+                    line += ": " + util::logSafe(message, 60);
+                }
+                log(line);
+            }
+            return;
+        }
     } else if (id == 0 || id != pendingSubscribeId_) {
         return;  // unknown or expired id (a subscribe not tracked because the map was full
                  // is still matched by pendingSubscribeId_)
