@@ -15,7 +15,7 @@
 // Stored (non-secret) JSON, schema 1:
 //   {"schema":1,
 //    "device":{"hostname","brightness","dim_after_s","dim_level","off_after_s","buzzer",
-//              "encoder_reverse","accel","send_interval_ms"},
+//              "detent_click","encoder_reverse","accel","send_interval_ms"},
 //    "wifi":{"ssid"}, "ha":{"url","ca_pem","tls_insecure"},
 //    "controls":[{"entity_id","label","action","step","press"}]}
 // Secrets (Wi-Fi password, HA token, web password) are never part of Config; they are
@@ -47,6 +47,7 @@ struct DeviceConfig {
     int32_t dimLevel = 15;          // 0-100 %
     uint32_t offAfterS = 300;       // 0-86400, 0 = never
     bool buzzer = true;
+    bool detentClick = false;       // a click on every detent (only with buzzer)
     bool encoderReverse = false;
     bool accel = true;
     uint32_t sendIntervalMs = 250;  // 100-2000

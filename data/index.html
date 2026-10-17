@@ -158,10 +158,12 @@
       <label>Screen off after (s, 0 = never)
         <input id="dev-off-after" type="number" min="0" max="86400" step="1">
       </label>
+      <p class="hint">The first turn or press after dimming only wakes the screen.</p>
       <label>Send interval to Home Assistant (ms)
         <input id="dev-send-interval" type="number" min="100" max="2000" step="1">
       </label>
       <label class="check"><input id="dev-buzzer" type="checkbox"> Buzzer click</label>
+      <label class="check"><input id="dev-detent-click" type="checkbox"> Click on every knob step (needs Buzzer click)</label>
       <label class="check"><input id="dev-reverse" type="checkbox"> Reverse encoder direction</label>
       <label class="check"><input id="dev-accel" type="checkbox"> Encoder acceleration</label>
       <button type="submit">Save device settings</button>

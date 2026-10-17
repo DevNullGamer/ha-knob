@@ -72,7 +72,7 @@ void press(size_t page, uint32_t nowMs) {
     engine.press(page, entityFor(page), haReady(), nowMs);
 }
 
-void loop(uint32_t nowMs) {
+bool loop(uint32_t nowMs) {
     // Every result before tick(): a lost result would keep its in-flight slot occupied.
     for (const core::ha::CallResult &result : ha::takeCallResults()) {
         engine.onResult(result, nowMs);
@@ -93,6 +93,7 @@ void loop(uint32_t nowMs) {
             lastErrorBeepMs = nowMs;
         }
     }
+    return notice.has_value();
 }
 
 std::optional<core::control::LocalValue> local(size_t page, uint32_t nowMs) {

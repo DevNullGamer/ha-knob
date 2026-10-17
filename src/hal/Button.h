@@ -13,5 +13,8 @@ void begin();
 // Call every loop; returns at most one event per call.
 core::ButtonFsm::Event poll(uint32_t nowMs);
 
+// The debounced state as of the last poll() (true = held).
+bool isDown();
+
 }  // namespace button
 }  // namespace hal

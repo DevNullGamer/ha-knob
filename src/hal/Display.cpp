@@ -16,6 +16,8 @@ namespace {
 constexpr int32_t kQspiHz = 40000000;
 constexpr int32_t kDrawBufLines = 40;
 constexpr int32_t kDefaultBrightnessPercent = 80;
+constexpr uint8_t kCmdDisplayOff = 0x28;  // CO5300_C_DISPOFF (MIPI DCS)
+constexpr uint8_t kCmdDisplayOn = 0x29;   // CO5300_C_DISPON
 
 Arduino_DataBus *bus = nullptr;
 Arduino_CO5300 *gfx = nullptr;
@@ -75,6 +77,12 @@ bool begin() {
 void setBrightnessPercent(int32_t percent) {
     if (gfx != nullptr) {
         gfx->setBrightness(core::percentToByte(percent));
+    }
+}
+
+void setPanelOn(bool on) {
+    if (bus != nullptr && gfx != nullptr) {
+        bus->sendCommand(on ? kCmdDisplayOn : kCmdDisplayOff);  // own begin/endWrite
     }
 }
 

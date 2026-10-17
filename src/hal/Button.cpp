@@ -19,5 +19,7 @@ core::ButtonFsm::Event poll(uint32_t nowMs) {
     return fsm.update(digitalRead(pins::kEncKey) == LOW, nowMs);
 }
 
+bool isDown() { return fsm.isDown(); }
+
 }  // namespace button
 }  // namespace hal

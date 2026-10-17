@@ -9,13 +9,13 @@
 //   HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<..>
 //      wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes>
 //      loopmax=<ms> ent=<entities>/<ids> cat=<none|fetching|building|ready|failed>
-//      stack=<bytes> psram_free=<bytes>
+//      stack=<bytes> psram_free=<bytes> disp=<on|dim|off>
 //      (every 5 s; ip = STA IP, else 192.168.4.1 with the setup AP up, else 0.0.0.0;
 //      ha = HA connection state; heap / heap_min = internal free heap now / lowest since
 //      boot; loopmax = longest loop() pass since the previous HB, without its delay;
 //      ent = live entities in the store / unique entity ids of the controls; cat = entity
 //      list fetch; stack = loop task stack never used so far (high-water mark, bytes);
-//      psram_free = free PSRAM now)
+//      psram_free = free PSRAM now; disp = screen level, src/app/Idle.h)
 //   CFG ...   config store events (see src/config/ConfigStore.h)
 //   WIFI ...  Wi-Fi events (see src/net/WifiManager.h)
 //   WEB ...   web server events (see src/net/WebServer.h)
@@ -29,7 +29,9 @@
 //           shows something new (banner=1: HA not Ready, state = the offline reason)
 //   UI toast text=<t>                             a control notice (src/ui/Ui.h)
 //   CTL ...   control presses and notices (see src/app/Control.h)
+//   IDLE ... | DISP ...   screen wake / dim / off (see src/app/Idle.h)
 //   TIN <cmd> | TIN bad <cmd>   test builds only (-DHAKNOB_TEST_INPUT): injected input
+//   BUZ ...   test builds only: buzzer requests (see src/hal/Buzzer.h)
 //   SYS reboot | SYS factory reset
 
 #include <Arduino.h>
@@ -45,6 +47,7 @@
 #include <vector>
 
 #include "app/Control.h"
+#include "app/Idle.h"
 #include "config/ConfigStore.h"
 #include "ha/HaClient.h"
 #include "hal/Button.h"
@@ -93,6 +96,7 @@ std::vector<core::config::Control> controls;
 uint32_t controlsGeneration = 0;  // +1 whenever `controls` is replaced
 bool encoderReverse = false;      // device.encoder_reverse
 bool buzzerEnabled = true;        // device.buzzer (the click on BTN down)
+bool detentClick = false;         // device.detent_click (a click per acted-on detent batch)
 struct ViewKey {
     int page = -1;
     uint32_t controlsGeneration = 0;
@@ -129,7 +133,7 @@ void printHeartbeat(uint32_t nowMs) {
                      : wifi.apActive   ? net::wifi::kApIp
                                        : "0.0.0.0";
     util::logPrintf("HB up=%u psram=%u flash=%u touch=%s count=%d ctl=%u cfg=%s wifi=%s ip=%s ha=%s "
-                    "heap=%u heap_min=%u loopmax=%u ent=%u/%u cat=%s stack=%u psram_free=%u\n",
+                    "heap=%u heap_min=%u loopmax=%u ent=%u/%u cat=%s stack=%u psram_free=%u disp=%s\n",
                     static_cast<unsigned>(nowMs / 1000), static_cast<unsigned>(ESP.getPsramSize()),
                     static_cast<unsigned>(ESP.getFlashChipSize()), hal::touch::variantName(),
                     static_cast<int>(shownCount),
@@ -140,7 +144,8 @@ void printHeartbeat(uint32_t nowMs) {
                     static_cast<unsigned>(ha::entities().size()), static_cast<unsigned>(ha::subscribedCount()),
                     core::ha::statesStateName(ha::catalogState()),
                     static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),  // bytes on ESP-IDF
-                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                    core::ui::screenLevelName(app::idle::level()));
     loopMaxUs = 0;
 }
 
@@ -191,6 +196,7 @@ std::vector<std::string> controlEntityIds(const core::config::Config &config) {
 void applyControls(const core::config::Config &config) {
     encoderReverse = config.device.encoderReverse;
     buzzerEnabled = config.device.buzzer;
+    detentClick = config.device.detentClick;
     app::control::applyConfig(config.device, config.controls);
     if (config.controls == controls && controlsGeneration != 0) {
         return;
@@ -322,8 +328,11 @@ void publishCatalog() {
 void handleWebRequests(uint32_t nowMs) {
     if (net::web::takeConfigDirty()) {
         const core::config::Config config = configStore.config();
+        // The user is looking at the device (Q8-9): wake it; the new brightness / timeouts
+        // apply in app::idle::loop() of this pass.
+        app::idle::keepAwake(app::idle::Source::Config, nowMs);
+        app::idle::applyConfig(config.device, nowMs);
         if (displayOk) {
-            hal::display::setBrightnessPercent(config.device.brightness);
             ui::selectCancel("config");  // its titles and pages may be stale (Q7-9)
         }
         net::wifi::applyConfig(config.wifi.ssid, configStore.wifiPassword(), config.device.hostname,
@@ -397,9 +406,10 @@ void handleWebRequests(uint32_t nowMs) {
 int32_t testDelta = 0;  // detents injected by "TIN rot" since the last handleEncoder()
 #endif
 
-// The detents of this pass (one batch, plan-step7.md Q7-2): counted for the Status page;
+// The detents of this pass (one batch, plan-step7.md Q7-2): counted for the Status page
+// (also when they only wake the screen); then, unless they woke it (plan-step8.md §3.5),
 // they move the Select list while it is open (1 item per detent), else turn the selected
-// control page.
+// control page; only these two click (device.buzzer and device.detent_click).
 void handleEncoder(uint32_t nowMs) {
     int32_t delta = hal::encoder::takeDelta();
 #if defined(HAKNOB_TEST_INPUT)
@@ -419,12 +429,24 @@ void handleEncoder(uint32_t nowMs) {
     }
     if (displayOk) {
         ui::showEncoderCount(shownCount);
-        const int page = ui::controlPage();
-        if (ui::selectIsOpen()) {
-            ui::selectMove(static_cast<int>(delta), nowMs);
-        } else if (page >= 0 && ui::pagesActive()) {
-            app::control::rotate(static_cast<size_t>(page), static_cast<int>(delta), nowMs);
-        }
+    }
+    if (!app::idle::input(app::idle::Source::Encoder, nowMs)) {
+        return;
+    }
+    if (!displayOk) {
+        return;
+    }
+    const int page = ui::controlPage();
+    bool actedOn = true;  // Q8-11: click only for a Select move or a control rotation
+    if (ui::selectIsOpen()) {
+        ui::selectMove(static_cast<int>(delta), nowMs);
+    } else if (page >= 0 && ui::pagesActive()) {
+        app::control::rotate(static_cast<size_t>(page), static_cast<int>(delta), nowMs);
+    } else {
+        actedOn = false;  // Status, NoControls, boot or setup screen
+    }
+    if (actedOn && buzzerEnabled && detentClick) {
+        hal::buzzer::click(nowMs);  // at most one per pass (and per 40 ms)
     }
 }
 
@@ -433,13 +455,17 @@ void handleButtonEvent(core::ButtonFsm::Event event, uint32_t nowMs) {
     if (event == Event::None) {
         return;
     }
-    if (event == Event::Pressed && buzzerEnabled) {
-        hal::buzzer::beep(nowMs);
-    }
     if (event == Event::ShortPress) {
         util::logPrintf("BTN up\n");  // a short press is also a release
     }
     util::logPrintf("BTN %s\n", core::buttonEventName(event));
+    // A gesture that woke the screen is swallowed up to its release (Q8-3): no click, no action.
+    if (!app::idle::button(event, nowMs)) {
+        return;
+    }
+    if (event == Event::Pressed && buzzerEnabled) {
+        hal::buzzer::beep(nowMs);
+    }
 
     if (!displayOk) {
         return;
@@ -484,12 +510,12 @@ void handleButtonEvent(core::ButtonFsm::Event event, uint32_t nowMs) {
 
 void handleButton(uint32_t nowMs) { handleButtonEvent(hal::button::poll(nowMs), nowMs); }
 
-void handleSwipe(core::Swipe swipe) {
+void handleSwipe(core::Swipe swipe, uint32_t nowMs) {
     if (swipe == core::Swipe::None) {
         return;
     }
     util::logPrintf("TOUCH swipe=%s\n", core::swipeName(swipe));
-    if (!displayOk) {
+    if (!app::idle::input(app::idle::Source::Swipe, nowMs) || !displayOk) {
         return;
     }
     // Swipe left = next page, swipe right = previous page (wrapping); ignored while the
@@ -500,12 +526,13 @@ void handleSwipe(core::Swipe swipe) {
     }
 }
 
-void handleTouch(uint32_t nowMs) { handleSwipe(hal::touch::poll(nowMs)); }
+void handleTouch(uint32_t nowMs) { handleSwipe(hal::touch::poll(nowMs), nowMs); }
 
 #if defined(HAKNOB_TEST_INPUT)
-// Test builds only (plan-step7.md Q7-10): "TIN rot <+-n>", "TIN short", "TIN long",
-// "TIN swipe left|right" lines on the serial port are injected through the same paths as
-// the HAL events (rotations join this pass's encoder batch, so encoder_reverse and the
+// Test builds only (plan-step7.md Q7-10, plan-step8.md §3.5): "TIN rot <+-n>", "TIN short",
+// "TIN long", "TIN down" (Pressed), "TIN up" (Released), "TIN verylong", "TIN swipe
+// left|right" lines on the serial port are injected through the same paths as the HAL
+// events (rotations join this pass's encoder batch, so encoder_reverse and the
 // acceleration apply). Non-blocking; lines longer than kTestLineMax characters are dropped
 // whole, lines without the "TIN " prefix are ignored.
 constexpr size_t kTestLineMax = 40;
@@ -531,12 +558,17 @@ void runTestLine(const std::string &line, uint32_t nowMs) {
             util::logPrintf("TIN %s\n", core::util::logSafe(cmd, kTestLineMax).c_str());
             testDelta += static_cast<int32_t>(n);
         }
-    } else if (cmd == "short" || cmd == "long") {
+    } else if (cmd == "short" || cmd == "long" || cmd == "down" || cmd == "up" || cmd == "verylong") {
         util::logPrintf("TIN %s\n", cmd.c_str());
-        handleButtonEvent(cmd == "short" ? Event::ShortPress : Event::LongPress, nowMs);
+        const Event event = cmd == "short"  ? Event::ShortPress
+                            : cmd == "long" ? Event::LongPress
+                            : cmd == "down" ? Event::Pressed
+                            : cmd == "up"   ? Event::Released
+                                            : Event::VeryLongPress;
+        handleButtonEvent(event, nowMs);
     } else if (cmd == "swipe left" || cmd == "swipe right") {
         util::logPrintf("TIN %s\n", cmd.c_str());
-        handleSwipe(cmd == "swipe left" ? core::Swipe::Left : core::Swipe::Right);
+        handleSwipe(cmd == "swipe left" ? core::Swipe::Left : core::Swipe::Right, nowMs);
     } else {
         ok = false;
     }
@@ -583,8 +615,9 @@ void setup() {
     const core::config::Config config = configStore.config();
 
     displayOk = hal::display::begin();
+    app::idle::applyConfig(config.device, millis());
     if (displayOk) {
-        hal::display::setBrightnessPercent(config.device.brightness);
+        app::idle::loop(millis());  // the configured brightness (logs DISP level=on)
     }
     hal::touch::begin();
     hal::encoder::begin();
@@ -626,7 +659,14 @@ void loop() {
     publishNetwork();
     ha::setNetworkUp(net::wifi::status().staConnected, nowMs);
     ha::loop();
-    app::control::loop(nowMs);  // after ha::loop() (its call results), before the view
+    // After ha::loop() (its call results), before the view. A toast wakes the screen (Q8-9).
+    if (app::control::loop(nowMs)) {
+        app::idle::keepAwake(app::idle::Source::Toast, nowMs);
+    }
+    // After every input, the config re-read and the toast, so a wake applies in this pass.
+    if (displayOk) {
+        app::idle::loop(nowMs);
+    }
     publishHa();
     publishCatalog();
     publishControlView(nowMs);

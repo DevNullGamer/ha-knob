@@ -1097,3 +1097,68 @@ Spec: `plan-step7.md` §3.5, §3.6 (ui), §4 Steps 7.7 and 7.8 (Q7-6, Q7-8, Q7-9
   title and value stay dimmed. Select, NoControls and Status get no banner (Q8-15).
 - Build: normal RAM 55316 bytes (16.9 %), flash 1842725 bytes (28.4 %, +820 B for 8.3 +
   8.6); test build RAM 55348, flash 1843861.
+
+## Step 8.4: idle dim / off on the device (2026-10-18)
+
+Spec: `plan-step8.md` §3.5, §4 Step 8.4 (Q8-1..Q8-9).
+
+- `hal::display::setPanelOn(on)`: one `bus->sendCommand(0x29 / 0x28)` (DISPON / DISPOFF;
+  `sendCommand` does its own begin/endWrite), no SLPIN / SLPOUT, no delay (Q8-5). Fallback
+  if [MANUAL] shows glow or artefacts: make it a no-op (brightness 0 alone).
+  `hal::button::isDown()`: the FSM's debounced state (for 8.7's arming).
+- `src/app/Idle` (`app::idle`): owns the `IdleTimer`, `applyConfig` (configure + brightness /
+  dim level), `input(Encoder|Swipe)`, `button(event)`, `keepAwake(Config|Toast)`, `loop`,
+  `level`. `loop` ticks, then applies `panelSetting` only when the level or the setting
+  differs from the last applied one: panel on before the brightness on a wake, brightness 0
+  before the panel off; the brightness is only written when the percentage changes. The
+  level counts for the change check, so Dim with `dim_level >= brightness` still logs `DISP
+  level=dim pct=<brightness>` (spec test 5 expects that line). The applied state starts as
+  "on, brightness unknown", so the first `loop` (in `setup`) writes the configured brightness
+  and logs `DISP level=on pct=<n>`; `main` no longer calls `setBrightnessPercent`.
+- `IDLE wake by=button consumed=1` is logged once, for the event that found the level not
+  On; the rest of the swallowed gesture is silent (its `BTN` lines still appear, A4).
+- `main` gating: encoder: `ENC` lines and the Status count first (raw input, also on a
+  wake: the count is a diagnostic), then `app::idle::input(Encoder)`; false -> stop.
+  Button: `BTN` lines, then `app::idle::button`; false -> stop (no press click, no Select).
+  Swipe: `TOUCH` line, then `app::idle::input(Swipe)`. Config re-read:
+  `keepAwake(Config)` **before** `applyConfig` (configure itself wakes, so the other order
+  would never log the config wake). Toast: `app::control::loop` now returns true when it
+  showed a notice -> `keepAwake(Toast)`. `app::idle::loop` runs right after
+  `app::control::loop` (after the inputs, `handleWebRequests` and the toast), only with a
+  working display; without one the level stays On and nothing is swallowed.
+- `TIN down|up|verylong` -> `Pressed` / `Released` / `VeryLongPress` through
+  `handleButtonEvent` (so `TIN down` clicks). `verylong` keeps its Status "very long press"
+  text; no reset before 8.7.
+- HB: ` disp=<on|dim|off>` appended after `psram_free` (Step 8.3 table: worst case 275
+  chars). HB lines therefore no longer end with `psram_free=`.
+- Web: hint "The first turn or press after dimming only wakes the screen." under the
+  screen-off field.
+- `src/util/Log.h`: the long `kMaxLine` comment line wrapped.
+
+## Step 8.5: detent click and `detent_click` (2026-10-18)
+
+Spec: `plan-step8.md` §3.4, §3.5, §4 Step 8.5 (Q8-10, Q8-11).
+
+- `DeviceConfig::detentClick` (default false), key `detent_click` right after `buzzer` in
+  `toJson` (the writer's key order), parsed like `buzzer` (wrong type -> Invalid
+  `device.detent_click`; missing -> false, also in a device patch section). The defaults'
+  JSON gains `"detent_click":false`, so `test_config`'s exact-string round trip needs the
+  key (Tester). The key adds 21 B (`,"detent_click":false`) to the serialised config: a
+  stored `cfg` written by older firmware within 21 B of `kMaxConfigJsonBytes` (12288) could
+  exceed it when re-serialised; such a config loads as defaults for that boot (`CFG
+  defaults reason=invalid`) and is never overwritten automatically.
+- `hal::buzzer::beep(now, ms)`: if a beep runs and its end is later than `now + ms`
+  (signed compare), nothing changes; otherwise it starts or its end moves to `now + ms`.
+  `click(now)`: 5 ms, dropped without a beep request when less than 40 ms passed since the
+  previous click request (also when that one was not started). Test builds log every beep
+  request as `BUZ ms=<d> started=<0|1>` (`util/Log.h` included only under `#if`).
+- `main`: `click` if `device.buzzer && device.detent_click` and the batch passed the idle
+  gate and was routed to a Select move or a control rotation (Parent decision on Q8-11
+  "acted on"): no click on Status / NoControls, the boot or setup screen, or without a
+  display. One per pass (one `handleEncoder` per pass); 8.7 adds the reset cancel. The press
+  click (30 ms, `Pressed`) and the 150 ms error beep already went through `beep`, so both now
+  follow the no-shorten rule.
+- Web: checkbox "Click on every knob step (needs Buzzer click)", always sent in the device
+  section.
+- Build (8.4 + 8.5): normal RAM 55364 bytes (16.9 %), flash 1844209 bytes (28.4 %, +1484 B);
+  test build RAM 55396, flash 1845713.

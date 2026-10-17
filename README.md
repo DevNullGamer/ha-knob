@@ -106,11 +106,14 @@ dropped) and injects them like the real input, so device tests can be automated:
 |---|---|
 | `TIN rot <+n\|-n>` | n encoder detents (1..100) in this loop pass's batch (`encoder_reverse` and acceleration apply) |
 | `TIN short` / `TIN long` | a short / long button press (no `BTN down`, so no click) |
+| `TIN down` / `TIN up` / `TIN verylong` | the button's press (`BTN down`, with the click) / release / very long press events |
 | `TIN swipe left` / `TIN swipe right` | a swipe |
 
 Each accepted line is logged as `TIN <cmd>`, anything else after `TIN ` as `TIN bad <cmd>`.
-The normal build contains none of it (`xtensa-esp32s3-elf-strings firmware.elf | grep -w TIN`
-finds no `TIN` word).
+The test build also logs every buzzer request as `BUZ ms=<duration> started=<0|1>` (0: a
+running beep already lasts longer, so nothing changed). The normal build contains none of it
+(`xtensa-esp32s3-elf-strings firmware.elf | grep -c 'TIN '` and `grep -c 'BUZ ms='` are 0;
+`grep -w BUZ` would miss it, `strings` may print it with a stray leading character).
 
 ### Serial log lines
 
@@ -124,12 +127,15 @@ CFG unchanged                            accepted patch that changes nothing (no
 CFG secrets wifi_pw_set=<0|1> ha_token_set=<0|1> web_pw_set=<0|1> ap_pw_set=<0|1>[ token_set len=<n>]
 CFG factory reset ok=<0|1>
 ENC d=<+1|-1> count=<n>                  one line per detent, clockwise = +1 (-1 with encoder_reverse)
-BTN down                                 debounced press (the buzzer clicks if device.buzzer)
+BTN down                                 debounced press (the buzzer clicks if device.buzzer, unless the press only wakes the screen)
 BTN up + BTN short                       release before 600 ms
 BTN long                                 held 600 ms (fired while held; no "short" after it)
 BTN verylong                             held 10 s
 BTN up                                   release after long / verylong
 TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
+IDLE wake by=<encoder|swipe|button> consumed=1   an input woke the dimmed / dark screen and did nothing else
+IDLE wake by=<config|toast> consumed=0   a config save or a notice woke the screen
+DISP level=<on|dim|off> pct=<n>          screen level / brightness applied (on a change, and once at boot)
 UI page=<i>/<n> | no_controls | status   page shown after a swipe, the Select list, or a long press without controls
 UI select open | choose=<i> | status     Select list opened / control page i or Status chosen
 UI select cancel reason=<long|idle|config|setup>   Select list closed without a change
@@ -141,7 +147,8 @@ HA call id=<n> <domain>.<service> entity=<id> data=<json>   a service call sent
 HA call ok id=<n> ms=<rtt> | HA call failed id=<n> error=<code>: <message> | HA call timeout id=<n>
 HA calls dropped n=<k> reason=connection_lost   unanswered calls when the connection ended
 TIN <cmd> | TIN bad <cmd>                test build only (see Test input)
-HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes> loopmax=<ms> ent=<n>/<ids> cat=<state> stack=<bytes> psram_free=<bytes>   every 5 s
+BUZ ms=<n> started=<0|1>                 test build only (see Test input)
+HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes> loopmax=<ms> ent=<n>/<ids> cat=<state> stack=<bytes> psram_free=<bytes> disp=<on|dim|off>   every 5 s
 WIFI ap ssid=<HA-Knob-XXXX> ip=192.168.4.1   setup access point up
 WIFI ap off                              setup access point shut down
 WIFI sta connecting ssid=<ssid>
@@ -201,7 +208,7 @@ internal heap now / the lowest since boot, and `loopmax` the longest main-loop p
 without the loop's own 5 ms delay) since the previous `HB`. `ent` is the number of live
 entities / unique entity ids of the controls, `cat` the entity list fetch (`none`,
 `fetching`, `building`, `ready`, `failed`), `stack` the loop task stack never used since
-boot (bytes) and `psram_free` the free PSRAM. SSIDs are logged, passwords and tokens never.
+boot (bytes), `psram_free` the free PSRAM and `disp` the screen level. SSIDs are logged, passwords and tokens never.
 
 A log line is at most 318 characters plus the newline (longer lines are cut); the longest possible `HB`
 line is well below that.
@@ -280,8 +287,8 @@ Non-secret config, schema 1 (defaults shown; `controls` example):
 {
   "schema": 1,
   "device":  { "hostname": "ha-knob", "brightness": 80, "dim_after_s": 30, "dim_level": 15,
-               "off_after_s": 300, "buzzer": true, "encoder_reverse": false, "accel": true,
-               "send_interval_ms": 250 },
+               "off_after_s": 300, "buzzer": true, "detent_click": false,
+               "encoder_reverse": false, "accel": true, "send_interval_ms": 250 },
   "wifi":    { "ssid": "" },
   "ha":      { "url": "", "ca_pem": "", "tls_insecure": false },
   "controls": [
@@ -298,7 +305,8 @@ Validation (`lib/core/src/config/ConfigModel.cpp`, first failure is reported as
 | `device.hostname` | `[a-z0-9-]`, 1 to 32 characters |
 | `device.brightness` | 5 to 100 |
 | `device.dim_level` | 0 to 100 |
-| `device.dim_after_s`, `device.off_after_s` | 0 to 86400 (0 = never) |
+| `device.dim_after_s`, `device.off_after_s` | 0 to 86400 (0 = never); seconds without input until the screen dims / turns off |
+| `device.buzzer`, `device.detent_click` | booleans, default `true` / `false`: the click on press, the error beep / a 5 ms click on every knob step (only with `buzzer`) |
 | `device.send_interval_ms` | 100 to 2000 |
 | `wifi.ssid` | empty (not configured) or at most 32 bytes |
 | `wifi.password` | 8 to 63 printable ASCII characters (none stored = open network) |
@@ -573,6 +581,16 @@ swipes are ignored. A config change and the setup screen close it. Calls of a co
 just before keep being sent while the list is open. Screen precedence: boot, setup, Select
 list, pages.
 
+**Idle dim / off** (every screen): `device.dim_after_s` after the last input the screen dims
+to `device.dim_level` (never brighter than `device.brightness`; 0 = black with the panel
+on), `device.off_after_s` after it the panel turns off (brightness 0 and DISPOFF; the
+content stays). 0 = never; with `off_after_s <= dim_after_s` it goes straight to off.
+Changes are instant. While dimmed or off, the first turn, button press or swipe only wakes
+the screen and does nothing else; for the button the whole gesture up to its release is
+ignored (also a long press). A touch without a swipe does not wake (the cap press clicks
+the button anyway). The screen never dims while the button is held. Saving the config in the
+web UI and a notice (toast) wake it too; Home Assistant state changes do not.
+
 A control page shows the title (label, else HA's `friendly_name`, else the entity
 id), a 270° arc for the value, the value with its unit, a state line and the page
 indicator `i/N` (of the controls). Values: brightness in % (0 % when the light is off),
@@ -624,7 +642,9 @@ Presses: `toggle` = `<domain>.toggle` (climate: `turn_on` when off, else `turn_o
   "No value to change", "Busy, try again") are logged as `CTL notice=` and shown for 3 s
   as a toast (white on dark red, below the value, at most 3 lines; a new one replaces the
   old one), with a 150 ms error beep (at most one per 2 s) when `device.buzzer` is on (the button click on press
-  follows `device.buzzer` too).
+  follows `device.buzzer` too). With `device.detent_click` (and `buzzer`) every turn that
+  acts clicks 5 ms (one click per loop pass, at most one per 40 ms; not for a turn that only
+  wakes the screen). A beep never cuts a longer running one short.
 - Arc colour: amber; white while the shown value is a local one HA has not confirmed;
   grey when dimmed (also mid-turn); for a hue control always the colour of the shown hue.
 - Some lights restore their previous level when turned on from 0 %; accepted.
@@ -717,6 +737,7 @@ Licences:
 partitions.csv    flash layout (NVS 64 KB, OTA app0/app1, LittleFS, coredump)
 include/          board_pins.h (GPIO map), lv_conf.h (LVGL config), version.h
 src/main.cpp      setup()/loop() wiring only
+src/app/          Control (turns / presses -> HA calls, notices), Idle (screen dim / off, wake gate)
 src/hal/          Display, Touch, Encoder, Button, Buzzer, PsramAllocator (hardware glue)
 src/config/       ConfigStore (NVS persistence, mutex)
 src/util/         Log.h (non-blocking serial logging)

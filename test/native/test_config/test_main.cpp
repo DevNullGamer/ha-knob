@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <set>
 #include <string>
+#include <cstring>
 #include <vector>
 
 #include "config/ConfigModel.h"
@@ -177,7 +178,7 @@ static void test_round_trip_spec_example_string_equal() {
     const std::string x =
         "{\"schema\":1,"
         "\"device\":{\"hostname\":\"ha-knob\",\"brightness\":80,\"dim_after_s\":30,\"dim_level\":15,"
-        "\"off_after_s\":300,\"buzzer\":true,\"encoder_reverse\":false,\"accel\":true,"
+        "\"off_after_s\":300,\"buzzer\":true,\"detent_click\":false,\"encoder_reverse\":false,\"accel\":true,"
         "\"send_interval_ms\":250},"
         "\"wifi\":{\"ssid\":\"MyNetwork\"},"
         "\"ha\":{\"url\":\"http://192.168.1.10:8123\",\"ca_pem\":\"\",\"tls_insecure\":false},"
@@ -337,6 +338,7 @@ static void test_wrong_types_invalid_give_defaults() {
         {"{\"device\":{\"hostname\":123}}", "device.hostname", "not_a_string"},
         {"{\"device\":{\"buzzer\":\"true\"}}", "device.buzzer", "not_a_boolean"},
         {"{\"device\":{\"accel\":1}}", "device.accel", "not_a_boolean"},
+        {"{\"device\":{\"detent_click\":\"true\"}}", "device.detent_click", "not_a_boolean"},
         {"{\"device\":{\"dim_after_s\":-1}}", "device.dim_after_s", nullptr},
         {"{\"wifi\":{\"ssid\":5}}", "wifi.ssid", "not_a_string"},
         {"{\"ha\":{\"url\":false}}", "ha.url", "not_a_string"},
@@ -896,6 +898,22 @@ static void test_merge_device_section_replace_is_literal() {
     cfg::DeviceConfig expected;
     expected.brightness = 90;
     TEST_ASSERT_TRUE(r.config.device == expected);
+}
+
+static void test_detent_click_default_roundtrip_merge_redacted() {
+    TEST_ASSERT_FALSE(cfg::Config().device.detentClick);
+    TEST_ASSERT_FALSE(load("{\"device\":{\"hostname\":\"x\"}}").config.device.detentClick);
+    cfg::LoadResult r = load("{\"device\":{\"detent_click\":true}}");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(cfg::LoadStatus::Loaded), static_cast<int>(r.status));
+    TEST_ASSERT_TRUE(r.config.device.detentClick);
+    TEST_ASSERT_TRUE(load(cfg::toJson(r.config)).config.device.detentClick);
+    TEST_ASSERT_NOT_NULL(strstr(cfg::toJson(r.config).c_str(), "\"detent_click\":true"));
+    TEST_ASSERT_NOT_NULL(strstr(cfg::toRedactedJson(r.config, {false, false, false}).c_str(), "\"detent_click\":true"));
+    // device section replace is literal: key absent -> false
+    cfg::Config cur;
+    cur.device.detentClick = true;
+    TEST_ASSERT_FALSE(mergeOk(cur, "{\"device\":{\"brightness\":90}}").config.device.detentClick);
+    TEST_ASSERT_TRUE(mergeOk(cur, "{\"device\":{\"detent_click\":true}}").config.device.detentClick);
 }
 
 static void test_merge_controls_section_replaces_list() {
@@ -1506,6 +1524,7 @@ int main() {
     RUN_TEST(test_merge_failure_resets_secret_changes);
     // AP password
     RUN_TEST(test_ap_password);
+    RUN_TEST(test_detent_click_default_roundtrip_merge_redacted);
     // DomainActions
     RUN_TEST(test_domain_table_contents);
     RUN_TEST(test_domain_defaults_within_range_and_presses_unique);

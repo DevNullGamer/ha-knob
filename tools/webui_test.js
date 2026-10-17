@@ -663,6 +663,23 @@ test('19', 'Save -> Save; row error -> rejected input; row-level error on switch
   }
 });
 
+// ---- 8.5: device.detent_click checkbox ------------------------------------------------------------------------------
+test('8.5', 'detent_click checkbox loads from config and is always sent in the device section', async () => {
+  const p = await page((s) => { s.config.device.detent_click = true; });
+  await p.open(); await p.advance(1);
+  eq(p.$('dev-detent-click').checked, true, 'checkbox loaded true');
+  let body = null;
+  p.srv.onPostConfig = (req) => { body = req.body; return { status: 200, data: {} }; };
+  p.$('device-form').dispatchEvent(new p.w.Event('submit', { cancelable: true, bubbles: true })); await p.advance(1);
+  eq(body && body.device && body.device.detent_click, true, 'saved true');
+  p.$('dev-detent-click').checked = false;
+  p.$('device-form').dispatchEvent(new p.w.Event('submit', { cancelable: true, bubbles: true })); await p.advance(1);
+  eq(body && body.device && body.device.detent_click, false, 'saved false (key always present)');
+  const q = await page(() => {});
+  await q.open(); await q.advance(1);
+  eq(q.$('dev-detent-click').checked, false, 'absent in config -> unchecked');
+});
+
 // ---- run ----------------------------------------------------------------------------------------------------------------
 (async () => {
   const only = process.argv[2];

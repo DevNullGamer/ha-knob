@@ -123,6 +123,7 @@ ValidationResult parseDevice(JsonVariantConst v, DeviceConfig &out) {
     r.i32("dim_level", out.dimLevel);
     r.u32("off_after_s", out.offAfterS);
     r.boolean("buzzer", out.buzzer);
+    r.boolean("detent_click", out.detentClick);
     r.boolean("encoder_reverse", out.encoderReverse);
     r.boolean("accel", out.accel);
     r.u32("send_interval_ms", out.sendIntervalMs);
@@ -197,6 +198,7 @@ void writeConfig(JsonObject root, const Config &c) {
     device["dim_level"] = c.device.dimLevel;
     device["off_after_s"] = c.device.offAfterS;
     device["buzzer"] = c.device.buzzer;
+    device["detent_click"] = c.device.detentClick;
     device["encoder_reverse"] = c.device.encoderReverse;
     device["accel"] = c.device.accel;
     device["send_interval_ms"] = c.device.sendIntervalMs;
@@ -369,7 +371,7 @@ bool isDigit(char c) { return c >= '0' && c <= '9'; }
 bool DeviceConfig::operator==(const DeviceConfig &o) const {
     return hostname == o.hostname && brightness == o.brightness && dimAfterS == o.dimAfterS &&
            dimLevel == o.dimLevel && offAfterS == o.offAfterS && buzzer == o.buzzer &&
-           encoderReverse == o.encoderReverse && accel == o.accel &&
+           detentClick == o.detentClick && encoderReverse == o.encoderReverse && accel == o.accel &&
            sendIntervalMs == o.sendIntervalMs;
 }
 

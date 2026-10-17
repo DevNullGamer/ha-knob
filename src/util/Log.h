@@ -27,7 +27,8 @@ namespace util {
 namespace logdetail {
 
 // Line buffer incl. the terminating NUL: a line is at most 318 chars + '\n' (logPrintf cuts
-// a longer one to that). The buffer is on the caller's stack (320 B per logPrintf call). Worst-case HB line: DESIGN-NOTES "Step 8.3".
+// a longer one to that). The buffer is on the caller's stack (320 B per logPrintf call).
+// Worst-case HB line: DESIGN-NOTES "Step 8.3".
 constexpr size_t kMaxLine = 320;
 constexpr int kHeadroom = 64;
 

@@ -33,8 +33,9 @@ void press(size_t page, uint32_t nowMs);
 
 // Every loop pass after ha::loop(): drains ha::takeCallResults() into the engine, sends
 // due values, and shows the newest notice (log + ui::showToast + a 150 ms error beep if
-// device.buzzer, at most one per 2 s).
-void loop(uint32_t nowMs);
+// device.buzzer, at most one per 2 s). Returns true when a notice was shown (the toast
+// wakes the screen, plan-step8.md Q8-9).
+bool loop(uint32_t nowMs);
 
 // The control's local value while it holds (presenter::PresentContext::local).
 std::optional<core::control::LocalValue> local(size_t page, uint32_t nowMs);

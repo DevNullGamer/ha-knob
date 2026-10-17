@@ -255,6 +255,7 @@ async function loadConfig() {
   $('dev-off-after').value = d.off_after_s;
   $('dev-send-interval').value = d.send_interval_ms;
   $('dev-buzzer').checked = !!d.buzzer;
+  $('dev-detent-click').checked = !!d.detent_click;
   $('dev-reverse').checked = !!d.encoder_reverse;
   $('dev-accel').checked = !!d.accel;
 
@@ -1240,6 +1241,7 @@ async function saveDevice(event) {
     off_after_s: intValue('dev-off-after'),
     send_interval_ms: intValue('dev-send-interval'),
     buzzer: $('dev-buzzer').checked,
+    detent_click: $('dev-detent-click').checked,
     encoder_reverse: $('dev-reverse').checked,
     accel: $('dev-accel').checked,
   };
