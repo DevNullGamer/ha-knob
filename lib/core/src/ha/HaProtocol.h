@@ -86,7 +86,7 @@ struct Message {
     bool hasAdded = false;
     bool hasChanged = false;
     bool hasRemoved = false;
-    bool envelopeOnly = false;  // parsed with the envelope filter (length > kEnvelopeOnlyBytes)
+    bool envelopeOnly = false;  // parsed with the envelope filter (length > kEnvelopeOnlyBytes, or forced)
     // Error only: ArduinoJson's error ("IncompleteInput", "InvalidInput", "NoMemory",
     // "TooDeep", "EmptyInput"), "not_object" or "no_type". "" otherwise. Static string.
     const char *parseError = "";
@@ -98,8 +98,10 @@ struct Message {
 };
 
 // Parses and classifies one received text frame. Never throws; malformed input gives
-// type Error.
-Message parseMessage(const char *json, size_t length, ArduinoJson::Allocator *allocator = nullptr);
+// type Error. `envelopeOnly` forces the envelope filter for any length (the session uses
+// it to recognise a get_states result whose "id" is not first without keeping its result).
+Message parseMessage(const char *json, size_t length, ArduinoJson::Allocator *allocator = nullptr,
+                     bool envelopeOnly = false);
 
 }  // namespace ha
 }  // namespace core

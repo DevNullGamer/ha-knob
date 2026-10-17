@@ -270,6 +270,7 @@ void HaSession::onText(const char *data, size_t length, uint32_t nowMs) {
     }
     const bool fetching = statesState_ == StatesState::Fetching;
     const bool checkStale = staleStatesId_ != 0 && length > kStatesRetainMinBytes;
+    bool envelopeFirst = false;
     if (fetching || checkStale) {
         const EnvelopePeek peek = peekEnvelope(data, length);
         if (checkStale && peek.hasId && peek.id == staleStatesId_) {
@@ -284,8 +285,22 @@ void HaSession::onText(const char *data, size_t length, uint32_t nowMs) {
             retainStates(data, length, nowMs);
             return;
         }
+        // A small message whose "id" is not first may still be the result: it is classified
+        // envelope-only, so a states result is never parsed with its whole "result" kept
+        // (that is one long main-loop pass, ~0.4 ms per entity on the device).
+        envelopeFirst = fetching && !peek.hasId;
     }
-    const Message msg = parseMessage(data, length, allocator_);
+    Message msg = parseMessage(data, length, allocator_, envelopeFirst);
+    if (envelopeFirst) {
+        if (msg.type == MessageType::Result && msg.id == statesId_ &&
+            (state_ == State::Subscribing || state_ == State::Ready)) {
+            retainStates(data, length, nowMs);  // small result, "id" not first
+            return;
+        }
+        if (msg.type == MessageType::Event) {
+            msg = parseMessage(data, length, allocator_);  // events need their payload
+        }
+    }
     switch (state_) {
         case State::Connecting:
             if (msg.type == MessageType::AuthRequired && send(buildAuth(token_, allocator_), nowMs)) {
@@ -308,7 +323,7 @@ void HaSession::onText(const char *data, size_t length, uint32_t nowMs) {
         case State::Ready:
             if (msg.type == MessageType::Result) {
                 if (statesState_ == StatesState::Fetching && msg.id == statesId_) {
-                    retainStates(data, length, nowMs);  // small result, "id" not first
+                    retainStates(data, length, nowMs);  // fallback (normally recognised above)
                 } else {
                     handleResult(msg.id, msg.success, msg.message);
                 }
@@ -611,7 +626,8 @@ void HaSession::retainStates(const char *data, size_t length, uint32_t nowMs) {
 }
 
 void HaSession::stepStates(uint32_t nowMs) {
-    const EntityCatalogBuilder::Status status = builder_->step(options_.statesBytesPerTick);
+    const EntityCatalogBuilder::Status status =
+        builder_->step(options_.statesBytesPerTick, options_.statesElementsPerTick);
     if (status == EntityCatalogBuilder::Status::Running) {
         return;
     }

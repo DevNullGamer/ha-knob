@@ -436,6 +436,77 @@ static void test_parse_error_reasons() {
     TEST_ASSERT_EQUAL_STRING("", parse("{\"type\":\"other\"}").parseError);
 }
 
+// ---- Step 6.5c: forced envelope-only parse ----
+
+static ha::Message parseEnv(const std::string &s) {
+    return ha::parseMessage(s.c_str(), s.size(), nullptr, true);
+}
+
+static void test_forced_envelope_only_small_result() {
+    ha::Message m = parseEnv("{\"type\":\"result\",\"success\":true,\"result\":[{\"entity_id\":\"light.a\"}],\"id\":7}");
+    TEST_ASSERT_EQUAL(MT::Result, m.type);
+    TEST_ASSERT_TRUE(m.envelopeOnly);
+    TEST_ASSERT_EQUAL_UINT32(7, m.id);
+    TEST_ASSERT_TRUE(m.success);
+    TEST_ASSERT_TRUE(m.result().isNull());
+    // same message, not forced: payload kept
+    const std::string s = "{\"type\":\"result\",\"success\":true,\"result\":[{\"entity_id\":\"light.a\"}],\"id\":7}";
+    ha::Message n = ha::parseMessage(s.c_str(), s.size(), nullptr, false);
+    TEST_ASSERT_FALSE(n.envelopeOnly);
+    TEST_ASSERT_EQUAL_UINT32(1, (uint32_t)n.result().size());
+}
+
+static void test_forced_envelope_only_small_event_has_no_payload() {
+    ha::Message m = parseEnv("{\"type\":\"event\",\"event\":{\"a\":{\"light.x\":{\"s\":\"on\"}}},\"id\":3}");
+    TEST_ASSERT_EQUAL(MT::Event, m.type);
+    TEST_ASSERT_EQUAL_UINT32(3, m.id);
+    TEST_ASSERT_TRUE(m.envelopeOnly);
+    TEST_ASSERT_FALSE(m.hasAdded);
+    TEST_ASSERT_FALSE(m.hasChanged);
+    TEST_ASSERT_FALSE(m.hasRemoved);
+    TEST_ASSERT_TRUE(m.event().isNull());
+}
+
+static void test_forced_envelope_only_keeps_failed_result_error() {
+    ha::Message m = parseEnv("{\"type\":\"result\",\"error\":{\"code\":\"not_found\",\"message\":\"Nope\",\"x\":[1,2]},"
+                            "\"success\":false,\"id\":9}");
+    TEST_ASSERT_EQUAL(MT::Result, m.type);
+    TEST_ASSERT_TRUE(m.envelopeOnly);
+    TEST_ASSERT_EQUAL_UINT32(9, m.id);
+    TEST_ASSERT_FALSE(m.success);
+    TEST_ASSERT_EQUAL_STRING("Nope", m.message.c_str());
+    TEST_ASSERT_EQUAL_STRING("not_found", m.errorCode.c_str());
+}
+
+static void test_forced_envelope_only_pong_and_others() {
+    ha::Message p = parseEnv("{\"type\":\"pong\",\"id\":5}");
+    TEST_ASSERT_EQUAL(MT::Pong, p.type);
+    TEST_ASSERT_EQUAL_UINT32(5, p.id);
+    TEST_ASSERT_TRUE(p.envelopeOnly);
+    ha::Message a = parseEnv("{\"ha_version\":\"2026.1\",\"type\":\"auth_ok\"}");
+    TEST_ASSERT_EQUAL(MT::AuthOk, a.type);
+    TEST_ASSERT_EQUAL_STRING("2026.1", a.haVersion.c_str());
+    ha::Message e = parseEnv("{broken");
+    TEST_ASSERT_EQUAL(MT::Error, e.type);
+}
+
+static void test_forced_envelope_only_boundary_independent() {
+    // at kEnvelopeOnlyBytes: false = full parse, true = envelope only; over: both envelope only
+    const std::string at = bigResult(ha::kEnvelopeOnlyBytes);
+    ha::Message full = ha::parseMessage(at.c_str(), at.size(), nullptr, false);
+    TEST_ASSERT_FALSE(full.envelopeOnly);
+    TEST_ASSERT_TRUE(full.result().is<JsonArrayConst>());
+    ha::Message forced = ha::parseMessage(at.c_str(), at.size(), nullptr, true);
+    TEST_ASSERT_TRUE(forced.envelopeOnly);
+    TEST_ASSERT_TRUE(forced.result().isNull());
+    TEST_ASSERT_EQUAL_UINT32(42, forced.id);
+    const std::string over = bigResult(ha::kEnvelopeOnlyBytes + 1);
+    TEST_ASSERT_TRUE(ha::parseMessage(over.c_str(), over.size(), nullptr, false).envelopeOnly);
+    TEST_ASSERT_TRUE(ha::parseMessage(over.c_str(), over.size(), nullptr, true).envelopeOnly);
+    // default argument = false
+    TEST_ASSERT_FALSE(parse("{\"id\":1,\"type\":\"pong\"}").envelopeOnly);
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_event_filter_keeps_needed_drops_unneeded);
@@ -473,5 +544,10 @@ int main(int, char **) {
     RUN_TEST(test_big_event_is_envelope_only_without_payload_flags);
     RUN_TEST(test_big_invalid_json_is_error);
     RUN_TEST(test_parse_error_reasons);
+    RUN_TEST(test_forced_envelope_only_small_result);
+    RUN_TEST(test_forced_envelope_only_small_event_has_no_payload);
+    RUN_TEST(test_forced_envelope_only_keeps_failed_result_error);
+    RUN_TEST(test_forced_envelope_only_pong_and_others);
+    RUN_TEST(test_forced_envelope_only_boundary_independent);
     return UNITY_END();
 }

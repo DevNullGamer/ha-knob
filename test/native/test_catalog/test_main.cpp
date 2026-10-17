@@ -966,6 +966,104 @@ static void test_one_megabyte_synthetic() {
     TEST_ASSERT_TRUE(steps > 10);
 }
 
+// ---------------- Step 6.5c: element limit per step ----------------
+
+// Mixed list: supported, unsupported, skipped, non-object and bad elements.
+static std::string mixedElements(int n) {
+    std::vector<std::string> items;
+    for (int i = 0; i < n; ++i) {
+        switch (i % 6) {
+            case 0: items.push_back(lightEntity("light.m" + std::to_string(i), "L" + std::to_string(i))); break;
+            case 1: items.push_back("{\"entity_id\":\"sensor.m" + std::to_string(i) + "\",\"state\":\"1\"}"); break;  // unsupported
+            case 2: items.push_back("5"); break;                                  // non-object
+            case 3: items.push_back("{\"state\":\"on\"}"); break;                // no entity_id: skipped
+            case 4: items.push_back("{\"entity_id\":\"switch.m" + std::to_string(i) + "\",\"state\":\"on\"}"); break;
+            default: items.push_back("{\"entity_id\":\"light.bad\",\"state\":}"); break;  // invalid JSON
+        }
+    }
+    return envelope(joinArray(items));
+}
+
+static void test_element_limit_all_combinations_identical() {
+    const std::string text = mixedElements(60);
+    const std::string reference = buildJson(text);
+    const size_t elementLimits[] = {0, 1, 2, 3, 7, 16, 59, 60, 61, 1000, (size_t)-1};
+    const size_t budgets[] = {0, 1, 50, 300, 4096, (size_t)-1};
+    for (size_t maxEl : elementLimits) {
+        for (size_t budget : budgets) {
+            ha::EntityCatalogBuilder b(text.data(), text.size(), kId);
+            const size_t limit = maxEl == 0 ? 1 : maxEl;
+            size_t steps = 0;
+            uint32_t prevTotal = 0;
+            size_t prevBytes = 0;
+            Status st = Status::Running;
+            while (st == Status::Running) {
+                st = b.step(budget, maxEl);
+                ++steps;
+                TEST_ASSERT_TRUE_MESSAGE(b.total() - prevTotal <= limit, "step exceeded maxElements");
+                if (st == Status::Running) {  // the final (Done) step may only finish
+                    TEST_ASSERT_TRUE_MESSAGE(b.bytesProcessed() > prevBytes, "step made no progress");
+                }
+                prevTotal = b.total();
+                prevBytes = b.bytesProcessed();
+                TEST_ASSERT_TRUE(steps < 100000);
+            }
+            TEST_ASSERT_EQUAL(Status::Done, st);
+            TEST_ASSERT_EQUAL_UINT32(60, b.total());
+            TEST_ASSERT_EQUAL_UINT32(30, b.skipped());  // cases 2, 3, 5 of every 6 (unsupported are not skipped)
+            TEST_ASSERT_EQUAL_UINT32(20, (uint32_t)b.entries().size());  // cases 0 and 4
+            TEST_ASSERT_TRUE_MESSAGE(reference == toJson(b.entries()), "output depends on the element limit");
+        }
+    }
+}
+
+static void test_element_limit_exact_step_count() {
+    std::vector<std::string> items;
+    for (int i = 0; i < 20; ++i) items.push_back(lightEntity("light.e" + std::to_string(i)));
+    const std::string text = envelope(joinArray(items));
+    // byte budget unlimited: only the element limit ends a Running step
+    ha::EntityCatalogBuilder b(text.data(), text.size(), kId);
+    uint32_t k = 0;
+    while (b.step((size_t)-1, 4) == Status::Running) {
+        ++k;
+        TEST_ASSERT_EQUAL_UINT32(4 * k, b.total());
+    }
+    TEST_ASSERT_EQUAL_UINT32(5, k);  // 20 elements: 5 Running steps of 4 (the limit is hit before "]"), the 6th is Done
+    TEST_ASSERT_EQUAL_UINT32(20, b.total());
+    TEST_ASSERT_EQUAL_UINT32(20, (uint32_t)b.entries().size());
+    // maxElements 0 behaves like 1
+    ha::EntityCatalogBuilder z(text.data(), text.size(), kId);
+    TEST_ASSERT_EQUAL(Status::Running, z.step((size_t)-1, 0));
+    TEST_ASSERT_EQUAL_UINT32(1, z.total());
+    // default argument = unlimited elements
+    ha::EntityCatalogBuilder d(text.data(), text.size(), kId);
+    TEST_ASSERT_EQUAL(Status::Done, d.step((size_t)-1));
+}
+
+static void test_element_limit_counts_skipped_and_unsupported() {
+    // 3 unsupported + 3 skipped/non-object elements, then one light; limit 2
+    const std::string text = envelope(joinArray({
+        "{\"entity_id\":\"sensor.a\",\"state\":\"1\"}",
+        "{\"entity_id\":\"sensor.b\",\"state\":\"1\"}",
+        "7",
+        "\"s\"",
+        "{\"entity_id\":5}",
+        "{\"entity_id\":\"sensor.c\",\"state\":\"1\"}",
+        lightEntity("light.z"),
+    }));
+    ha::EntityCatalogBuilder b(text.data(), text.size(), kId);
+    TEST_ASSERT_EQUAL(Status::Running, b.step((size_t)-1, 2));
+    TEST_ASSERT_EQUAL_UINT32(2, b.total());
+    TEST_ASSERT_EQUAL(Status::Running, b.step((size_t)-1, 2));
+    TEST_ASSERT_EQUAL_UINT32(4, b.total());
+    TEST_ASSERT_EQUAL(Status::Running, b.step((size_t)-1, 2));
+    TEST_ASSERT_EQUAL_UINT32(6, b.total());
+    TEST_ASSERT_EQUAL(Status::Done, b.step((size_t)-1, 2));
+    TEST_ASSERT_EQUAL_UINT32(7, b.total());
+    TEST_ASSERT_EQUAL_UINT32(3, b.skipped());  // 7, "s", {"entity_id":5}
+    TEST_ASSERT_EQUAL_UINT32(1, (uint32_t)b.entries().size());
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_scan_whitespace);
@@ -1015,5 +1113,8 @@ int main(int, char **) {
     RUN_TEST(test_writer_escape_heavy_names_and_long_steps);
     RUN_TEST(test_writer_capacity_no_doubling);
     RUN_TEST(test_one_megabyte_synthetic);
+    RUN_TEST(test_element_limit_all_combinations_identical);
+    RUN_TEST(test_element_limit_exact_step_count);
+    RUN_TEST(test_element_limit_counts_skipped_and_unsupported);
     return UNITY_END();
 }

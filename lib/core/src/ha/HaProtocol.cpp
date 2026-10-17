@@ -122,11 +122,11 @@ const char *messageTypeName(MessageType type) {
 
 Message::Message(ArduinoJson::Allocator *allocator) : doc(makeDoc(allocator)) {}
 
-Message parseMessage(const char *json, size_t length, ArduinoJson::Allocator *allocator) {
+Message parseMessage(const char *json, size_t length, ArduinoJson::Allocator *allocator, bool envelopeOnly) {
     Message msg(allocator);
     DeserializationError err = DeserializationError::InvalidInput;
     if (json != nullptr && length > 0) {
-        msg.envelopeOnly = length > kEnvelopeOnlyBytes;
+        msg.envelopeOnly = envelopeOnly || length > kEnvelopeOnlyBytes;
         const JsonDocument filter = makeMessageFilter(!msg.envelopeOnly, allocator);
         err = deserializeJson(msg.doc, json, length, DeserializationOption::Filter(filter),
                               DeserializationOption::NestingLimit(kMaxNesting));

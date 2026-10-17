@@ -58,8 +58,9 @@
 //
 // Entity list (plan-step6.md §3.1): requestStates() (Ready only) sends get_states. Its
 // result is recognised with peekEnvelope() and taken over from the transport without copy
-// or parse (Transport::retainText); tick() then builds the catalog in slices of
-// Options::statesBytesPerTick bytes. States: None -> Fetching -> Building -> Ready (the
+// or parse (Transport::retainText; a small one whose "id" is not first after an
+// envelope-only parse); tick() then builds the catalog in slices of
+// Options::statesBytesPerTick bytes / statesElementsPerTick elements. States: None -> Fetching -> Building -> Ready (the
 // catalog is handed over once by takeCatalog()) or Failed (statesError()). A build in
 // progress finishes even if the connection drops; a URL / token / TLS change aborts it and
 // drops the catalog (possibly another HA instance).
@@ -173,8 +174,12 @@ const char *statesStateName(StatesState state);
 
 struct SessionOptions {
     // Bytes of the retained get_states text the catalog builder works through per tick()
-    // (whole elements, at least one per tick). Device: 32 KB, about 5 ms.
+    // (whole elements, at least one per tick), and at most this many elements per tick.
+    // A tick ends at whichever limit comes first. Device (Step 6.5c): an element costs
+    // ~0.4 ms of parsing plus ~0.17 ms per KB, so 16 elements / 32 KB stay at ~7-12 ms
+    // (32 KB of ~300-byte entities alone was ~100 parses, ~45 ms).
     size_t statesBytesPerTick = 32u * 1024u;
+    size_t statesElementsPerTick = 16;
 };
 
 class HaSession {

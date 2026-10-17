@@ -133,10 +133,13 @@ public:
                          ArduinoJson::Allocator *allocator = nullptr);
 
     // Processes whole units (one top-level member, or one "result" element with its
-    // separator) until at least maxBytes (minimum 1) of text were consumed in this call,
-    // so a step goes at most one element beyond its budget. The result is identical for
-    // every budget. After Done / Failed it returns that status and does nothing.
-    Status step(size_t maxBytes);
+    // separator) until at least maxBytes (minimum 1) of text were consumed in this call or
+    // maxElements (minimum 1) "result" elements were processed, so a step goes at most one
+    // element beyond its byte budget. The element limit bounds the per-element parse cost
+    // of small entities (a 32 KB step of ~300-byte elements is ~100 parses). The result is
+    // identical for every budget. After Done / Failed it returns that status and does
+    // nothing.
+    Status step(size_t maxBytes, size_t maxElements = SIZE_MAX);
 
     Status status() const { return status_; }
 

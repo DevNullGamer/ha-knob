@@ -2346,6 +2346,214 @@ static void test_logs_never_contain_token() {
     TEST_ASSERT_TRUE(s.statesError().find(token) == std::string::npos);
 }
 
+// ---- Step 6.5c: element limit per tick, envelope-first parse while Fetching -----------------
+
+// Same events / pong with "id" not first (HA sends it first; other servers need not).
+static std::string eventAIdLast(uint32_t id, const std::string &entity, const std::string &state) {
+    return "{\"type\":\"event\",\"event\":{\"a\":{\"" + entity + "\":{\"s\":\"" + state +
+           "\",\"a\":{}}}},\"id\":" + std::to_string(id) + "}";
+}
+
+static std::string eventCIdLast(uint32_t id, const std::string &entity, const std::string &state) {
+    return "{\"event\":{\"c\":{\"" + entity + "\":{\"+\":{\"s\":\"" + state + "\"}}}},\"type\":\"event\",\"id\":" +
+           std::to_string(id) + "}";
+}
+
+static int buildTicks(ha::HaSession &s, uint32_t now) {
+    int ticks = 0;
+    while (s.statesState() == ha::StatesState::Building && ticks < 100000) {
+        s.tick(now);
+        ++ticks;
+    }
+    return ticks;
+}
+
+static void test_default_element_limit_is_16_per_tick() {
+    ha::SessionOptions def;
+    TEST_ASSERT_EQUAL_UINT32(16, (uint32_t)def.statesElementsPerTick);
+    struct Case { int n; int ticks; };
+    const Case cases[] = {{40, 3}, {17, 2}, {100, 7}, {5, 1}};
+    for (const Case &c : cases) {
+        FakeTransport t;
+        ha::HaSession s(t);  // default options
+        toReady(s, t, 0);
+        s.requestStates(100);
+        const std::string r = statesResult(1, c.n);
+        TEST_ASSERT_TRUE(r.size() < 32u * 1024u);  // the byte budget is not what limits the tick
+        feed(s, r, 200);
+        TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+        TEST_ASSERT_EQUAL_INT(c.ticks, buildTicks(s, 300));
+        expectCatalog(s, c.n);
+        balanced(t);
+    }
+    // a larger limit builds the same catalog in fewer ticks
+    ha::SessionOptions opt;
+    opt.statesElementsPerTick = 1000;
+    FakeTransport t;
+    ha::HaSession s(t, nullptr, opt);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    feed(s, statesResult(1, 40), 200);
+    TEST_ASSERT_EQUAL_INT(1, buildTicks(s, 300));
+    expectCatalog(s, 40);
+    // one element per tick: n + 1 ticks (the last one reaches the end), still complete
+    ha::SessionOptions one;
+    one.statesElementsPerTick = 1;
+    FakeTransport t2;
+    ha::HaSession s2(t2, nullptr, one);
+    toReady(s2, t2, 0);
+    s2.requestStates(100);
+    feed(s2, statesResult(1, 6), 200);
+    TEST_ASSERT_EQUAL_INT(7, buildTicks(s2, 300));
+    expectCatalog(s2, 6);
+}
+
+static void test_fetching_own_event_id_not_first_applied() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    s.requestStates(10);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    feed(s, eventAIdLast(1, "light.a", "on"), 11);
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    TEST_ASSERT_EQUAL_STRING("on", s.entities().find("light.a")->state.c_str());
+    feed(s, eventCIdLast(1, "light.a", "off"), 12);
+    TEST_ASSERT_EQUAL_STRING("off", s.entities().find("light.a")->state.c_str());
+    // another subscription's event with id last is still ignored
+    feed(s, eventAIdLast(99, "light.z", "on"), 13);
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+}
+
+static void test_fetching_small_result_id_last_retained_and_built() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    const std::string r = statesResult(1, 5, 0, true);  // "result" first, "id" last
+    TEST_ASSERT_TRUE(r.size() < 64u * 1024u);
+    TEST_ASSERT_TRUE(r.find("\"id\":1,") != std::string::npos);
+    feed(s, r, 200);
+    TEST_ASSERT_EQUAL(1, t.retainCalls);
+    TEST_ASSERT_EQUAL(1, t.allocs);
+    TEST_ASSERT_EQUAL(ha::StatesState::Building, s.statesState());
+    TEST_ASSERT_TRUE(hasLog(logs, "states retained len=" + std::to_string(r.size())));
+    uint32_t now = 201;
+    finishBuild(s, now);
+    expectCatalog(s, 5);
+    balanced(t);
+    // while a re-subscribe is pending too
+    FakeTransport t2;
+    ha::HaSession s2(t2);
+    toReady(s2, t2, 0, {"light.a"});
+    reconfigure(s2, {"light.b"}, 11);  // unsubscribe id 2, subscribe id 3
+    s2.requestStates(12);              // get_states id 4
+    feed(s2, statesResult(4, 3, 0, true), 13);
+    TEST_ASSERT_EQUAL(1, t2.retainCalls);
+    TEST_ASSERT_EQUAL(ha::StatesState::Building, s2.statesState());
+    uint32_t now2 = 14;
+    finishBuild(s2, now2);
+    expectCatalog(s2, 3);
+    balanced(t2);
+}
+
+static void test_fetching_other_or_stale_result_id_last_not_retained() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0);
+    s.requestStates(100);
+    feed(s, statesResult(999, 3, 0, true), 150);  // not our id, id last
+    feed(s, statesResult(0, 3, 0, true), 151);
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL_STRING("", s.statesError().c_str());
+    // the real result still works afterwards
+    feed(s, statesResult(1, 4, 0, true), 200);
+    TEST_ASSERT_EQUAL(1, t.retainCalls);
+    uint32_t now = 201;
+    finishBuild(s, now);
+    expectCatalog(s, 4);
+    balanced(t);
+}
+
+static void test_fetching_failing_subscribe_result_id_last() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    reconfigure(s, {"light.b"}, 10);  // unsubscribe id 2, subscribe id 3
+    feed(s, resultOk(2), 11);
+    s.requestStates(12);              // get_states id 4
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    TEST_ASSERT_EQUAL_STRING(getStatesMsg(4).c_str(), t.sent.back().c_str());
+    feed(s, "{\"type\":\"result\",\"success\":false,\"error\":{\"code\":\"x\",\"message\":\"nope\"},\"id\":3}", 13);
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+    TEST_ASSERT_EQUAL_STRING("subscribe_failed: nope", s.lastError().c_str());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());  // fetch unaffected
+    // a failing get_states result with id last fails the fetch (retained, builder reports it)
+    feed(s, "{\"type\":\"result\",\"success\":false,\"error\":{\"code\":\"x\",\"message\":\"denied\"},\"id\":4}", 14);
+    uint32_t now = 15;
+    finishBuild(s, now);
+    TEST_ASSERT_EQUAL(ha::StatesState::Failed, s.statesState());
+    TEST_ASSERT_EQUAL_STRING("states_failed: denied", s.statesError().c_str());
+    balanced(t);
+}
+
+static void test_fetching_pong_id_not_first_clears_ping() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    toReady(s, t, 0, {"light.a"});
+    s.tick(30000);  // ping
+    const uint32_t pingId = lastId(t);
+    TEST_ASSERT_TRUE(t.sent.back().find("ping") != std::string::npos);
+    s.requestStates(30001);
+    feed(s, "{\"type\":\"pong\",\"id\":" + std::to_string(pingId) + "}", 30002);
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    s.onRxProgress(1, 40000);
+    s.tick(40001);
+    TEST_ASSERT_EQUAL(S::Ready, s.state());  // no pong_timeout: the pong was recognised
+}
+
+static void test_fetching_malformed_small_message_changes_nothing() {
+    FakeTransport t;
+    ha::HaSession s(t);
+    Logs logs;
+    attachLogs(s, logs);
+    toReady(s, t, 0, {"light.a"});
+    feed(s, eventA(1, {{"light.a", "on"}}), 1);
+    s.requestStates(100);
+    logs.lines.clear();
+    const uint32_t cc = s.changeCount();
+    const uint32_t sc = s.statesChangeCount();
+    const size_t sent = t.sent.size();
+    feed(s, "{\"type\":\"result\",\"success\":tr", 101);
+    feed(s, "garbage", 102);
+    feed(s, "{\"result\":[1,2,3", 103);
+    feed(s, "[1,2]", 104);
+    feed(s, "{\"type\":\"event\",\"event\":{\"a\":", 105);  // truncated event, no id
+    TEST_ASSERT_EQUAL(0, t.retainCalls);
+    TEST_ASSERT_EQUAL(ha::StatesState::Fetching, s.statesState());
+    TEST_ASSERT_EQUAL(S::Ready, s.state());
+    TEST_ASSERT_EQUAL_UINT32(cc, s.changeCount());
+    TEST_ASSERT_EQUAL_UINT32(sc, s.statesChangeCount());
+    TEST_ASSERT_EQUAL_STRING("", s.statesError().c_str());
+    TEST_ASSERT_EQUAL((int)sent, (int)t.sent.size());
+    TEST_ASSERT_EQUAL(0, (int)logs.lines.size());
+    TEST_ASSERT_EQUAL(1, (int)s.entities().size());
+    // and the fetch still completes
+    feed(s, statesResult(2, 2), 200);  // subscribe id 1, get_states id 2
+    uint32_t now = 201;
+    finishBuild(s, now);
+    expectCatalog(s, 2);
+    balanced(t);
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_state_names);
@@ -2449,5 +2657,12 @@ int main(int, char **) {
     RUN_TEST(test_rx_progress_ignored_cases);
     RUN_TEST(test_rx_progress_during_connect_phase_does_not_extend_timeouts);
     RUN_TEST(test_logs_never_contain_token);
+    RUN_TEST(test_default_element_limit_is_16_per_tick);
+    RUN_TEST(test_fetching_own_event_id_not_first_applied);
+    RUN_TEST(test_fetching_small_result_id_last_retained_and_built);
+    RUN_TEST(test_fetching_other_or_stale_result_id_last_not_retained);
+    RUN_TEST(test_fetching_failing_subscribe_result_id_last);
+    RUN_TEST(test_fetching_pong_id_not_first_clears_ping);
+    RUN_TEST(test_fetching_malformed_small_message_changes_nothing);
     return UNITY_END();
 }

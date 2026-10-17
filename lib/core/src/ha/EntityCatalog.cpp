@@ -248,14 +248,16 @@ EntityCatalogBuilder::EntityCatalogBuilder(const char *data, size_t len, uint32_
     addAttributeFilter(filter_["attributes"].to<JsonObject>());
 }
 
-EntityCatalogBuilder::Status EntityCatalogBuilder::step(size_t maxBytes) {
+EntityCatalogBuilder::Status EntityCatalogBuilder::step(size_t maxBytes, size_t maxElements) {
     if (status_ != Status::Running) {
         return status_;
     }
     const size_t budget = maxBytes == 0 ? 1 : maxBytes;
+    const size_t elementBudget = maxElements == 0 ? 1 : maxElements;
     const size_t start = pos_;
+    const uint32_t startElements = catalog_.total_;  // counts every element unit
     while (unit()) {
-        if (pos_ - start >= budget) {
+        if (pos_ - start >= budget || catalog_.total_ - startElements >= elementBudget) {
             break;
         }
     }
