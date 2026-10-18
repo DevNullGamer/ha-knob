@@ -1,0 +1,284 @@
+# HA Knob CI (chg003): every push and PR builds the firmware, the LittleFS image and the
+# test build, runs the native unit tests and packages a release preview. A v* tag (equal to
+# "v" + FW_VERSION, checked by tools/release_layout.py) also publishes a GitHub Release and
+# deploys the web flasher to GitHub Pages.
+#
+# Rules: every action pinned to a full commit SHA; permissions per job (none at the top);
+# no secrets, no pull_request_target, no ${{ }} inside run: (values come via env:);
+# no cache on tag builds, so a release never uses a restored cache.
+
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.12"
+  PLATFORMIO_VERSION: "6.2.0"
+  # ESP Web Tools is fetched from the npm registry and checked against this integrity
+  # (npm "dist.integrity"); a mismatch fails the build. README "Library versions".
+  EWT_VERSION: "10.4.0"
+  EWT_INTEGRITY: "sha512-3pwkeFFm5Fj7UQo8SJNYK5RXrtNCpq6X9QoI6bMT4GBZWgrJqjn0YvM9ihG74BtMoSFYXfmDtkehuxe50PTMPQ=="
+  FLASHER_URL: "https://devnullgamer.github.io/ha-knob/"
+
+jobs:
+  native:
+    name: native tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Cache PlatformIO
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        # zizmor: ignore[cache-poisoning] skipped on tag refs (if:), so releases never use a cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.platformio/platforms
+            ~/.platformio/packages
+            ~/.platformio/.cache
+            .pio/libdeps
+          key: pio-${{ runner.os }}-${{ github.job }}-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO
+        run: python -m pip install --disable-pip-version-check "platformio==${PLATFORMIO_VERSION}"
+      - name: Native unit tests
+        run: pio test -e native
+
+  firmware:
+    name: firmware + release layout
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Cache PlatformIO
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        # zizmor: ignore[cache-poisoning] skipped on tag refs (if:), so releases never use a cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.platformio/platforms
+            ~/.platformio/packages
+            ~/.platformio/.cache
+            .pio/libdeps
+          key: pio-${{ runner.os }}-${{ github.job }}-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO
+        run: python -m pip install --disable-pip-version-check "platformio==${PLATFORMIO_VERSION}"
+      - name: Build firmware
+        run: pio run -e t-encoder-pro
+      - name: Build LittleFS image
+        run: pio run -e t-encoder-pro -t buildfs
+      - name: Project metadata
+        run: pio project metadata -e t-encoder-pro --json-output --json-output-path "$RUNNER_TEMP/metadata.json"
+      - name: Check the release build has no test hooks
+        # CLAUDE.md "Idle and reset": TIN / BUZ strings exist only in t-encoder-pro-test.
+        # The HB format string is the positive control (proves the strings dump works).
+        run: |
+          strings_bin="$HOME/.platformio/packages/toolchain-xtensa-esp32s3/bin/xtensa-esp32s3-elf-strings"
+          "$strings_bin" .pio/build/t-encoder-pro/firmware.elf > "$RUNNER_TEMP/strings.txt"
+          count() { grep -c -F -- "$1" "$RUNNER_TEMP/strings.txt" || true; }
+          hb=$(count 'HB up=')
+          tin=$(count 'TIN ')
+          buz=$(count 'BUZ ms=')
+          echo "HB up=: $hb, TIN: $tin, BUZ ms=: $buz"
+          if [ "$hb" -lt 1 ]; then echo "::error::strings dump has no HB line"; exit 1; fi
+          if [ "$tin" -ne 0 ] || [ "$buz" -ne 0 ]; then
+            echo "::error::release firmware contains test input hooks"; exit 1
+          fi
+      - name: Fetch and verify ESP Web Tools
+        run: |
+          dir="$RUNNER_TEMP/ewt"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/ewt.tgz" \
+            "https://registry.npmjs.org/esp-web-tools/-/esp-web-tools-${EWT_VERSION}.tgz"
+          actual="sha512-$(openssl dgst -sha512 -binary "$dir/ewt.tgz" | base64 -w0)"
+          if [ "$actual" != "$EWT_INTEGRITY" ]; then
+            echo "::error::esp-web-tools ${EWT_VERSION} integrity mismatch: got $actual"; exit 1
+          fi
+          tar -xzf "$dir/ewt.tgz" -C "$dir" --no-same-owner package/LICENSE package/dist/web
+          test -f "$dir/package/dist/web/install-button.js"
+      - name: Package release layout
+        # --tag only on tag refs: release_layout.py fails unless the tag is "v" + FW_VERSION.
+        run: |
+          tag_args=()
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag_args=(--tag "$GITHUB_REF_NAME"); fi
+          python -I tools/release_layout.py --env t-encoder-pro \
+            --metadata "$RUNNER_TEMP/metadata.json" \
+            --build-dir .pio/build/t-encoder-pro --version-header include/version.h \
+            "${tag_args[@]}" --out dist --site-template web-flasher \
+            --ewt-dir "$RUNNER_TEMP/ewt/package/dist/web" \
+            --esptool "$(command -v python)" "$HOME/.platformio/packages/tool-esptoolpy/esptool.py"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dist
+          path: |
+            dist/
+            !dist/site/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: site
+          path: dist/site/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: firmware-elf
+          path: .pio/build/t-encoder-pro/firmware.elf
+          if-no-files-found: error
+          retention-days: 90
+
+  firmware-test:
+    name: test firmware build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Cache PlatformIO
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        # zizmor: ignore[cache-poisoning] skipped on tag refs (if:), so releases never use a cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.platformio/platforms
+            ~/.platformio/packages
+            ~/.platformio/.cache
+            .pio/libdeps
+          key: pio-${{ runner.os }}-${{ github.job }}-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO
+        run: python -m pip install --disable-pip-version-check "platformio==${PLATFORMIO_VERSION}"
+      - name: Build test firmware
+        run: pio run -e t-encoder-pro-test
+
+  release:
+    name: GitHub Release
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [native, firmware, firmware-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # gh release create (release + assets)
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS.txt
+      - name: Zip licences and write release notes
+        # The firmware job checked tag == "v" + FW_VERSION, so the version is the tag minus "v".
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          zip_name="ha-knob-${ver}-licenses.zip"
+          (cd dist && zip -qrX "$zip_name" licenses)
+          {
+            echo "HA Knob ${ver} firmware for the LilyGo T-Encoder Pro."
+            echo
+            echo "## Install"
+            echo
+            echo "- Web flasher (Chrome or Edge on a desktop): ${FLASHER_URL}"
+            echo "- esptool, one merged image (ends before the NVS partition, so the settings are kept):"
+            echo
+            echo '  ```'
+            echo "  esptool.py --chip esp32s3 write_flash 0x0 ha-knob-${ver}-merged.bin"
+            echo '  ```'
+            echo
+            echo "- esptool, the separate parts (in the folder with the .bin files):"
+            echo
+            echo '  ```'
+            echo "  esptool.py --chip esp32s3 write_flash @flash_args.txt"
+            echo '  ```'
+            echo
+            echo "Licences: LICENSE, THIRD_PARTY_NOTICES.md and ${zip_name} (the full licence texts)."
+            echo
+            echo "## SHA-256"
+            echo
+            echo "Check with \`sha256sum -c SHA256SUMS.txt\`."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            (cd dist && sha256sum "$zip_name")
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          echo "ZIP_NAME=$zip_name" >> "$GITHUB_ENV"
+          echo "VER=$ver" >> "$GITHUB_ENV"
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=(
+            "dist/ha-knob-${VER}-bootloader.bin"
+            "dist/ha-knob-${VER}-partitions.bin"
+            "dist/ha-knob-${VER}-boot_app0.bin"
+            "dist/ha-knob-${VER}-firmware.bin"
+            "dist/ha-knob-${VER}-littlefs.bin"
+            "dist/ha-knob-${VER}-merged.bin"
+            dist/flash_args.txt
+            dist/SHA256SUMS.txt
+            dist/LICENSE
+            dist/THIRD_PARTY_NOTICES.md
+            "dist/${ZIP_NAME}"
+          )
+          for f in "${files[@]}"; do test -f "$f" || { echo "::error::missing asset $f"; exit 1; }; done
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "HA Knob ${VER}" --notes-file "$RUNNER_TEMP/notes.md" "${files[@]}"
+
+  pages:
+    name: GitHub Pages flasher
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      pages: write # deploy-pages
+      id-token: write # deploy-pages OIDC token
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: site
+          path: site
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site/
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
