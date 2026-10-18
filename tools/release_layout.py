@@ -45,8 +45,16 @@ PRODUCT = "HA Knob"
 FILE_PREFIX = "ha-knob"
 SECTOR = 0x1000  # flash erase sector; every part starts on one and is rounded up to it
 
-VERSION_RE = re.compile(r'#define\s+FW_VERSION\s+"([^"]+)"')
-VERSION_CHARS_RE = re.compile(r"^[0-9A-Za-z.+-]+$")
+# At a line start, so a commented-out define is ignored.
+VERSION_RE = re.compile(r'^[ \t]*#[ \t]*define[ \t]+FW_VERSION[ \t]+"([^"]+)"', re.M)
+VERSION_CHARS_RE = re.compile(r"[0-9A-Za-z.+-]+")  # used with fullmatch
+
+# ESP32-S3 boot: the ROM loads the bootloader from 0x0; its image header (magic 0xE9) holds
+# the flash size in the high nibble of byte 3.
+BOOTLOADER_OFFSET = 0x0
+IMAGE_MAGIC = 0xE9
+FLASH_SIZES = {0: 1 << 20, 1: 2 << 20, 2: 4 << 20, 3: 8 << 20, 4: 16 << 20, 5: 32 << 20,
+               6: 64 << 20, 7: 128 << 20}
 
 # Partition table (ESP-IDF esp_partition binary format).
 PART_ENTRY_SIZE = 32
@@ -55,14 +63,17 @@ PART_MD5_MAGIC = 0xEBEB
 PART_END_MAGIC = 0xFFFF
 PART_TABLE_MAX = 0xC00  # ESP-IDF partition table size
 
-# (type, subtype) of the partitions the layout depends on.
+# (type, subtype, label or None) of the partitions the layout depends on; the first match
+# counts. NVS is found by its label, as ESP-IDF and Preferences do.
 PART_KEYS = {
-    "otadata": (0x01, 0x00),
-    "app0": (0x00, 0x10),
-    "spiffs": (0x01, 0x82),
-    "nvs": (0x01, 0x02),
-    "coredump": (0x01, 0x03),
+    "otadata": (0x01, 0x00, None),
+    "app0": (0x00, 0x10, None),
+    "spiffs": (0x01, 0x82, None),
+    "nvs": (0x01, 0x02, "nvs"),
+    "coredump": (0x01, 0x03, None),
 }
+# Data subtypes never written outside an erase: every partition of these is protected.
+KEEP_SUBTYPES = {0x02: "nvs", 0x03: "coredump"}
 
 # Order of the parts in the outputs; the first three come from the metadata flash_images.
 PART_NAMES = ("bootloader", "partitions", "boot_app0", "firmware", "littlefs")
@@ -111,7 +122,7 @@ def read_version(header):
     if not match:
         fail("no #define FW_VERSION \"...\" in %s" % header)
     version = match.group(1)
-    if not VERSION_CHARS_RE.match(version):
+    if not VERSION_CHARS_RE.fullmatch(version):
         fail("FW_VERSION %r has characters outside [0-9A-Za-z.+-]" % version)
     return version
 
@@ -143,28 +154,56 @@ def read_metadata(path, env):
 
 
 def read_partitions(path):
-    """Parses partitions.bin; returns {key: (offset, size)} for PART_KEYS."""
+    """Parses partitions.bin and verifies its MD5 entry. Returns ({key: (offset, size)} for
+    PART_KEYS, [(label, type, subtype, offset, size)] of every entry)."""
     try:
         blob = path.read_bytes()
     except OSError as e:
         fail("cannot read %s: %s" % (path, e))
+    if len(blob) > PART_TABLE_MAX:
+        fail("%s is %s bytes, more than the %s-byte partition table"
+             % (path, hexs(len(blob)), hexs(PART_TABLE_MAX)))
     found = {}
-    for pos in range(0, min(len(blob), PART_TABLE_MAX), PART_ENTRY_SIZE):
+    entries = []
+    md5_seen = False
+    for pos in range(0, len(blob), PART_ENTRY_SIZE):
         entry = blob[pos:pos + PART_ENTRY_SIZE]
         if len(entry) < PART_ENTRY_SIZE:
             break
         magic, ptype, subtype, offset, size = struct.unpack_from("<HBBII", entry)
-        if magic in (PART_MD5_MAGIC, PART_END_MAGIC):
+        if magic == PART_MD5_MAGIC:
+            if entry[16:32] != hashlib.md5(blob[:pos]).digest():
+                fail("%s: partition table MD5 does not match" % path)
+            md5_seen = True
+            break
+        if magic == PART_END_MAGIC:
             break
         if magic != PART_MAGIC:
             fail("%s: bad partition entry magic 0x%04X at byte %d" % (path, magic, pos))
-        for key, ident in PART_KEYS.items():
-            if (ptype, subtype) == ident and key not in found:
+        label = entry[12:28].split(b"\0", 1)[0].decode("ascii", "replace")
+        entries.append((label, ptype, subtype, offset, size))
+        for key, (want_type, want_sub, want_label) in PART_KEYS.items():
+            if (key not in found and (ptype, subtype) == (want_type, want_sub)
+                    and want_label in (None, label)):
                 found[key] = (offset, size)
+    if not md5_seen:
+        fail("%s has no MD5 entry" % path)
     missing = [key for key in PART_KEYS if key not in found]
     if missing:
         fail("%s has no %s partition" % (path, ", ".join(missing)))
-    return found
+    return found, entries
+
+
+def read_flash_size(bootloader):
+    """Flash size from the bootloader image header."""
+    with bootloader.open("rb") as f:
+        header = f.read(4)
+    if len(header) < 4 or header[0] != IMAGE_MAGIC:
+        fail("%s is not an ESP image (no 0x%02X magic)" % (bootloader, IMAGE_MAGIC))
+    code = header[3] >> 4
+    if code not in FLASH_SIZES:
+        fail("%s: unknown flash size code %d in the image header" % (bootloader, code))
+    return FLASH_SIZES[code]
 
 
 def collect_parts(flash_images, app_offset, partitions, build_dir):
@@ -188,17 +227,30 @@ def collect_parts(flash_images, app_offset, partitions, build_dir):
     return parts
 
 
-def check_layout(parts, partitions, built_table):
-    """Asserts the layout is consistent and leaves NVS and the coredump untouched."""
+def overlap(start_a, end_a, start_b, end_b):
+    return start_a < end_b and start_b < end_a
+
+
+def check_layout(parts, partitions, entries, built_table):
+    """Asserts the layout is consistent and that neither a part nor the merged image
+    (0x0 to the end of the last part, gaps included) touches an NVS or coredump partition."""
     sizes = {name: path.stat().st_size for name, (_, path) in parts.items()}
     off = {name: offset for name, (offset, _) in parts.items()}
 
     if parts["partitions"][1].read_bytes() != built_table.read_bytes():
         fail("metadata partitions image %s differs from the built %s"
              % (parts["partitions"][1], built_table))
+    if off["bootloader"] != BOOTLOADER_OFFSET:
+        fail("bootloader offset %s != %s" % (hexs(off["bootloader"]), hexs(BOOTLOADER_OFFSET)))
     otadata, app0 = partitions["otadata"], partitions["app0"]
     if off["boot_app0"] != otadata[0]:
         fail("boot_app0 offset %s != otadata offset %s" % (hexs(off["boot_app0"]), hexs(otadata[0])))
+    if sizes["boot_app0"] > otadata[1]:
+        fail("boot_app0.bin (%s bytes) does not fit otadata (%s bytes)"
+             % (hexs(sizes["boot_app0"]), hexs(otadata[1])))
+    if sizes["partitions"] > PART_TABLE_MAX:
+        fail("partitions image (%s bytes) is larger than %s"
+             % (hexs(sizes["partitions"]), hexs(PART_TABLE_MAX)))
     if off["firmware"] != app0[0]:
         fail("application_offset %s != app0 offset %s" % (hexs(off["firmware"]), hexs(app0[0])))
     bootloader_end = off["bootloader"] + sizes["bootloader"]
@@ -212,24 +264,39 @@ def check_layout(parts, partitions, built_table):
         fail("littlefs.bin size %s != spiffs partition size %s"
              % (hexs(sizes["littlefs"]), hexs(partitions["spiffs"][1])))
 
+    flash_size = read_flash_size(parts["bootloader"][1])
+    for label, _, _, start, size in entries:
+        if start + size > flash_size:
+            fail("partition %s %s-%s ends beyond the %s-byte flash"
+                 % (label, hexs(start), hexs(start + size), hexs(flash_size)))
+
     ranges = []
     for name in PART_NAMES:
         if off[name] % SECTOR:
             fail("%s offset %s is not %s-aligned" % (name, hexs(off[name]), hexs(SECTOR)))
         if sizes[name] == 0:
             fail("%s image is empty" % name)
-        ranges.append((name, off[name], off[name] + round_up(sizes[name])))
+        end = off[name] + round_up(sizes[name])
+        if end > flash_size:
+            fail("%s %s-%s ends beyond the %s-byte flash"
+                 % (name, hexs(off[name]), hexs(end), hexs(flash_size)))
+        ranges.append((name, off[name], end))
     for i, (name_a, start_a, end_a) in enumerate(ranges):
         for name_b, start_b, end_b in ranges[i + 1:]:
-            if start_a < end_b and start_b < end_a:
+            if overlap(start_a, end_a, start_b, end_b):
                 fail("%s %s-%s overlaps %s %s-%s" % (name_a, hexs(start_a), hexs(end_a),
                                                      name_b, hexs(start_b), hexs(end_b)))
-        for keep in ("nvs", "coredump"):
-            start_k, size_k = partitions[keep]
-            if start_a < start_k + size_k and start_k < end_a:
-                fail("%s %s-%s overlaps the %s partition %s-%s"
-                     % (name_a, hexs(start_a), hexs(end_a), keep, hexs(start_k),
-                        hexs(start_k + size_k)))
+
+    # The merged image is written as one block from 0x0, so the gaps between parts count.
+    ranges.append(("merged image", 0, max(end for _, _, end in ranges)))
+    for label, ptype, subtype, start_k, size_k in entries:
+        if ptype != 0x01 or subtype not in KEEP_SUBTYPES:
+            continue
+        for name, start, end in ranges:
+            if overlap(start, end, start_k, start_k + size_k):
+                fail("%s %s-%s overlaps the %s partition %s %s-%s"
+                     % (name, hexs(start), hexs(end), KEEP_SUBTYPES[subtype], label,
+                        hexs(start_k), hexs(start_k + size_k)))
     return sizes
 
 
@@ -355,9 +422,9 @@ def run(args):
     check_tag(args.tag, version)
     flash_images, app_offset = read_metadata(Path(args.metadata), args.env)
     built_table = build_dir / "partitions.bin"
-    partitions = read_partitions(built_table)
+    partitions, entries = read_partitions(built_table)
     parts = collect_parts(flash_images, app_offset, partitions, build_dir)
-    sizes = check_layout(parts, partitions, built_table)
+    sizes = check_layout(parts, partitions, entries, built_table)
 
     ewt_dir = Path(args.ewt_dir)
     ewt_license = Path(args.ewt_license) if args.ewt_license else ewt_dir.parent.parent / "LICENSE"
@@ -382,7 +449,9 @@ def run(args):
     build_site(out / "site", Path(args.site_template), version, ewt_dir, ewt_license,
                repo_root, part_files)
 
-    sums = [p for p in sorted(out.iterdir()) if p.is_file() and p.name != "SHA256SUMS.txt"]
+    # Sorted by name (code points): the same file on Windows and Linux.
+    sums = sorted((p for p in out.iterdir() if p.is_file() and p.name != "SHA256SUMS.txt"),
+                  key=lambda p: p.name)
     write_text(out / "SHA256SUMS.txt", "".join("%s  %s\n" % (sha256(p), p.name) for p in sums))
 
     print("HA Knob %s (%s)" % (version, args.tag or "no tag"))
@@ -412,7 +481,8 @@ def main():
     parser.add_argument("--ewt-license",
                         help="ESP Web Tools LICENSE (default: <ewt-dir>/../../LICENSE)")
     parser.add_argument("--esptool", required=True, nargs="+", metavar="ARG",
-                        help="esptool command as separate arguments, e.g. <python> <esptool.py>")
+                        help="esptool command as separate arguments, e.g. <python> <esptool.py>;"
+                             " no argument may start with '-' (so not 'python -m esptool')")
     parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parent.parent),
                         help="where LICENSE, THIRD_PARTY_NOTICES.md and licenses/ are")
     args = parser.parse_args()
