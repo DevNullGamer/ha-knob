@@ -154,7 +154,7 @@ Components with code in `firmware.elf` that need their own attribution:
 |---|---|---|---|
 | lwIP (`liblwip.a`; espressif/esp-lwip a45be9e) | Copyright (c) 2001, 2002 Swedish Institute of Computer Science | BSD-3-Clause | `lwIP-COPYING.txt` |
 | FreeRTOS kernel V10.4.3, ESP-IDF port (`libfreertos.a`) | Copyright (C) 2020 Amazon.com, Inc. or its affiliates | MIT | `FreeRTOS-LICENSE.md` (the copyright line is from `tasks.c`) |
-| Mbed TLS 2.28.7 (`libmbedcrypto.a`, `libmbedtls_2.a`, `libmbedx509.a`; espressif/mbedtls 2b8e772) | Copyright (C) 2006-2018 ARM Limited | Apache-2.0 (dual Apache-2.0 / GPL-2.0-or-later; used under Apache-2.0) | `Apache-2.0.txt` |
+| Mbed TLS 2.28.7 (`libmbedcrypto.a`, `libmbedtls_2.a`, `libmbedx509.a`; espressif/mbedtls 2b8e772) | Copyright (C) 2006-2018 ARM Limited; Copyright The Mbed TLS Contributors | Apache-2.0 (dual Apache-2.0 / GPL-2.0-or-later; used under Apache-2.0) | `Apache-2.0.txt` |
 | wpa_supplicant, ESP-IDF fork (`libwpa_supplicant.a`) | Copyright (c) 2002-2019, Jouni Malinen and contributors | BSD-3-Clause (advertising clause removed) | `wpa_supplicant-README.txt` |
 | fast PBKDF2 inside wpa_supplicant (`fastpbkdf2.c`) | Copyright (c) 2015 Joseph Birr-Pixton | CC0 1.0 (public domain dedication) | none required |
 | TLSF heap allocator (`libheap.a`, `heap_tlsf.c`) | Copyright (c) 2006-2016, Matthew Conte | BSD-3-Clause | `heap_tlsf-notice.txt` |
@@ -164,7 +164,7 @@ Components with code in `firmware.elf` that need their own attribution:
 | esp_littlefs (`libesp_littlefs.a`; joltwallet/esp_littlefs 41873c2) | Copyright 2020 Brian Pugh | MIT | `esp_littlefs-LICENSE.txt` |
 | littlefs (`lfs.c` in `libesp_littlefs.a`; littlefs-project/littlefs f53a0cc) | Copyright (c) 2022, The littlefs authors; Copyright (c) 2017, Arm Limited | BSD-3-Clause | `littlefs-LICENSE.md` |
 | Wi-Fi, PHY and coexistence binary libraries (`libnet80211.a`, `libpp.a`, `libcore.a` from the SDK, `libsmartconfig.a`, `libcoexist.a`, `libphy.a`; espressif/esp32-wifi-lib f2aae4d, espressif/esp-phy-lib dcfdccf) | Espressif Systems | Apache-2.0 | `Apache-2.0.txt` |
-| FreeBSD net80211 code inside `libnet80211.a` (per ESP-IDF COPYRIGHT.rst) | Copyright (c) 2004-2008 Sam Leffler, Errno Consulting | BSD | `ESP-IDF-COPYRIGHT.rst` (no separate text is published with the binary) |
+| FreeBSD net80211 code inside `libnet80211.a` (per ESP-IDF COPYRIGHT.rst) | Copyright (c) 2004-2008 Sam Leffler, Errno Consulting | BSD-2-Clause | `ESP-IDF-COPYRIGHT.rst`; standard FreeBSD `sys/net80211` BSD-2-Clause wording in `FreeBSD-net80211-BSD-2-Clause.txt` (not a verbatim copy of a source header: none is published with the binary) |
 | esp_diagnostics (`libesp_diagnostics.a`, from espressif/esp-insights) | Espressif Systems | Apache-2.0 | `Apache-2.0.txt` |
 | mDNS, NVS, spi_flash, esp_netif, Wi-Fi provisioning / protocomm glue and the other Espressif components | Espressif Systems | Apache-2.0 | `Apache-2.0.txt` |
 
@@ -357,6 +357,7 @@ Every file in `licenses/` is a verbatim copy (line endings normalised to LF by g
 | `LGPL-3.0.txt` | AsyncTCP 3.5.0 `LICENSE` (`.pio/libdeps/t-encoder-pro/AsyncTCP/LICENSE`) |
 | `MPL-2.0.txt` | https://www.mozilla.org/media/MPL/2.0/index.txt |
 | `ESP-IDF-COPYRIGHT.rst` | ESP-IDF v4.4.7 `docs/en/COPYRIGHT.rst` |
+| `FreeBSD-net80211-BSD-2-Clause.txt` | Standard FreeBSD `sys/net80211` BSD-2-Clause wording with the Sam Leffler copyright line (not copied from a published file) |
 | `newlib-COPYING.NEWLIB.txt` | toolchain-xtensa-esp32s3 8.4.0+2021r2-patch5 `share/licenses/newlib/COPYING.NEWLIB` |
 | `LVGL-LICENCE.txt` | LVGL 9.2.2 `LICENCE.txt` (`.pio/libdeps`) |
 | `SensorLib-LICENSE.txt` | SensorLib 0.3.4 `LICENSE` (`.pio/libdeps`) |

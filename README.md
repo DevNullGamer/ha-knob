@@ -1,5 +1,7 @@
 # HA Knob
 
+[![build](https://github.com/DevNullGamer/ha-knob/actions/workflows/build.yml/badge.svg)](https://github.com/DevNullGamer/ha-knob/actions/workflows/build.yml)
+
 Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB OPI PSRAM,
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
@@ -13,7 +15,8 @@ screens (see "Screens") and changes them with the knob and the button (see "Cont
 
 ## First-time setup
 
-1. Flash the firmware and the web UI files once (`-t upload` and `-t uploadfs`, see below).
+1. Flash the firmware and the web UI files once: with the web flasher or a release image
+   (see "Flashing"), or from source with `-t upload` and `-t uploadfs` (see "Commands").
 2. The device starts its setup access point. The screen shows its name (`HA-Knob-XXXX`) and
    its WPA2 password (random, generated on first boot).
 3. Join that network with a phone or laptop. The captive portal opens the setup page; if it
@@ -39,6 +42,55 @@ screens (see "Screens") and changes them with the knob and the button (see "Cont
 
 If the device cannot join the configured network within 30 s, it opens the setup access
 point again (and keeps retrying the network every 60 s).
+
+## Flashing
+
+A release (GitHub Releases, tag `vX.Y.Z`) contains the firmware, the setup web UI (LittleFS)
+and the boot files; nothing needs to be built.
+
+**Web flasher** (recommended): https://devnullgamer.github.io/ha-knob/ with Chrome or Edge on
+a desktop computer (Web Serial; other browsers cannot flash). It always installs the latest
+release. Plug in the T-Encoder Pro, click **Install**, pick the port and follow the dialog.
+
+- **Without "Erase device"** the settings survive: the Wi-Fi network, the Home Assistant
+  address and token, the controls and the setup access point password are kept. Nothing at
+  or after 0xFE0000 (the NVS partition) is written.
+- **With "Erase device"** the whole chip is erased first: all settings are gone, and the
+  device starts its setup access point with a new password (see "First-time setup").
+- If the port does not show up or the install cannot start, enter download mode: hold the
+  knob (IO0) while plugging in USB or pressing reset, then try again (see "Factory reset"
+  for why IO0 is special).
+- The flasher does not set up Wi-Fi (Improv is off); use the setup access point as above.
+
+**esptool** (needs esptool 4.x; the release page lists these commands too). The merged image
+ends before the NVS partition, so it keeps the settings too:
+
+```
+esptool.py --chip esp32s3 write_flash 0x0 ha-knob-X.Y.Z-merged.bin
+esptool.py --chip esp32s3 write_flash @flash_args.txt     # separate parts, run next to the .bin files
+sha256sum -c SHA256SUMS.txt                               # check the downloads first
+```
+
+**PlatformIO** from source is unchanged (`pio run -t upload`, `-t uploadfs`; see "Commands").
+
+## Releases
+
+1. Bump `FW_VERSION` in `include/version.h` and commit.
+2. Tag exactly `v` + `FW_VERSION` (`git tag v0.8.1 && git push origin v0.8.1`). CI refuses a
+   tag that differs, before building.
+3. CI (`.github/workflows/build.yml`) builds, packages, creates the GitHub Release (5 separate
+   parts, the merged image, `flash_args.txt`, `SHA256SUMS.txt`, `LICENSE`, the notices and a
+   licences zip) and deploys the flasher to GitHub Pages.
+
+Every push and pull request builds both firmware envs, runs `pio test -e native` and
+packages a preview (artifacts `release-dist`, `site`, `firmware-elf`, no release). Locally:
+`python -I tools/release_layout.py --help` (flash offsets are derived from the build, never
+hard-coded; it asserts the part layout and writes `dist/`).
+
+Notes: the flasher serves the **latest** release, so a pre-release tag such as `v1.0.0-rc1`
+also becomes the flasher version. Supply chain: only `platformio==6.2.0` is pinned (its pip
+dependencies are not hash-pinned) and tag builds download all packages fresh, with no cache.
+`--esptool` takes separate arguments and none may start with `-` (so not `python -m esptool`).
 
 ## Prerequisites
 
@@ -736,6 +788,9 @@ All versions are pinned exactly in `platformio.ini`.
 | `ESP32Async/AsyncTCP` | 3.5.0 | TCP layer of the web server; maintained fork, core 2.x compatible |
 | `ESP32Async/ESPAsyncWebServer` | 3.12.1 | Web server (middleware, static files); maintained fork, core 2.x compatible. PlatformIO prints "Ignored `Hash` dependency": that dependency is for ESP8266 only |
 | `throwtheswitch/Unity` | 2.6.1 | Host test framework (native env); pinned to the version PlatformIO resolved |
+| PlatformIO Core (CI only) | 6.2.0 | `pip install platformio==6.2.0` in CI, same as local |
+| ESP Web Tools (flasher site, CI only) | 10.4.0 | Apache-2.0; vendored at build time from the npm tarball, `sha512-3pwkeFFm5Fj7UQo8SJNYK5RXrtNCpq6X9QoI6bMT4GBZWgrJqjn0YvM9ihG74BtMoSFYXfmDtkehuxe50PTMPQ==` checked in CI (mismatch fails), not committed |
+| GitHub Actions | pinned to full commit SHAs | each `uses:` has a `# vX.Y.Z` comment; Dependabot (monthly) proposes updates |
 | `lv_font_conv` (npx, font generation only) | 1.5.3 | See Fonts; source fonts from LVGL 9.2.2's `scripts/built_in_font/` |
 
 Build flags: the `t-encoder-pro` env (and the test env that extends it) replaces the core's
@@ -803,7 +858,9 @@ lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the h
   src/util/       MathUtil, Sha1, Base64, JsonScan, StdAllocator (STL allocator on an injected allocator)
   src/ws/         WsHandshake, WsFrame, WsReceiver (WebSocket client codec, RFC 6455)
 test/native/      host unit tests (Unity), run with `pio test -e native`
-tools/            serial_check.py, gen_fonts.sh
+tools/            serial_check.py, gen_fonts.sh, release_layout.py (release packaging)
+.github/          workflows/build.yml (CI, release, Pages), dependabot.yml
+web-flasher/      flasher page template (index.html, flasher.css); ESP Web Tools is added by CI
 docs/             DESIGN-NOTES.md (per-step design decisions and measurements)
 licenses/         third-party licence texts (verbatim; see THIRD_PARTY_NOTICES.md), esp-web-tools/ for the flasher
 ```

@@ -205,6 +205,12 @@ Reasons and measurements: `docs/DESIGN-NOTES.md` (one section per step); read th
 - `-DHAKNOB_TEST_INPUT` (env `t-encoder-pro-test`) only: `TIN` input, `BUZ` log, all in
   `#if`; `xtensa-esp32s3-elf-strings firmware.elf | grep -c 'TIN '` / `'BUZ ms='`: 0 normally.
 
+## CI and releases (chg003; DESIGN-NOTES "chg003")
+
+- Local packaging: `python -I tools/release_layout.py --help`. Flash offsets come only from it (PlatformIO metadata + built `partitions.bin`); never hard-code them.
+- A release tag must equal `v` + `FW_VERSION`. ESP Web Tools is vendored at build time (sha512 pin in `build.yml`), never committed.
+- Workflows: actions pinned by SHA, permissions per job, no secrets, no `${{ }}` in `run:`; keep actionlint + zizmor clean.
+
 ## Secrets
 
 - Never commit Wi-Fi passwords, Home Assistant tokens or any credential; they live only in

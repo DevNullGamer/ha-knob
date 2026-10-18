@@ -91,6 +91,14 @@ jobs:
           key: pio-${{ runner.os }}-${{ github.job }}-${{ hashFiles('platformio.ini') }}
       - name: Install PlatformIO
         run: python -m pip install --disable-pip-version-check "platformio==${PLATFORMIO_VERSION}"
+      - name: Check tag matches FW_VERSION
+        # Fails a wrong tag in seconds, before the build (release_layout.py checks it again).
+        if: ${{ github.ref_type == 'tag' }}
+        run: |
+          ver=$(sed -n 's/^#define FW_VERSION "\([^"]*\)".*/\1/p' include/version.h)
+          if [ -z "$ver" ] || [ "$GITHUB_REF_NAME" != "v${ver}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match FW_VERSION '${ver}'"; exit 1
+          fi
       - name: Build firmware
         run: pio run -e t-encoder-pro
       - name: Build LittleFS image
@@ -108,6 +116,10 @@ jobs:
           tin=$(count 'TIN ')
           buz=$(count 'BUZ ms=')
           echo "HB up=: $hb, TIN: $tin, BUZ ms=: $buz"
+          # Fail closed: a non-numeric count (grep error) must not pass the -ne tests below.
+          for n in "$hb" "$tin" "$buz"; do
+            case "$n" in ''|*[!0-9]*) echo "::error::strings count is not numeric"; exit 1 ;; esac
+          done
           if [ "$hb" -lt 1 ]; then echo "::error::strings dump has no HB line"; exit 1; fi
           if [ "$tin" -ne 0 ] || [ "$buz" -ne 0 ]; then
             echo "::error::release firmware contains test input hooks"; exit 1
@@ -205,6 +217,8 @@ jobs:
           ver="${GITHUB_REF_NAME#v}"
           zip_name="ha-knob-${ver}-licenses.zip"
           (cd dist && zip -qrX "$zip_name" licenses)
+          # The zip is built here, so its hash joins SHA256SUMS.txt (one file verifies every asset).
+          (cd dist && sha256sum "$zip_name" >> SHA256SUMS.txt && sha256sum -c SHA256SUMS.txt)
           {
             echo "HA Knob ${ver} firmware for the LilyGo T-Encoder Pro."
             echo
@@ -231,7 +245,6 @@ jobs:
             echo
             echo '```'
             cat dist/SHA256SUMS.txt
-            (cd dist && sha256sum "$zip_name")
             echo '```'
           } > "$RUNNER_TEMP/notes.md"
           echo "ZIP_NAME=$zip_name" >> "$GITHUB_ENV"

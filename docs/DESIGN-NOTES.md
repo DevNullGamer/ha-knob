@@ -1304,3 +1304,55 @@ change log (`plan-step8.md`, 8.4-8.8) and merged into the user test list by the 
 `tools/webui_test.js` static check (8.9): the forbidden action literal `'percentage'` is
 allowed in exactly one place, the `<input step="any">` attribute of a fan's percentage step
 in `data/app.js`; it is not an action table (that still comes from `/api/meta/actions`).
+
+## chg003: CI, releases, web flasher (2026-10-18)
+
+Files: `.github/workflows/build.yml`, `.github/dependabot.yml`, `tools/release_layout.py`,
+`web-flasher/{index.html,flasher.css}`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, `licenses/`.
+Repo renamed to `DevNullGamer/ha-knob` (Pages `https://devnullgamer.github.io/ha-knob/`).
+
+- **Offsets are never hard-coded.** `release_layout.py` takes `flash_images` and
+  `application_offset` from `pio project metadata --json-output`, parses the built
+  `partitions.bin` (otadata, app0, spiffs, nvs, coredump) and asserts: boot_app0 == otadata,
+  application_offset == app0, firmware fits app0, littlefs size == spiffs size, parts pairwise
+  disjoint (4 KB rounded), none overlaps NVS or coredump. A partition-table change therefore
+  fails CI instead of producing a wrong manifest.
+- **Settings survive.** The parts and the merged image end at 0xFE0000 (littlefs 0xC70000 +
+  0x370000), the NVS start; the merged image is built without `--fill-flash-size`, so
+  writing it at 0x0 leaves NVS, secrets and `ap_pw` alone. NVS is written only when the
+  user ticks "Erase device". boot_app0 resets otadata to app0 (no OTA, so harmless).
+  The flasher uses the 5 separate parts (about 5.6 MB, not 16.6 MB; app1 is never written).
+- **ESP Web Tools is vendored, not loaded from a CDN.** Same origin keeps `script-src 'self'`
+  and `connect-src 'self'`; SRI could not cover its dynamically imported chunks. CI downloads
+  the npm tarball of 10.4.0, verifies its sha512 (`dist.integrity`, mismatch fails the job) and
+  copies `dist/web` into the site; it is not committed. Its flash settings are "keep"; it
+  detects the USB-Serial/JTAG reset (303A:1001); `new_install_improv_wait_time: 0` turns Improv
+  off.
+- **CSP.** The page starts strict (`style-src 'self'`). ESP Web Tools' `ewt-console` writes a
+  `<style>` through `innerHTML` and its dialogs use style attributes: 3 violations were measured
+  under the strict policy. Hashes would need `'unsafe-hashes'` for the attributes and are
+  brittle across versions, so `style-src` is `'self' 'unsafe-inline'`. Everything else stays
+  `'none'`/`'self'`, `script-src` has no inline allowance, `base-uri 'none'`, referrer
+  `no-referrer`. The page has no own JS.
+- **Workflow rules.** Every action is pinned to a full SHA with a version comment (dereferenced
+  annotated tags); `permissions: {}` at the top and per job (`contents: write` only in
+  `release`, `pages`/`id-token: write` only in `pages`); `persist-credentials: false`; no `${{ }}`
+  inside `run:`; no secrets, no `pull_request_target`; concurrency per ref (tags never
+  cancelled). Caches (`~/.platformio`, `.pio/libdeps`) are skipped on tag refs, so the
+  zizmor `cache-poisoning` findings are suppressed inline (`# zizmor: ignore[cache-poisoning]`):
+  a release build never restores a cache. actionlint and zizmor are clean.
+- **Release checks.** An early step "Check tag matches FW_VERSION" fails a wrong tag before
+  the build; `release_layout.py --tag` checks it again. The `TIN ` / `BUZ ms=` string counts
+  in `firmware.elf` must be 0 and are validated as numbers first (fail closed; `HB up=` is the
+  positive control). The release job appends the hash of the licences zip (built in that job)
+  to `SHA256SUMS.txt` and re-verifies, so one `sha256sum -c SHA256SUMS.txt` covers every
+  asset (chosen over a second sums file: one file, one command, no `--ignore-missing`).
+  Only the five parts, the merged image, `flash_args.txt`, the sums, `LICENSE`, the notices
+  and the zip are attached; `firmware.elf` (42 MB) is a 90-day workflow artifact only.
+- **Linux CI.** The first runner run needed no portability fixes: native tests 858/858 on
+  Ubuntu 24.04 / GCC 13 (-Werror, LP64, case-sensitive includes).
+- **Known limits.** Only `platformio==6.2.0` is pinned (pip dependencies are not
+  hash-pinned); tag builds fetch packages fresh. A pre-release tag becomes the flasher version.
+  Repo settings for publication (Step 7): fork PR workflows need approval, read-only default
+  token, `github-pages` environment allows `v*` tags; check that Dependabot accepts `cooldown`.
+- CLAUDE.md is about 15 KB: trim history into this file at the next opportunity.
