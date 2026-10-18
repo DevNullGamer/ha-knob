@@ -1280,3 +1280,27 @@ Spec: `plan-step8.md` §3.6, §4 Step 8.8 (Q8-16).
   high-water, gate >= 2048): 4040 at boot, 3056 after mock `--deep-result 17 18 19 20`
   (nesting 20 = `kMaxNesting`); 3056 after POST `/api/config` bodies of 15 000 / 15 900 /
   16 300 B (all 200, no reboot, loopmax <= 64 ms for the one pass that applied the config).
+
+## Step 8 (summary, 0.8.0) (2026-10-18)
+
+Delivered in 0.8.0 (sections 8.1-8.8 above): pure `IdleTimer` / `ResetConfirm` (core);
+idle dim / off with a wake gate in `app::idle` (panel off = brightness 0 + DISPOFF, no
+SLPIN); the disconnected banner on control pages (`OfflineReason`); `device.detent_click`
+and `hal::buzzer::click` (a beep never shortens a running one); the factory-reset gesture
+(10 s hold, short press confirms, arms after `releaseSeen()`, IO0 BOOT-strap note in
+README); log carry-overs and render performance (single 62 KB internal draw buffer, `-O2`,
+in-place RGB565 swap). Test-only `TIN` / `BUZ` / `HAKNOB_STATES_ON_READY` stay out of the
+normal build.
+
+Accepted deviations: the arc colour-flip frames take 42-43 ms at 40 MHz QSPI (limit 40 ms
+for every other update; 80 MHz was measured but not adopted); the first input on a dimmed
+screen only wakes it (plan Q8-1); some lights restore their previous level when turned on
+from 0 % (Step 7).
+
+Open: the consolidated [MANUAL] acceptance list for Steps 7-8 (panel DISPOFF behaviour,
+wake feel, banner wording, factory-reset gesture, detent click taste) is kept in the
+change log (`plan-step8.md`, 8.4-8.8) and merged into the user test list by the Parent.
+
+`tools/webui_test.js` static check (8.9): the forbidden action literal `'percentage'` is
+allowed in exactly one place, the `<input step="any">` attribute of a fan's percentage step
+in `data/app.js`; it is not an action table (that still comes from `/api/meta/actions`).

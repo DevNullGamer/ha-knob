@@ -4,7 +4,7 @@
 
 HA Knob: Home Assistant controller firmware for the LilyGo T-Encoder Pro (ESP32-S3R8,
 16 MB flash, 8 MB OPI PSRAM, 390x390 round AMOLED, touch, rotary encoder, buzzer).
-PlatformIO + Arduino framework. Current version 0.7.1.
+PlatformIO + Arduino framework. Current version 0.8.0.
 
 Approved spec and change log (outside the repo):
 `~/.claude/workspace/chgreq/LilyGo T-encoderPro - HA Controller/chg001/`.
@@ -62,9 +62,9 @@ only on `BOOT`.
   main loop only. `src/net/WebServer` (`net::web`): ESPAsyncWebServer routes.
 - `lib/core/src/ha/`: `HaUrl` (the only URL parser; ConfigModel's `parseUrlEndpoint` is an
   alias of it), `HaProtocol` (message builders + classifier), `HaSession` (clock-injected
-  state machine over a `Transport`; fake in native tests). `src/ha/HaClient` (`ha::`) wires the session to `src/ha/WsTransport` (own
-  WebSocket client on `WiFiClient`) and logs; main loop only, like all HA socket I/O. Never
-  enable `coalesce_messages`. The token lives only in `ConfigStore` and the session.
+  state machine over a `Transport`; fake in native tests). `src/ha/HaClient` (`ha::`) wires
+  it to `src/ha/WsTransport` (own WebSocket client on `WiFiClient`) and logs; main loop
+  only, like all HA socket I/O. Never enable `coalesce_messages`. The token lives only in `ConfigStore` and the session.
 - `lib/core/src/ha/EntityAttrs` is the only attribute model (typed fields for exactly
   `kAttributeKeys`; never parse other attributes). `EntityStore` applies
   `subscribe_entities` a/c/r events (max 64 entities). `parseMessage` always uses a filter
@@ -72,7 +72,7 @@ only on `BOOT`.
   Long-lived core containers take an injected allocator (`util::StdAllocator` over
   `ArduinoJson::Allocator*`, nullptr = heap; build elements with it); the session passes
   its PSRAM allocator to its `EntityStore`.
-- `util/JsonScan`, `ha/EntityCatalog` (Step 6.3): the get_states result is scanned and
+- `util/JsonScan`, `ha/EntityCatalog` (6.3): the get_states result is scanned and
   built in budgeted slices (each `result` element parsed alone with a filter;
   `catalogToJson` is host only); never parse it whole with ArduinoJson.
 - **Web callbacks run in the `async_tcp` task**: never call LVGL, `WiFi.*` or main-loop state
@@ -83,8 +83,8 @@ only on `BOOT`.
   entity list is a published `shared_ptr` body, streamed (never copied; max 4 streams).
   New routes use `AsyncURIMatcher::exact` (a plain path also matches `<path>/...`).
 - `lib/core/src/web/RequestGuard`: Host allow-list, captive-portal redirect, method,
-  CSRF (`application/json` + `X-HAKnob: 1`), body limit (16 KB), Basic auth check. Every
-  request passes it in the server middleware. Never add CORS headers.
+  CSRF (`application/json` + `X-HAKnob: 1`), body limit (16 KB), Basic auth check; runs
+  in the server middleware for every request. Never add CORS headers.
 - Web UI (`data/`): vanilla JS, no build step, DOM text via `textContent` only (no
   `innerHTML`), no inline scripts or styles (CSP). Clients always send
   whole config sections (section replace is literal), `ssid` in every `wifi` section, `url`,
@@ -102,11 +102,10 @@ only on `BOOT`.
 - **IO3 (VCI_EN) must be HIGH** before the display is initialised.
 - Display: Arduino_GFX `Arduino_ESP32QSPI` + `Arduino_CO5300(bus, 4, 0, false, 390, 390, 0,0,0,0)`,
   `begin(40000000)`. LVGL flush areas: even x1/y1 and even width/height
-  (`LV_EVENT_INVALIDATE_AREA` handler). `flushCb` swaps in place
+  (`LV_EVENT_INVALIDATE_AREA`). `flushCb` swaps in place
   (`lv_draw_sw_rgb565_swap` + `draw16bitBeRGBBitmap`): keep PARTIAL mode + sync flush.
 - **IO0 is the encoder push button and the BOOT strapping pin**: holding the knob during
-  reset enters download mode. No hold-at-boot gestures; the reset hold arms only
-  after `hal::button::releaseSeen()`, never `isDown()`.
+  reset enters download mode. No hold-at-boot gestures.
 - **Never call `Serial.setDebugOutput(true)`, and never define `CONFIG_ASYNC_TCP_DEBUG` or
   `ASYNCWEBSERVER_LOG_DEBUG`**: they route library/ESP-IDF output into the USB serial
   without the `logPrintf` protection below (and blocking writes from the `async_tcp` task).
@@ -123,14 +122,12 @@ only on `BOOT`.
   anywhere**, nor `digitalRead` in the ISR (flash-resident on core 2.0.17; DESIGN-NOTES
   "Serial logging and encoder ISR"). Check after changes: `xtensa-esp32s3-elf-nm -C
   firmware.elf | grep encoder` (code at 0x4037xxxx/0x4038xxxx, data at 0x3fcxxxxx).
-- Buzzer uses the core-2.x LEDC API (`ledcSetup` + `ledcAttachPin`), not core-3 `ledcAttach`.
-- SensorLib drivers are given `sda/scl = -1` because `Wire.begin(5, 6)` is called first
-  (otherwise core 2 logs "bus already initialized").
+- Buzzer: core-2.x LEDC API (`ledcSetup` + `ledcAttachPin`), not `ledcAttach`.
+- SensorLib drivers get `sda/scl = -1` (`Wire.begin(5, 6)` runs first).
 
 ## Invariants from Steps 1-6
 
-Binding rules distilled from the step history. Reasons, measurements and edge cases are in
-`docs/DESIGN-NOTES.md` (one section per step); read the section for the area you change.
+Reasons and measurements: `docs/DESIGN-NOTES.md` (one section per step); read the one for your area.
 
 - Input: CST816 touch; encoder 2 transitions per detent, clockwise = positive (confirmed on
   hardware); `QuadratureDecoder` counts on arrival at a different rest state (00/11).
@@ -152,7 +149,7 @@ Binding rules distilled from the step history. Reasons, measurements and edge ca
   `gen_esp32part.py .pio/build/t-encoder-pro/partitions.bin`.
 - Wi-Fi: `WiFi.persistent(false)`, `setAutoReconnect(false)`; WifiManager schedules
   retries, reads STA link state from ESP-IDF (not `WiFi.status()`) and scans with
-  `esp_wifi_scan_start` (not `WiFi.scanNetworks`). Wi-Fi restarts only when the SSID or
+  `esp_wifi_scan_start` (not `WiFi.scanNetworks`). Restart Wi-Fi only when the SSID /
   password in use differ.
 - Web: the static handler serves only files listed from the LittleFS root at boot; HEAD is
   404; paths are compared with their full length (decoded NUL -> 404).
@@ -166,10 +163,9 @@ Binding rules distilled from the step history. Reasons, measurements and edge ca
   `setLogger` (no "HA " prefix; the logger must not call back into the session).
 - `WsTransport`: one blocking step per poll; `WiFiClient::connect` timeout is in
   milliseconds; read only when `available() > 0`; detect a closed peer with
-  `recv(MSG_PEEK | MSG_DONTWAIT)`. Messages are assembled in PSRAM (limit 4 MB, larger /
-  binary ones dropped); messages > 256 KB are parsed envelope-only. Every read with data
-  calls `onRxProgress`; mid-message silence for 15 s -> `rx_stalled`. `retainText` hands
-  over only the buffer being delivered to `onText` (detached, no copy).
+  `recv(MSG_PEEK | MSG_DONTWAIT)`. Messages > 256 KB are parsed envelope-only. Every read
+  with data calls `onRxProgress`; mid-message silence for 15 s -> `rx_stalled`.
+  Assembled in PSRAM; `retainText` hands over only the buffer being delivered (no copy).
 - HaClient (Step 6.5): `main` passes the controls' unique entity ids on every
   `ha::configure`. get_states only via `ha::requestStates()`; the catalog JSON is built
   once into a `shared_ptr<const std::string>` (`ha::catalogJson()`, only while the fetch is
@@ -181,8 +177,6 @@ Binding rules distilled from the step history. Reasons, measurements and edge ca
   Reset the client before every attempt; connect with the pre-resolved IP and the URL host;
   never `connect(host, ...)`; `setCACertBundle` only with `_binary_x509_crt_bundle_start`.
   Use `ha::SecureClient`, never a bare `WiFiClientSecure` (core `stop()` fd-0 bug).
-- Core `log_e` lines reach COM14 through the ROM (not `HWCDC::write`), bypass `logPrintf`
-  and do not block.
 
 ## Control (Step 7; DESIGN-NOTES "Step 7.x")
 
@@ -198,9 +192,16 @@ Binding rules distilled from the step history. Reasons, measurements and edge ca
   per loop-pass batch (`Acceleration::onDetents`).
 - HA-supplied text in logs only via `core::util::logSafe`. HB worst case 275 of 318
   chars (DESIGN-NOTES "Step 8.3"): recount before adding a field.
-- Input passes `app::idle` first (false = wake only: no action, no click); while
-  `app::reset::captures()`, input goes only to `app::reset`. Beeps only via
-  `hal::buzzer::beep` / `click` (never shorten).
+
+## Idle and reset (Step 8; DESIGN-NOTES "Step 8 (summary, 0.8.0)")
+
+- Wake gate: all input passes `app::idle` first, before any routing (false = wake only: no
+  action, no click; a button gesture is ignored up to its release). While
+  `app::reset::captures()`, input goes only to `app::reset`.
+- Factory-reset gesture (hold 10 s + short press) arms only after `hal::button::releaseSeen()`,
+  never `isDown()` (IO0 note above).
+- Panel off = brightness 0 + DISPOFF, never SLPIN. Beeps only via `hal::buzzer::beep` /
+  `click`; a beep never shortens a running one.
 - `-DHAKNOB_TEST_INPUT` (env `t-encoder-pro-test`) only: `TIN` input, `BUZ` log, all in
   `#if`; `xtensa-esp32s3-elf-strings firmware.elf | grep -c 'TIN '` / `'BUZ ms='`: 0 normally.
 

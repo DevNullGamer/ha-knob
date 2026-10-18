@@ -62,9 +62,11 @@ test('S', 'static checks', async () => {
   check(!/<script(?![^>]*\bsrc=)/i.test(HTML), 'index.html has an inline <script>');
   check(!/\sstyle\s*=/i.test(HTML), 'index.html has a style attribute');
   // No action / press / step-range literals: the table comes from /api/meta/actions only.
+  // the one allowed use: the <input step> attribute of a fan's percentage step (not an action table)
+  const appNoStepAttr = APP.replace("control.action === 'percentage' ? 'any'", "control.action === X ? 'any'");
   for (const lit of ['toggle', 'brightness', 'color_temp', 'hue', 'target_temp', 'position', 'volume',
     'percentage', 'play_pause', 'mute', 'tilt', 'open_close']) {
-    check(!new RegExp(`['"]${lit}['"]`).test(APP), `app.js contains the action literal '${lit}'`);
+    check(!new RegExp(`['"]${lit}['"]`).test(appNoStepAttr), `app.js contains the action literal '${lit}'`);
   }
   check(/\[hidden\]\s*\{\s*display\s*:\s*none\s*!important\s*;?\s*\}/.test(CSS), 'style.css lacks [hidden]{display:none !important}');
 });

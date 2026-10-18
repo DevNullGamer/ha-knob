@@ -4,7 +4,7 @@ Firmware that turns the **LilyGo T-Encoder Pro** (ESP32-S3R8, 16 MB flash, 8 MB 
 390x390 round AMOLED, capacitive touch, rotary encoder with push button, buzzer) into a
 Home Assistant control knob.
 
-**Status: v0.7.1, Step 7.8 (knob and button control Home Assistant entities; Select list).** The firmware
+**Status: v0.8.0 (knob and button control Home Assistant entities; idle dim / off; disconnected banner; factory-reset gesture).** The firmware
 drives the hardware (display, touch swipes, encoder, button, buzzer), loads its configuration
 from NVS, joins Wi-Fi (or opens a setup access point), serves a setup web UI for Wi-Fi, Home
 Assistant, controls and device settings, keeps an authenticated, self-healing WebSocket
@@ -662,6 +662,7 @@ Presses: `toggle` = `<domain>.toggle` (climate: `turn_on` when off, else `turn_o
 | Encoder | One count per detent, counted on arrival at a rest state (00/11); bounce, half-turns back and invalid jumps never count |
 | Button | 30 ms debounce; short press < 600 ms (on release); long press at 600 ms (once, while held); very long press at 10 s (factory reset, only after the button was seen released once since boot) |
 | Swipe | Horizontal travel >= 80 px, finger down for <= 700 ms, and \|dx\| >= 2 x \|dy\| |
+| Wake (dimmed / off screen) | The first turn, press or swipe only wakes the screen (a button gesture is ignored up to its release); a bare touch does not wake |
 | Acceleration (`device.accel`) | Detents < 40 ms apart x4, < 80 ms x2, else x1 (per loop-pass batch) |
 
 ## Factory reset
