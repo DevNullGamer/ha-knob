@@ -16,3 +16,6 @@ secrets*
 
 # Python
 /tools/__pycache__/
+
+# Release packaging output (tools/release_layout.py)
+/dist/

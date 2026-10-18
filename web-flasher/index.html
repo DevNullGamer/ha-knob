@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- style-src allows inline styles only because ESP Web Tools 10.4.0 needs them (style
+     attributes in its dialogs, a <style> element in its log console); scripts stay 'self'. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HA Knob __VERSION__ web flasher</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="flasher.css">
+<script type="module" src="esp-web-tools/install-button.js"></script>
+</head>
+<body>
+<main>
+<h1>HA Knob web flasher</h1>
+<p class="lead">Installs HA Knob <strong>__VERSION__</strong> (firmware and setup web UI) on a
+LilyGo T-Encoder Pro over USB, straight from the browser.</p>
+
+<section class="install">
+  <esp-web-install-button manifest="manifest.json">
+    <button slot="activate" type="button">Install HA Knob __VERSION__</button>
+    <p slot="unsupported" class="warn">This browser cannot talk to USB serial devices. Use
+      Google Chrome or Microsoft Edge on a desktop computer (Windows, macOS, Linux or ChromeOS).</p>
+    <p slot="not-allowed" class="warn">Installing only works on an HTTPS page (or on localhost).</p>
+  </esp-web-install-button>
+  <noscript><p class="warn">The installer needs JavaScript.</p></noscript>
+</section>
+
+<section>
+<h2>What you need</h2>
+<ul>
+  <li>Google Chrome or Microsoft Edge on a desktop computer. Firefox, Safari and phones have
+    no Web Serial support.</li>
+  <li>This page over HTTPS (it is).</li>
+  <li>A USB-C cable that carries data, plugged straight into the T-Encoder Pro.</li>
+</ul>
+</section>
+
+<section>
+<h2>Install</h2>
+<ol>
+  <li>Plug in the T-Encoder Pro and click <strong>Install HA Knob __VERSION__</strong>.</li>
+  <li>Pick the device in the port list (usually "USB JTAG/serial debug unit") and click
+    <strong>Connect</strong>.</li>
+  <li>Click <strong>Install HA Knob</strong>, tick <strong>Erase device</strong> or leave it
+    unticked (see below), click <strong>Next</strong>, confirm, and wait until the install
+    has finished. The device restarts by itself.</li>
+</ol>
+</section>
+
+<section>
+<h2>Erase or keep the settings</h2>
+<dl>
+  <dt>Without "Erase device" (update)</dt>
+  <dd>Only the firmware, the setup web UI and the boot data are written. The settings area at
+    the end of the flash is not touched, so the Wi-Fi network, the Home Assistant address and
+    token, the controls, the device settings and the setup access point password are all
+    kept.</dd>
+  <dt>With "Erase device"</dt>
+  <dd>The whole flash is erased first. This removes every setting: Wi-Fi network and
+    password, Home Assistant address and token, controls, device settings, the web UI
+    password and the setup access point password. On the next start the device generates a
+    new setup access point password and shows it on the screen. (The factory-reset gesture
+    on the device keeps the access point password; erasing here does not.)</dd>
+</dl>
+<p>Tick "Erase device" for the first install, or when the device ran other firmware before.</p>
+</section>
+
+<section>
+<h2>After the install</h2>
+<p>This installer does not set up Wi-Fi. On a new or erased device, HA Knob opens its setup
+access point: the screen shows its name (<code>HA-Knob-XXXX</code>) and password. Join it with a
+phone or laptop; the setup page opens by itself, or go to <code>http://192.168.4.1/</code>.
+Then follow <a href="https://github.com/DevNullGamer/ha-knob#first-time-setup">First-time
+setup</a> in the README.</p>
+</section>
+
+<section>
+<h2>If the device is not found or the install fails</h2>
+<p>Put the board in download mode by hand: hold the knob pressed (it is the BOOT button,
+IO0) while you plug in the USB cable or press reset, then release it and click
+<strong>Install</strong> again. When the install has finished, unplug the cable and plug it
+in again without holding the knob.</p>
+<p>Do not hold the knob while the device starts normally: that always enters download mode
+instead of starting HA Knob.</p>
+</section>
+
+<section>
+<h2>Other ways to flash</h2>
+<p>The <a href="https://github.com/DevNullGamer/ha-knob/releases/tag/v__VERSION__">release
+v__VERSION__</a> has the separate images, <code>flash_args.txt</code>, checksums and a merged
+image for esptool:</p>
+<pre><code>esptool.py --chip esp32s3 write_flash 0x0 ha-knob-__VERSION__-merged.bin</code></pre>
+<p>The merged image ends before the settings area, so it keeps the settings like an update
+here. Building from source with PlatformIO is described in the
+<a href="https://github.com/DevNullGamer/ha-knob">README</a>.</p>
+</section>
+
+<footer>
+<p>HA Knob is MIT licensed: <a href="LICENSE">LICENSE</a>,
+<a href="THIRD_PARTY_NOTICES.md">third-party notices</a> (with links to the licence
+texts). The installer is
+<a href="https://github.com/esphome/esp-web-tools">ESP Web Tools</a> 10.4.0 (Apache-2.0,
+<a href="esp-web-tools/LICENSE">licence</a>), served from this site, not from a CDN.
+Source: <a href="https://github.com/DevNullGamer/ha-knob">github.com/DevNullGamer/ha-knob</a>.</p>
+</footer>
+</main>
+</body>
+</html>

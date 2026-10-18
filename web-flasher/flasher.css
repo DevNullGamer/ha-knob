@@ -1,0 +1,82 @@
+/* HA Knob web flasher (colours as in the device's setup UI, data/style.css) */
+:root {
+  --bg: #111418;
+  --panel: #1b2026;
+  --text: #e8eaed;
+  --muted: #9aa0a6;
+  --accent: #41bdf5;
+  --danger: #e5534b;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+main {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 2rem;
+}
+
+h1 { margin: 0 0 0.5rem; font-size: 1.6rem; }
+h2 { margin: 1.75rem 0 0.5rem; font-size: 1.2rem; }
+
+a { color: var(--accent); }
+
+.lead { color: var(--muted); }
+
+.install {
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 1.25rem;
+  margin: 1.25rem 0;
+  text-align: center;
+}
+
+/* Slotted content stays hidden until ESP Web Tools has loaded and chosen a slot. */
+esp-web-install-button:not(:defined) > * { display: none; }
+
+.install button {
+  font: inherit;
+  font-weight: 600;
+  padding: 0.7rem 1.5rem;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--accent);
+  color: var(--bg);
+  cursor: pointer;
+}
+
+.install button:hover,
+.install button:focus-visible { filter: brightness(1.15); }
+
+.warn { color: var(--danger); margin: 0; }
+
+dt { font-weight: 600; margin-top: 0.75rem; }
+dd { margin: 0.25rem 0 0 1.25rem; }
+
+li + li { margin-top: 0.35rem; }
+
+code, pre {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.9em;
+}
+
+pre {
+  background: var(--panel);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+}
+
+footer {
+  margin-top: 2.5rem;
+  border-top: 1px solid var(--panel);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
