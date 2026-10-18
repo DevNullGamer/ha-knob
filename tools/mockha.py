@@ -1,7 +1,7 @@
 """Mock of the HA WebSocket API for on-device checks (Steps 5, 5b.2 and 5b.4; not a unit test).
 
 Run with a Python the Windows firewall allows on the LAN, e.g.
-  C:\\Users\\Jesper\\AppData\\Local\\Python\\pythoncore-3.15-64\\python.exe tools/mockha.py --seconds 300
+  "%LOCALAPPDATA%\\Python\\<your Python>\\python.exe" tools/mockha.py --seconds 300
 
 Basic options
   --port P            listen port (default 8765)

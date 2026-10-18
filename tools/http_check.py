@@ -2,7 +2,7 @@
 """LAN HTTP checks against a running HA Knob (plan.md §3.8, §4 Step 4).
 
 Usage:
-    python tools/http_check.py --ip 192.168.1.143 [--hostname ha-knob] [--reboot]
+    python tools/http_check.py --ip DEVICE_IP [--hostname ha-knob] [--reboot]
                                [--web-password-test] [--tls-config-test]
                                [--ha-test --mock-python PY --mock-host PC_IP
                                 [--mock-port 8765] [--serial-log FILE]]

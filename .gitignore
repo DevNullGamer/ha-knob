@@ -11,5 +11,8 @@ secrets*
 .env
 .env.*
 
+# Local user acceptance test notes
+/UAT/
+
 # Python
 /tools/__pycache__/

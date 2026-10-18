@@ -4,7 +4,7 @@
 Usage (Git Bash or PowerShell; needs a background serial logger, see tools/serial_log.py, and
 a Python the Windows firewall lets accept LAN connections for the mock):
 
-    python tools/step65_check.py --ip 192.168.1.143 --serial-log LOG --mock-host 192.168.3.9 \
+    python tools/step65_check.py --ip DEVICE_IP --serial-log LOG --mock-host PC_IP \
         --mock-python <py3.15> [--cert-dir .pio/testcerts] SCENARIO [SCENARIO ...]
 
 Scenarios: plain3m, tls3m, small, oversize, stall, stallpong, sub, stack, token.
@@ -260,9 +260,9 @@ def states_run(dev, ser, args, name, tls, reboot=True):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ip", default="192.168.1.143")
+    ap.add_argument("--ip", required=True, help="device IP")
     ap.add_argument("--serial-log", required=True)
-    ap.add_argument("--mock-host", default="192.168.3.9")
+    ap.add_argument("--mock-host", required=True, help="LAN IP of this PC as seen from the device")
     ap.add_argument("--mock-python", required=True)
     ap.add_argument("--cert-dir", default=os.path.join(os.path.dirname(__file__), "..", ".pio", "testcerts"))
     ap.add_argument("--workdir", default=".")

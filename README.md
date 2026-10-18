@@ -751,15 +751,14 @@ in one blocking loop into an unguarded 15 KB-limited buffer, would silently fall
 unverified TLS connection and could not shorten its TLS handshake timeout. The project's
 own WebSocket client replaces it (no new library).
 
-Licences:
-- LVGL MIT, SensorLib MIT, ArduinoJson MIT, AsyncTCP LGPL-3.0, ESPAsyncWebServer LGPL-3.0.
-- Fonts: the Montserrat and FontAwesome Free font files are SIL OFL 1.1; the FontAwesome
-  Free icon designs are CC BY 4.0. The generated `src/ui/fonts/*.c` are derived fonts, so
-  before any public release the OFL notices (and FontAwesome attribution) must ship with
-  them.
-- Arduino_GFX: licence unconfirmed / mixed (the 1.5.0 package ships no LICENSE file; much
-  of it is derived from Adafruit-GFX, which is BSD); acceptable for this private project,
-  to be rechecked before any public release.
+Licences: HA Knob is MIT (`LICENSE`). Third-party licences, checked against the library
+sources, and the required notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md):
+- LVGL, SensorLib and ArduinoJson are MIT; Arduino_GFX is BSD (Adafruit-derived; the 1.5.0
+  package ships no licence file, so the upstream text is reproduced in the notices).
+- AsyncTCP and ESPAsyncWebServer are LGPL-3.0, arduino-esp32 is LGPL-2.1+; ESP-IDF
+  (mbedTLS, bootloader) is Apache-2.0. The notices describe how to rebuild and relink.
+- Fonts: the generated `src/ui/fonts/*.c` derive from Montserrat and Font Awesome Free
+  (SIL OFL 1.1; icon designs CC BY 4.0). The OFL text and attribution are in the notices.
 - The LilyGo vendor repository is GPL-3.0; this project uses only hardware facts (pin
   numbers, panel quirks) from it and copies none of its files.
 

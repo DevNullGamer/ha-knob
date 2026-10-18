@@ -4,14 +4,14 @@
 // Edge or Chrome (BROWSER_EXE, default Edge), the device with the new data/ uploaded and a
 // mock HA (tools/mockha.py --states-file F with 1500 entities; entity 0 must be
 // light.mock_0 named '<img src=x onerror=alert(1)>') that the device is configured for.
-//   node tools/webui_browser.js http://192.168.1.143 [web-password-check]
+//   node tools/webui_browser.js http://DEVICE_IP [web-password-check]
 // With "web-password-check" it sets the web password 'testpw1', checks the 401 path and removes it.
 'use strict';
 const path = require('path');
 const http = require('http');
 const nm = process.env.WEBUI_NODE_MODULES;
 const puppeteer = require(nm ? path.join(nm, 'puppeteer-core') : 'puppeteer-core');
-const BASE = process.argv[2] || 'http://192.168.1.143';
+const BASE = process.argv[2] || 'http://ha-knob.local';
 const EXE = process.env.BROWSER_EXE || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
 const XSS = '<img src=x onerror=alert(1)>';
 

@@ -9,7 +9,7 @@ namespace noControlsScreen {
 
 lv_obj_t *create();
 
-// Where the web UI is, e.g. "Open http://192.168.1.143" (the next line reads
+// Where the web UI is, e.g. "Open http://192.168.4.1" (the next line reads
 // "to add controls").
 void setAddress(const char *line);
 
