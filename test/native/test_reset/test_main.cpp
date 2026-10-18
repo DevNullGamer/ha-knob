@@ -213,6 +213,29 @@ static void test_real_button_fsm_integration() {
     TEST_ASSERT_EQUAL_INT(1, opens);
 }
 
+// The caller (app::reset) ticks before every input: a ShortPress at or after the deadline
+// finds the confirmation expired (timeout), one 1 ms before it still confirms.
+static void test_expire_first_late_short_press() {
+    const uint32_t offsets[] = {10000u, 10001u, 12000u};
+    for (uint32_t off : offsets) {
+        ResetConfirm r = opened(5000);
+        TEST_ASSERT_TRUE(r.tick(5000 + off) == R::Cancelled);
+        TEST_ASSERT_TRUE(r.lastCancel() == CR::Timeout);
+        TEST_ASSERT_TRUE(r.onButton(Ev::ShortPress, 5000 + off) == R::None);
+        TEST_ASSERT_FALSE(r.confirmed());
+        TEST_ASSERT_FALSE(r.captures());
+    }
+    ResetConfirm early = opened(5000);
+    TEST_ASSERT_TRUE(early.tick(5000 + 9999) == R::None);
+    TEST_ASSERT_TRUE(early.onButton(Ev::ShortPress, 5000 + 9999) == R::Confirmed);
+    // across the millis() wrap
+    const uint32_t open = 0xFFFFF000u;
+    ResetConfirm w = opened(open);
+    TEST_ASSERT_TRUE(w.tick(open + 10000u) == R::Cancelled);
+    TEST_ASSERT_TRUE(w.onButton(Ev::ShortPress, open + 10000u) == R::None);
+    TEST_ASSERT_FALSE(w.confirmed());
+}
+
 static void test_names() {
     TEST_ASSERT_EQUAL_STRING("none", cancelReasonName(CR::None));
     TEST_ASSERT_EQUAL_STRING("rotate", cancelReasonName(CR::Rotate));
@@ -238,6 +261,7 @@ int main(int, char **) {
     RUN_TEST(test_reopen_without_rearm);
     RUN_TEST(test_clock_wrap);
     RUN_TEST(test_real_button_fsm_integration);
+    RUN_TEST(test_expire_first_late_short_press);
     RUN_TEST(test_names);
     return UNITY_END();
 }
