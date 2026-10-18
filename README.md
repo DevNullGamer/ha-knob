@@ -752,13 +752,29 @@ unverified TLS connection and could not shorten its TLS handshake timeout. The p
 own WebSocket client replaces it (no new library).
 
 Licences: HA Knob is MIT (`LICENSE`). Third-party licences, checked against the library
-sources, and the required notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md):
+sources and the linker map, and the required notices are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); the full licence texts (verbatim copies,
+sources listed in the notices) are in `licenses/`. Releases and the flasher site ship
+`LICENSE`, the notices and `licenses/`.
+- Files not covered by `LICENSE`: `src/ui/fonts/*.c` (SIL OFL 1.1) and `include/lv_conf.h`
+  (MIT, LVGL Kft, derived from `lv_conf_template.h`).
 - LVGL, SensorLib and ArduinoJson are MIT; Arduino_GFX is BSD (Adafruit-derived; the 1.5.0
-  package ships no licence file, so the upstream text is reproduced in the notices).
-- AsyncTCP and ESPAsyncWebServer are LGPL-3.0, arduino-esp32 is LGPL-2.1+; ESP-IDF
-  (mbedTLS, bootloader) is Apache-2.0. The notices describe how to rebuild and relink.
-- Fonts: the generated `src/ui/fonts/*.c` derive from Montserrat and Font Awesome Free
-  (SIL OFL 1.1; icon designs CC BY 4.0). The OFL text and attribution are in the notices.
+  package ships no licence file, so `license.txt` from tag v1.5.0 is copied to `licenses/`).
+- AsyncTCP and ESPAsyncWebServer are LGPL-3.0-or-later. arduino-esp32 is LGPL-2.1-or-later
+  as a whole; individual files are Apache-2.0 (e.g. LittleFS, Preferences, HWCDC,
+  ssl_client) or MIT (ESPmDNS). The notices give the exact source tags and how to rebuild
+  with a modified library or core.
+- ESP-IDF v4.4.7 (precompiled into arduino-esp32, and the bootloader) is Apache-2.0 and
+  bundles lwIP, littlefs, wpa_supplicant, TLSF (BSD), FreeRTOS, cJSON, esp_littlefs, the
+  Xtensa HAL (MIT), mbedTLS (Apache-2.0) and the Mozilla CA list (MPL-2.0); newlib is
+  BSD-family. The notices list each with its copyright line.
+- Fonts: the generated `src/ui/fonts/*.c` derive from Montserrat 7.200 and Font Awesome
+  Free 5.9.0 (SIL OFL 1.1, no Reserved Font Name; icon designs CC BY 4.0). The OFL text and
+  attribution are in the notices.
+- The web flasher (GitHub Pages only) serves ESP Web Tools 10.4.0 (Apache-2.0), which
+  bundles lit (BSD-3), @material/web, esptool-js, improv-wifi-serial-sdk (Apache-2.0),
+  pako (MIT/Zlib), tslib (0BSD), atob-lite (MIT) and the esptool flasher stubs
+  (GPL-2.0-or-later); their texts are in `licenses/esp-web-tools/`.
 - The LilyGo vendor repository is GPL-3.0; this project uses only hardware facts (pin
   numbers, panel quirks) from it and copies none of its files.
 
@@ -789,6 +805,7 @@ lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the h
 test/native/      host unit tests (Unity), run with `pio test -e native`
 tools/            serial_check.py, gen_fonts.sh
 docs/             DESIGN-NOTES.md (per-step design decisions and measurements)
+licenses/         third-party licence texts (verbatim; see THIRD_PARTY_NOTICES.md), esp-web-tools/ for the flasher
 ```
 
 ## Security

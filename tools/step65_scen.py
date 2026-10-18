@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Step 6.5 device scenarios, second part (see tools/step65_check.py for the helpers and usage).
 
-    python tools/step65_scen.py --serial-log LOG --mock-python PY --workdir DIR SCENARIO ...
+    python tools/step65_scen.py --ip DEVICE_IP --mock-host PC_IP --serial-log LOG --mock-python PY
+        [--cert-dir DIR] [--workdir DIR] SCENARIO ...
 
 Scenarios: p3m, t3m (3 MB / 1500 entities, plain / TLS, clean reboot), small, cancel, stall,
 oversize, sub, stack, token. The device must run a -DHAKNOB_STATES_ON_READY build.
