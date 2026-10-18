@@ -1219,3 +1219,64 @@ Spec: `plan-step8.md` §3.5, §4 Step 8.7 (Q8-12..Q8-14).
 - Logs: `SYS factory reset src=<web|button>` (prefix unchanged).
 - Build: normal RAM 55436 bytes (16.9 %), flash 1846337 bytes (28.5 %, +2128 B over 8.5);
   test build RAM 55460, flash 1847897.
+
+## Step 8.8: render performance (2026-10-18)
+
+Spec: `plan-step8.md` §3.6, §4 Step 8.8 (Q8-16).
+
+- **Instrumentation.** `main::renderUi` times `lv_timer_handler()`; `hal::display::flushCb`
+  adds its own time and pixel count to file-local counters, read and reset by
+  `takeFlushStats()` after every handler call. `UI render ms=<n> flush_ms=<f> px=<p>` (ms
+  rounded up, like `loopmax`): test builds every pass >= 5 ms, normal builds >= 50 ms and at
+  most once per 5 s. The widget updates done before the handler (`publishControlView`,
+  `ui::selectOpen`) are not in `ms`; HB `loopmax` covers them.
+- **Setup.** Test build, mock HA (`tools/mockha.py --call-apply`), 24 controls (lights,
+  climate, cover, fan, media player), every third title a 247-character friendly name, one
+  Danish title, no labels; dim / off 0 (never) except for the wake test (off 5 s). Swipe:
+  12 x `TIN swipe left` 1 s apart. Select: 4 x `TIN long` (open) / `TIN long` (cancel).
+  Spin: `TIN rot +1` every 20 ms for 5 s (the spec run; with acceleration the brightness hits
+  100 % after about 6 detents) and a second run that alternates 10 x `+1` / 10 x `-1` so
+  the value keeps changing (85 updates). Wake: off, then `TIN rot +1`.
+- **Results** (UI render ms max / HB loopmax ms; flush_ms in brackets where it matters):
+
+| Measure | swipe render | Select open render / loopmax | spin render (all / colour flip) | spin loopmax | wake |
+|---|---|---|---|---|---|
+| Before (8.7 + logging) | 35-61 | 53-68 / 136-153 | <= 41 / 49-63 (flush 23) | 62-69 | < 5 |
+| 1: one 390x80 buffer | 31-55 | 43-58 / 126-143 | <= 38 / 55 | 56-62 | - |
+| 2: `-O2` | 25-44 | 40-54 / 116-131 | <= 31 / 44-45 (flush 21) | 45-52 | - |
+| 3a: Select titles by binary search | - | 34-47 / 46-61 | - | - | - |
+| 3b: swap in place + `draw16bitBeRGBBitmap` | 24-43 | 38-52 / 52-67 | <= 30 / 42-43 (flush 19) | 35-51 | < 5 |
+| Gate | <= 100 | <= 100 | <= 40 / colour flip accepted at 42-43 (user 2026-10-18) | <= 60 | <= 100 |
+
+  Not kept (measured): `LV_USE_STDLIB_STRING = CLIB` (about 1 ms, within noise).
+- **Colour-flip frames (user decision 2026-10-18).** The <= 40 ms value-update gate is
+  relaxed only for the arc colour-flip frames (`unconfirmed` 0 <-> 1, measured 42-43 ms);
+  every other value update must stay <= 40 ms (measured <= 30 ms). A style change
+  invalidates the whole 360x360 arc (134 k px); 19 ms of such a frame is the panel transfer.
+  QSPI stays at 40 MHz (`begin(40000000)` unchanged); 80 MHz was measured (all gates met:
+  colour flip 36-37 ms, flush 12 ms) but not adopted.
+- **Fix 1 (buffer).** One 62 400 B internal buffer (`MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`);
+  if it does not fit, the old two 390x40 buffers and `ERR draw buffer fallback`.
+- **Fix 2 (`-O2`).** `build_unflags = -Os` + `-O2`, see README "Library versions"; applies to
+  the project, the libraries and the Arduino core sources (FrameworkArduino), not to the
+  precompiled ESP-IDF libraries. Encoder
+  `nm` check: `encoderIsr` at 0x403754bc (IRAM), `decoder` / `detents` / `lastRead` at
+  0x3fc9d3xx; its disassembly has no `call`. Flash (normal build) 1 846 337 -> 2 037 977 B
+  (+191 640 B, 31.4 % of the app slot); RAM 55 476 B.
+- **Fix 3a (Select open).** `SelectScreen::itemText` cut a long title by dropping one
+  character and measuring again, up to ~40 `lv_text_get_size` calls per title (about 80 ms
+  outside the render for 8 long titles). It now binary-searches the longest whole-character
+  prefix that fits with "…" (same result, since the width grows with the prefix).
+- **Fix 3b (flush).** `flushCb` swaps the rendered RGB565 buffer in place with
+  `lv_draw_sw_rgb565_swap` and sends it with `draw16bitBeRGBBitmap`, which DMAs straight from
+  the buffer in 2 KB chunks instead of copying each chunk through Arduino_GFX's swap loop.
+  Safe because LVGL re-renders the (single) buffer for every area.
+- **Heap.** Internal heap at boot 136 936 -> 136 764 B, connected (24 controls, Ready)
+  136 752 -> 136 604 B (both within 2 KB). Boot first render loopmax 313 -> 268 ms
+  (excluded from the gates).
+- **Wake.** LVGL keeps rendering while the panel is off and the panel keeps its RAM, so the
+  wake itself needs no render >= 5 ms (before and after).
+- **Stack (Auditor finding 3, Tester 2026-10-18, -O2 test build).** HB `stack=` (loop task
+  high-water, gate >= 2048): 4040 at boot, 3056 after mock `--deep-result 17 18 19 20`
+  (nesting 20 = `kMaxNesting`); 3056 after POST `/api/config` bodies of 15 000 / 15 900 /
+  16 300 B (all 200, no reboot, loopmax <= 64 ms for the one pass that applied the config).

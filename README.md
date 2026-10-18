@@ -141,6 +141,7 @@ UI select open | choose=<i> | status     Select list opened / control page i or 
 UI select cancel reason=<long|idle|config|setup|reset>   Select list closed without a change
 UI view page=<i>/<n> value=<v><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1> unconfirmed=<0|1> title=<t> banner=<0|1>   the shown control page changed (unconfirmed=1: a turned value HA has not confirmed yet; banner=1: HA not connected, state = the reason)
 UI toast text=<t>                        a control notice shown to the user for 3 s
+UI render ms=<n> flush_ms=<f> px=<p>     a slow LVGL pass (ms = the whole lv_timer_handler() call, flush_ms / px = panel transfer time / pixels in it); test builds: every pass >= 5 ms; normal builds: >= 50 ms, at most once per 5 s
 CTL press page=<i> press=<press>         short press on control page i
 CTL notice=<kind> page=<i> text=<t>      ha_offline / not_found / unavailable / no_value / busy / failed / timeout
 HA call id=<n> <domain>.<service> entity=<id> data=<json>   a service call sent
@@ -735,6 +736,14 @@ All versions are pinned exactly in `platformio.ini`.
 | `ESP32Async/ESPAsyncWebServer` | 3.12.1 | Web server (middleware, static files); maintained fork, core 2.x compatible. PlatformIO prints "Ignored `Hash` dependency": that dependency is for ESP8266 only |
 | `throwtheswitch/Unity` | 2.6.1 | Host test framework (native env); pinned to the version PlatformIO resolved |
 | `lv_font_conv` (npx, font generation only) | 1.5.3 | See Fonts; source fonts from LVGL 9.2.2's `scripts/built_in_font/` |
+
+Build flags: the `t-encoder-pro` env (and the test env that extends it) replaces the core's
+default `-Os` with `-O2` (`build_unflags = -Os`). It applies to the project, the libraries
+(LVGL, Arduino_GFX, ...) and the Arduino core sources (FrameworkArduino, incl. HWCDC, WiFi,
+WiFiClientSecure, LittleFS); only the precompiled ESP-IDF libraries are not affected.
+Step 8.8: LVGL renders about 20-25 % faster (the spinning loopmax gate of 60 ms needs it);
+the app image grows by about 190 KB (1.85 -> 2.04 MB of the 6.2 MB app slot). After a flag
+change re-run the encoder IRAM check (CLAUDE.md, `nm`).
 
 `links2004/WebSockets` 2.7.3 (Step 5) was removed in v0.5.1 (Step 5b.2): it read every frame
 in one blocking loop into an unguarded 15 KB-limited buffer, would silently fall back to an

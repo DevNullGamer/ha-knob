@@ -4,11 +4,11 @@
 
 HA Knob: Home Assistant controller firmware for the LilyGo T-Encoder Pro (ESP32-S3R8,
 16 MB flash, 8 MB OPI PSRAM, 390x390 round AMOLED, touch, rotary encoder, buzzer).
-PlatformIO + Arduino framework. Current version 0.7.1 (Step 7.8: Select list).
+PlatformIO + Arduino framework. Current version 0.7.1.
 
-The approved specification and change log live outside the repo in
+Approved spec and change log (outside the repo):
 `~/.claude/workspace/chgreq/LilyGo T-encoderPro - HA Controller/chg001/`.
-Implement one specification step at a time.
+One spec step at a time.
 
 ## Commands
 
@@ -24,8 +24,8 @@ pio test -e native                       # host unit tests (needs MSYS2 ucrt64 g
 ```
 
 `serial_check.py` never resets or flashes; it waits for each `--expect` regex and exits 0/1.
-USB-CDC drops output printed before the host enumerates, so assert on the repeating `HB`
-line, not only on `BOOT`.
+USB-CDC drops output before the host enumerates: assert on the repeating `HB` line, not
+only on `BOOT`.
 
 ## Layout and rules
 
@@ -101,8 +101,9 @@ line, not only on `BOOT`.
 
 - **IO3 (VCI_EN) must be HIGH** before the display is initialised.
 - Display: Arduino_GFX `Arduino_ESP32QSPI` + `Arduino_CO5300(bus, 4, 0, false, 390, 390, 0,0,0,0)`,
-  `begin(40000000)`. LVGL flush areas must be rounded to even x1/y1 and even width/height
-  (done in an `LV_EVENT_INVALIDATE_AREA` handler).
+  `begin(40000000)`. LVGL flush areas: even x1/y1 and even width/height
+  (`LV_EVENT_INVALIDATE_AREA` handler). `flushCb` swaps in place
+  (`lv_draw_sw_rgb565_swap` + `draw16bitBeRGBBitmap`): keep PARTIAL mode + sync flush.
 - **IO0 is the encoder push button and the BOOT strapping pin**: holding the knob during
   reset enters download mode. No hold-at-boot gestures; the reset hold arms only
   after `hal::button::releaseSeen()`, never `isDown()`.

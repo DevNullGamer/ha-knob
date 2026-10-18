@@ -28,6 +28,9 @@
 //           unconfirmed=<0|1> title=<t> banner=<0|1>   (one line) the selected control page
 //           shows something new (banner=1: HA not Ready, state = the offline reason)
 //   UI toast text=<t>                             a control notice (src/ui/Ui.h)
+//   UI render ms=<n> flush_ms=<f> px=<p>          a slow lv_timer_handler() pass (ms = whole
+//           pass, flush_ms / px = panel transfer time / pixels inside it); test builds: every
+//           pass >= 5 ms, normal builds: >= 50 ms, at most once per 5 s
 //   CTL ...   control presses and notices (see src/app/Control.h)
 //   IDLE ... | DISP ...   screen wake / dim / off (see src/app/Idle.h)
 //   RST ...   factory-reset gesture (see src/app/Reset.h)
@@ -69,6 +72,15 @@ namespace {
 constexpr uint32_t kHeartbeatMs = 5000;
 constexpr uint32_t kLoopDelayMs = 5;
 constexpr uint32_t kSystemRequestDelayMs = 750;  // let the HTTP response go out first
+// "UI render" log (plan-step8.md §3.6): test builds log every slow pass, normal builds only
+// long pauses and at most one line per kRenderLogGapMs.
+#if defined(HAKNOB_TEST_INPUT)
+constexpr uint32_t kRenderLogMinUs = 5000;
+constexpr uint32_t kRenderLogGapMs = 0;
+#else
+constexpr uint32_t kRenderLogMinUs = 50000;
+constexpr uint32_t kRenderLogGapMs = 5000;
+#endif
 
 ConfigStore configStore;
 const char *bootCfgSource = "defaults";  // how this boot got its config: defaults | loaded
@@ -76,6 +88,8 @@ bool displayOk = false;
 int32_t shownCount = 0;
 uint32_t lastHeartbeatMs = 0;
 uint32_t loopMaxUs = 0;  // longest loop() pass since the last heartbeat
+uint32_t lastRenderLogMs = 0;
+bool renderLogged = false;  // lastRenderLogMs is valid
 std::string apPassword;  // shown on the setup screen
 net::wifi::Status shownWifi;
 ui::NetworkView shownView;
@@ -150,6 +164,25 @@ void printHeartbeat(uint32_t nowMs) {
                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
                     core::ui::screenLevelName(app::idle::level()));
     loopMaxUs = 0;
+}
+
+// Runs LVGL (timers, render, flush) and logs a slow pass (plan-step8.md §3.6).
+void renderUi(uint32_t nowMs) {
+    const uint32_t startUs = micros();
+    lv_timer_handler();
+    const uint32_t renderUs = micros() - startUs;
+    uint32_t flushUs = 0;
+    uint32_t flushPx = 0;
+    hal::display::takeFlushStats(&flushUs, &flushPx);  // always, so the next pass starts at 0
+    if (renderUs < kRenderLogMinUs ||
+        (renderLogged && nowMs - lastRenderLogMs < kRenderLogGapMs)) {
+        return;
+    }
+    renderLogged = true;
+    lastRenderLogMs = nowMs;
+    util::logPrintf("UI render ms=%u flush_ms=%u px=%u\n",
+                    static_cast<unsigned>((renderUs + 999) / 1000),
+                    static_cast<unsigned>((flushUs + 999) / 1000), static_cast<unsigned>(flushPx));
 }
 
 // Publishes Wi-Fi state changes to the web server snapshot and the screens.
@@ -717,7 +750,7 @@ void loop() {
 
     if (displayOk) {
         ui::tick(nowMs);
-        lv_timer_handler();
+        renderUi(nowMs);
     }
     const uint32_t passUs = micros() - startUs;
     if (passUs > loopMaxUs) {

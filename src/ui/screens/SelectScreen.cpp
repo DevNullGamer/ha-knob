@@ -1,5 +1,8 @@
 #include "ui/screens/SelectScreen.h"
 
+#include <string>
+#include <vector>
+
 #include "ui/Widgets.h"
 #include "util/Text.h"
 
@@ -28,7 +31,7 @@ int32_t textWidth(const std::string &text) {
 
 // One roller line: control characters as spaces, cut (UTF-8-safe) with "…" to the width.
 std::string itemText(const std::string &title) {
-    // Pre-cut: more never fits the width, and the measure loop below is quadratic.
+    // Pre-cut: more never fits the width, and every measure below walks the whole text.
     std::string text = core::util::truncateUtf8(title, kMaxItemBytes);
     for (char &c : text) {
         const unsigned char u = static_cast<unsigned char>(c);
@@ -40,19 +43,28 @@ std::string itemText(const std::string &title) {
     if (textWidth(text) <= maxWidth) {
         return text;
     }
-    while (!text.empty()) {
-        // Drop the last UTF-8 character (continuation bytes 10xxxxxx, then its lead byte).
-        while (!text.empty() && (static_cast<unsigned char>(text.back()) & 0xC0) == 0x80) {
-            text.pop_back();
-        }
-        if (!text.empty()) {
-            text.pop_back();
-        }
-        if (textWidth(text + kEllipsis) <= maxWidth) {
-            break;
+    // The longest prefix of whole UTF-8 characters that fits with "…". The width grows with
+    // the prefix, so a binary search over the character starts finds it in a few measures
+    // (the old drop-one-character loop measured up to ~40 times per title: Step 8.8).
+    std::vector<size_t> starts;  // byte offset of every character after the first
+    for (size_t i = 1; i < text.size(); ++i) {
+        if ((static_cast<unsigned char>(text[i]) & 0xC0) != 0x80) {
+            starts.push_back(i);
         }
     }
-    return text + kEllipsis;
+    size_t fits = 0;  // a prefix length that fits (0 = only "…")
+    size_t lo = 0;
+    size_t hi = starts.size();  // candidates starts[lo, hi)
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (textWidth(text.substr(0, starts[mid]) + kEllipsis) <= maxWidth) {
+            fits = starts[mid];
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return text.substr(0, fits) + kEllipsis;
 }
 
 }  // namespace
