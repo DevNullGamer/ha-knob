@@ -93,6 +93,7 @@ jobs:
         run: python -m pip install --disable-pip-version-check "platformio==${PLATFORMIO_VERSION}"
       - name: Check tag matches FW_VERSION
         # Fails a wrong tag in seconds, before the build (release_layout.py checks it again).
+        # This sed matches only an unindented #define; release_layout is more lenient. Both fail closed.
         if: ${{ github.ref_type == 'tag' }}
         run: |
           ver=$(sed -n 's/^#define FW_VERSION "\([^"]*\)".*/\1/p' include/version.h)
@@ -241,7 +242,7 @@ jobs:
             echo
             echo "## SHA-256"
             echo
-            echo "Check with \`sha256sum -c SHA256SUMS.txt\`."
+            echo "Check with \`sha256sum -c --ignore-missing SHA256SUMS.txt\` (only the files you downloaded)."
             echo
             echo '```'
             cat dist/SHA256SUMS.txt

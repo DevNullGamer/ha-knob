@@ -207,9 +207,12 @@ Reasons and measurements: `docs/DESIGN-NOTES.md` (one section per step); read th
 
 ## CI and releases (chg003; DESIGN-NOTES "chg003")
 
-- Local packaging: `python -I tools/release_layout.py --help`. Flash offsets come only from it (PlatformIO metadata + built `partitions.bin`); never hard-code them.
-- A release tag must equal `v` + `FW_VERSION`. ESP Web Tools is vendored at build time (sha512 pin in `build.yml`), never committed.
-- Workflows: actions pinned by SHA, permissions per job, no secrets, no `${{ }}` in `run:`; keep actionlint + zizmor clean.
+- Local packaging: `python -I tools/release_layout.py --help`. Flash offsets come only
+  from it (PlatformIO metadata + built `partitions.bin`); never hard-code them.
+- A release tag must equal `v` + `FW_VERSION`. ESP Web Tools is vendored at build time
+  (sha512 pin in `build.yml`), never committed.
+- Workflows: actions pinned by SHA, permissions per job, no secrets, no `${{ }}` in
+  `run:`; keep actionlint + zizmor clean.
 
 ## Secrets
 

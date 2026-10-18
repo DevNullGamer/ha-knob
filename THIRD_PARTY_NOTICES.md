@@ -8,7 +8,7 @@ repositories at the exact tags or commits named below, and the linker map of the
 build (`.pio/build/t-encoder-pro/firmware.map`: only components with code or data in
 `firmware.elf` are listed).
 
-The full licence texts are in [`licenses/`](licenses/) (verbatim copies; the source of each
+The full licence texts are in [`licenses/`](licenses/) (verbatim copies, except `FreeBSD-net80211-BSD-2-Clause.txt` (standard wording, see "Licence files"); the source of each
 file is listed in "Licence files" at the end). Releases and the flasher site ship `LICENSE`,
 this file and the whole `licenses/` directory.
 
@@ -164,7 +164,7 @@ Components with code in `firmware.elf` that need their own attribution:
 | esp_littlefs (`libesp_littlefs.a`; joltwallet/esp_littlefs 41873c2) | Copyright 2020 Brian Pugh | MIT | `esp_littlefs-LICENSE.txt` |
 | littlefs (`lfs.c` in `libesp_littlefs.a`; littlefs-project/littlefs f53a0cc) | Copyright (c) 2022, The littlefs authors; Copyright (c) 2017, Arm Limited | BSD-3-Clause | `littlefs-LICENSE.md` |
 | Wi-Fi, PHY and coexistence binary libraries (`libnet80211.a`, `libpp.a`, `libcore.a` from the SDK, `libsmartconfig.a`, `libcoexist.a`, `libphy.a`; espressif/esp32-wifi-lib f2aae4d, espressif/esp-phy-lib dcfdccf) | Espressif Systems | Apache-2.0 | `Apache-2.0.txt` |
-| FreeBSD net80211 code inside `libnet80211.a` (per ESP-IDF COPYRIGHT.rst) | Copyright (c) 2004-2008 Sam Leffler, Errno Consulting | BSD-2-Clause | `ESP-IDF-COPYRIGHT.rst`; standard FreeBSD `sys/net80211` BSD-2-Clause wording in `FreeBSD-net80211-BSD-2-Clause.txt` (not a verbatim copy of a source header: none is published with the binary) |
+| FreeBSD net80211 code inside `libnet80211.a` (per ESP-IDF COPYRIGHT.rst) | Copyright (c) 2004-2008 Sam Leffler, Errno Consulting | BSD (ESP-IDF COPYRIGHT.rst); BSD-2-Clause per the FreeBSD sys/net80211 sources | `ESP-IDF-COPYRIGHT.rst`; standard FreeBSD `sys/net80211` BSD-2-Clause wording in `FreeBSD-net80211-BSD-2-Clause.txt` (not a verbatim copy of a source header: none is published with the binary) |
 | esp_diagnostics (`libesp_diagnostics.a`, from espressif/esp-insights) | Espressif Systems | Apache-2.0 | `Apache-2.0.txt` |
 | mDNS, NVS, spi_flash, esp_netif, Wi-Fi provisioning / protocomm glue and the other Espressif components | Espressif Systems | Apache-2.0 | `Apache-2.0.txt` |
 
@@ -346,7 +346,7 @@ files or code were copied from it.
 
 ## Licence files
 
-Every file in `licenses/` is a verbatim copy (line endings normalised to LF by git). Sources:
+Every file in `licenses/` is a verbatim copy, except `FreeBSD-net80211-BSD-2-Clause.txt` (standard wording), (line endings normalised to LF by git). Sources:
 
 | File | Source |
 |---|---|

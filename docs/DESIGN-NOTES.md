@@ -1345,8 +1345,9 @@ Repo renamed to `DevNullGamer/ha-knob` (Pages `https://devnullgamer.github.io/ha
   the build; `release_layout.py --tag` checks it again. The `TIN ` / `BUZ ms=` string counts
   in `firmware.elf` must be 0 and are validated as numbers first (fail closed; `HB up=` is the
   positive control). The release job appends the hash of the licences zip (built in that job)
-  to `SHA256SUMS.txt` and re-verifies, so one `sha256sum -c SHA256SUMS.txt` covers every
-  asset (chosen over a second sums file: one file, one command, no `--ignore-missing`).
+  to `SHA256SUMS.txt` and re-verifies, so one `sha256sum -c --ignore-missing SHA256SUMS.txt`
+  covers every asset a user downloaded (chosen over a second sums file: one file; `--ignore-missing`
+  is needed because users fetch only the files they flash).
   Only the five parts, the merged image, `flash_args.txt`, the sums, `LICENSE`, the notices
   and the zip are attached; `firmware.elf` (42 MB) is a 90-day workflow artifact only.
 - **Linux CI.** The first runner run needed no portability fixes: native tests 858/858 on

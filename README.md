@@ -49,26 +49,28 @@ A release (GitHub Releases, tag `vX.Y.Z`) contains the firmware, the setup web U
 and the boot files; nothing needs to be built.
 
 **Web flasher** (recommended): https://devnullgamer.github.io/ha-knob/ with Chrome or Edge on
-a desktop computer (Web Serial; other browsers cannot flash). It always installs the latest
-release. Plug in the T-Encoder Pro, click **Install**, pick the port and follow the dialog.
+a desktop computer (Web Serial; other browsers cannot flash). It always installs the most
+recently tagged release. Plug in the T-Encoder Pro, click **Install**, pick the port and follow the dialog.
 
+- **Tick "Erase device"** for the first install and after other firmware was on the device.
 - **Without "Erase device"** the settings survive: the Wi-Fi network, the Home Assistant
   address and token, the controls and the setup access point password are kept. Nothing at
   or after 0xFE0000 (the NVS partition) is written.
 - **With "Erase device"** the whole chip is erased first: all settings are gone, and the
   device starts its setup access point with a new password (see "First-time setup").
 - If the port does not show up or the install cannot start, enter download mode: hold the
-  knob (IO0) while plugging in USB or pressing reset, then try again (see "Factory reset"
-  for why IO0 is special).
+  knob (IO0) while plugging in USB or pressing reset, then try again (see "Hardware notes"
+  for why IO0 is special). After an install made in download mode, unplug and replug USB
+  without holding the knob.
 - The flasher does not set up Wi-Fi (Improv is off); use the setup access point as above.
 
 **esptool** (needs esptool 4.x; the release page lists these commands too). The merged image
 ends before the NVS partition, so it keeps the settings too:
 
 ```
+sha256sum -c --ignore-missing SHA256SUMS.txt             # check what you downloaded first
 esptool.py --chip esp32s3 write_flash 0x0 ha-knob-X.Y.Z-merged.bin
 esptool.py --chip esp32s3 write_flash @flash_args.txt     # separate parts, run next to the .bin files
-sha256sum -c SHA256SUMS.txt                               # check the downloads first
 ```
 
 **PlatformIO** from source is unchanged (`pio run -t upload`, `-t uploadfs`; see "Commands").
@@ -76,8 +78,8 @@ sha256sum -c SHA256SUMS.txt                               # check the downloads 
 ## Releases
 
 1. Bump `FW_VERSION` in `include/version.h` and commit.
-2. Tag exactly `v` + `FW_VERSION` (`git tag v0.8.1 && git push origin v0.8.1`). CI refuses a
-   tag that differs, before building.
+2. Tag exactly `v` + `FW_VERSION` (`git tag v0.8.1 && git push origin v0.8.1`). The firmware job fails early on a
+   tag that differs, so nothing is published.
 3. CI (`.github/workflows/build.yml`) builds, packages, creates the GitHub Release (5 separate
    parts, the merged image, `flash_args.txt`, `SHA256SUMS.txt`, `LICENSE`, the notices and a
    licences zip) and deploys the flasher to GitHub Pages.
@@ -87,8 +89,8 @@ packages a preview (artifacts `release-dist`, `site`, `firmware-elf`, no release
 `python -I tools/release_layout.py --help` (flash offsets are derived from the build, never
 hard-coded; it asserts the part layout and writes `dist/`).
 
-Notes: the flasher serves the **latest** release, so a pre-release tag such as `v1.0.0-rc1`
-also becomes the flasher version. Supply chain: only `platformio==6.2.0` is pinned (its pip
+Notes: the flasher serves the **most recently tagged** release, so a pre-release tag such as `v1.0.0-rc1`
+also becomes the flasher version. Supply chain: of the pip packages only `platformio==6.2.0` is pinned (its
 dependencies are not hash-pinned) and tag builds download all packages fresh, with no cache.
 `--esptool` takes separate arguments and none may start with `-` (so not `python -m esptool`).
 
@@ -776,7 +778,7 @@ The generated files also need `-DLV_LVGL_H_INCLUDE_SIMPLE` (set in `platformio.i
 
 ## Library versions
 
-All versions are pinned exactly in `platformio.ini`.
+Libraries are pinned exactly in `platformio.ini`; CI tools are pinned in `.github/workflows/build.yml`.
 
 | Library | Version | Why this version |
 |---|---|---|
@@ -788,7 +790,7 @@ All versions are pinned exactly in `platformio.ini`.
 | `ESP32Async/AsyncTCP` | 3.5.0 | TCP layer of the web server; maintained fork, core 2.x compatible |
 | `ESP32Async/ESPAsyncWebServer` | 3.12.1 | Web server (middleware, static files); maintained fork, core 2.x compatible. PlatformIO prints "Ignored `Hash` dependency": that dependency is for ESP8266 only |
 | `throwtheswitch/Unity` | 2.6.1 | Host test framework (native env); pinned to the version PlatformIO resolved |
-| PlatformIO Core (CI only) | 6.2.0 | `pip install platformio==6.2.0` in CI, same as local |
+| PlatformIO Core in CI | 6.2.0 | `pip install platformio==6.2.0` in CI, same as local |
 | ESP Web Tools (flasher site, CI only) | 10.4.0 | Apache-2.0; vendored at build time from the npm tarball, `sha512-3pwkeFFm5Fj7UQo8SJNYK5RXrtNCpq6X9QoI6bMT4GBZWgrJqjn0YvM9ihG74BtMoSFYXfmDtkehuxe50PTMPQ==` checked in CI (mismatch fails), not committed |
 | GitHub Actions | pinned to full commit SHAs | each `uses:` has a `# vX.Y.Z` comment; Dependabot (monthly) proposes updates |
 | `lv_font_conv` (npx, font generation only) | 1.5.3 | See Fonts; source fonts from LVGL 9.2.2's `scripts/built_in_font/` |
@@ -809,7 +811,7 @@ own WebSocket client replaces it (no new library).
 Licences: HA Knob is MIT (`LICENSE`). Third-party licences, checked against the library
 sources and the linker map, and the required notices are in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); the full licence texts (verbatim copies,
-sources listed in the notices) are in `licenses/`. Releases and the flasher site ship
+except `FreeBSD-net80211-BSD-2-Clause.txt`, standard wording; sources listed in the notices) are in `licenses/`. Releases and the flasher site ship
 `LICENSE`, the notices and `licenses/`.
 - Files not covered by `LICENSE`: `src/ui/fonts/*.c` (SIL OFL 1.1) and `include/lv_conf.h`
   (MIT, LVGL Kft, derived from `lv_conf_template.h`).
@@ -862,7 +864,7 @@ tools/            serial_check.py, gen_fonts.sh, release_layout.py (release pack
 .github/          workflows/build.yml (CI, release, Pages), dependabot.yml
 web-flasher/      flasher page template (index.html, flasher.css); ESP Web Tools is added by CI
 docs/             DESIGN-NOTES.md (per-step design decisions and measurements)
-licenses/         third-party licence texts (verbatim; see THIRD_PARTY_NOTICES.md), esp-web-tools/ for the flasher
+licenses/         third-party licence texts (verbatim except one, see THIRD_PARTY_NOTICES.md), esp-web-tools/ for the flasher
 ```
 
 ## Security
