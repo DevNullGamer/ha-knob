@@ -1162,3 +1162,60 @@ Spec: `plan-step8.md` §3.4, §3.5, §4 Step 8.5 (Q8-10, Q8-11).
   section.
 - Build (8.4 + 8.5): normal RAM 55364 bytes (16.9 %), flash 1844209 bytes (28.4 %, +1484 B);
   test build RAM 55396, flash 1845713.
+
+## Step 8.7: factory reset gesture (2026-10-18)
+
+Spec: `plan-step8.md` §3.5, §4 Step 8.7 (Q8-12..Q8-14).
+
+- **Arming (Q8-13, Auditor carry-over from 8.2).** `ButtonFsm` starts with
+  `stableDown_ = false`, so `isDown()` reads false for the first 30 ms of polling even while
+  the knob is physically held; `observeButton(isDown())` would arm on the first pass and a
+  hold that began right after the strap sample could open the confirmation 10 s later.
+  `hal::button::releaseSeen()` instead is set (sticky) only when `poll()` has seen the raw
+  level up on consecutive polls spanning >= `kDebounceMs` (the same 30 ms as the FSM's
+  debounce), i.e. a genuine debounced release. `app::reset::loop` passes
+  `observeButton(!releaseSeen())`. A knob held from boot therefore never arms until it is
+  released; `TIN verylong` in tests arms normally (the physical button is up).
+  `releaseSeen()` is sample-based: it needs two `poll()` samples with the raw level up
+  (and none down in between) at least 30 ms apart, so it depends on the loop polling
+  (5 ms delay per pass), not on an edge interrupt.
+  `ResetConfirm`'s API is unchanged.
+- `src/app/Reset` (`app::reset`): owns the `ResetConfirm`; `button` returns true when the
+  confirmation captured the event (open / confirmed before the call) or the event opened it.
+  On open: `ui::selectCancel("reset")` (new reason, logged as `UI select cancel
+  reason=reset`), the 300 ms beep if `device.buzzer` (`setBeep`, set in `applyControls`),
+  `RST open`, `ui::showResetConfirm(10)`. `loop`: arming, `tick()` (before `secondsLeft()`),
+  countdown. `takeConfirmed()` is true once after `RST confirm`. `button` / `rotate` /
+  `swipe` run the timeout (`tick`) first (Auditor round 2): a short press in the same pass
+  as, or after, the deadline finds the confirmation cancelled (`RST cancel reason=timeout`)
+  and never confirms. Parent decision: input aimed at the reset screen never reaches a
+  control. A button gesture is "taken" when one of its events found the confirmation open
+  or confirmed, opened it, or triggered the expiry; its remaining events up to its release
+  (`ShortPress` / `Released`) return true from `app::reset::button` (swallowed: no Select,
+  no control press), also after a cancel (rotate / swipe / timeout in a later pass, e.g. a
+  press begun at 9.9 s and released after the timeout). A detent batch / swipe that
+  triggered the expiry is swallowed too: `main` checks `captures()` before calling
+  `rotate` / `swipe` and returns afterwards. Input after an expiry that `loop` already
+  handled in an earlier pass is routed normally. The `Pressed` click still sounds (it
+  comes before the reset in the routing order).
+- `main` routing per §3.5: encoder: idle gate, then `reset::rotate` while it captures (no
+  click); button: idle gate, press click, `reset::button`, then 7.x routing (a not-armed
+  very long press logs `RST ignored reason=not_armed` and still shows "very long press" on
+  Status); swipe: idle gate, `reset::swipe` while it captures. Each pass after the inputs:
+  `reset::loop`, then on `takeConfirmed()` `ui::showResetting()` and `pendingSystem =
+  FactoryReset` 750 ms later with `src=button` (a pending web reboot is upgraded to the
+  reset; a pending web reset keeps its time and `src=web`). The reset works without a
+  display too (the `ui::` calls do nothing before `ui::begin`).
+- Keep awake: while `captures()` (confirming or "Resetting..."), `app::idle::keepAwake(Reset)`
+  every pass after the toast; `keepAwake` logs only on an actual wake (new source name
+  `reset`), so nothing is logged per pass. The open itself always happens with the screen
+  On (a wake swallows the gesture, Q8-3).
+- `ui`: precedence boot > reset > setup > Select > pages (`targetScreen`); `canNavigate()` is
+  false while the confirmation is shown. `showResetConfirm(n)` sets the countdown label only
+  when `n` changes (and resets the screen to the question when it opens);
+  `showResetting()` hides the lines and countdown and centres "Resetting..." in the red
+  title; `hideResetConfirm()` returns to the screen below. `ResetScreen`: title font 28
+  (`0xE53935`) at y -90, lines font 20 at -40 / -10, countdown font 56 at +60.
+- Logs: `SYS factory reset src=<web|button>` (prefix unchanged).
+- Build: normal RAM 55436 bytes (16.9 %), flash 1846337 bytes (28.5 %, +2128 B over 8.5);
+  test build RAM 55460, flash 1847897.

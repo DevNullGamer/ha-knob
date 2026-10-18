@@ -9,6 +9,9 @@ namespace button {
 
 namespace {
 core::ButtonFsm fsm;
+bool upTracked = false;  // the raw level was up at the previous poll
+uint32_t upSinceMs = 0;  // since when the raw level is up
+bool released = false;   // releaseSeen()
 }  // namespace
 
 void begin() {
@@ -16,10 +19,21 @@ void begin() {
 }
 
 core::ButtonFsm::Event poll(uint32_t nowMs) {
-    return fsm.update(digitalRead(pins::kEncKey) == LOW, nowMs);
+    const bool rawDown = digitalRead(pins::kEncKey) == LOW;
+    if (rawDown) {
+        upTracked = false;
+    } else if (!upTracked) {
+        upTracked = true;
+        upSinceMs = nowMs;
+    } else if (!released && nowMs - upSinceMs >= core::ButtonFsm::kDebounceMs) {
+        released = true;
+    }
+    return fsm.update(rawDown, nowMs);
 }
 
 bool isDown() { return fsm.isDown(); }
+
+bool releaseSeen() { return released; }
 
 }  // namespace button
 }  // namespace hal

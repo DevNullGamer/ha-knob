@@ -30,9 +30,10 @@
 //   UI toast text=<t>                             a control notice (src/ui/Ui.h)
 //   CTL ...   control presses and notices (see src/app/Control.h)
 //   IDLE ... | DISP ...   screen wake / dim / off (see src/app/Idle.h)
+//   RST ...   factory-reset gesture (see src/app/Reset.h)
 //   TIN <cmd> | TIN bad <cmd>   test builds only (-DHAKNOB_TEST_INPUT): injected input
 //   BUZ ...   test builds only: buzzer requests (see src/hal/Buzzer.h)
-//   SYS reboot | SYS factory reset
+//   SYS reboot | SYS factory reset src=<web|button>
 
 #include <Arduino.h>
 #include <esp_heap_caps.h>
@@ -48,6 +49,7 @@
 
 #include "app/Control.h"
 #include "app/Idle.h"
+#include "app/Reset.h"
 #include "config/ConfigStore.h"
 #include "ha/HaClient.h"
 #include "hal/Button.h"
@@ -118,6 +120,7 @@ bool viewBuilt = false;
 core::presenter::ControlView shownControlView;
 net::web::SystemRequest pendingSystem = net::web::SystemRequest::None;
 uint32_t pendingSystemAtMs = 0;
+const char *pendingSystemSource = "web";  // SYS factory reset src=<web|button>
 
 void printBootLine() {
     util::logPrintf("BOOT fw=%s psram=%u flash=%u touch=%s heap=%u cfg=%s\n", FW_VERSION,
@@ -197,6 +200,7 @@ void applyControls(const core::config::Config &config) {
     encoderReverse = config.device.encoderReverse;
     buzzerEnabled = config.device.buzzer;
     detentClick = config.device.detentClick;
+    app::reset::setBeep(config.device.buzzer);
     app::control::applyConfig(config.device, config.controls);
     if (config.controls == controls && controlsGeneration != 0) {
         return;
@@ -387,11 +391,12 @@ void handleWebRequests(uint32_t nowMs) {
     if (request != net::web::SystemRequest::None && pendingSystem == net::web::SystemRequest::None) {
         pendingSystem = request;
         pendingSystemAtMs = nowMs + kSystemRequestDelayMs;
+        pendingSystemSource = "web";
     }
     if (pendingSystem != net::web::SystemRequest::None &&
         static_cast<int32_t>(nowMs - pendingSystemAtMs) >= 0) {
         if (pendingSystem == net::web::SystemRequest::FactoryReset) {
-            util::logPrintf("SYS factory reset\n");
+            util::logPrintf("SYS factory reset src=%s\n", pendingSystemSource);
             configStore.factoryReset();
         } else {
             util::logPrintf("SYS reboot\n");
@@ -408,8 +413,9 @@ int32_t testDelta = 0;  // detents injected by "TIN rot" since the last handleEn
 
 // The detents of this pass (one batch, plan-step7.md Q7-2): counted for the Status page
 // (also when they only wake the screen); then, unless they woke it (plan-step8.md §3.5),
-// they move the Select list while it is open (1 item per detent), else turn the selected
-// control page; only these two click (device.buzzer and device.detent_click).
+// they cancel the reset confirmation while it is shown, else move the Select list while it
+// is open (1 item per detent), else turn the selected control page; only the last two click
+// (device.buzzer and device.detent_click).
 void handleEncoder(uint32_t nowMs) {
     int32_t delta = hal::encoder::takeDelta();
 #if defined(HAKNOB_TEST_INPUT)
@@ -431,6 +437,10 @@ void handleEncoder(uint32_t nowMs) {
         ui::showEncoderCount(shownCount);
     }
     if (!app::idle::input(app::idle::Source::Encoder, nowMs)) {
+        return;
+    }
+    if (app::reset::captures()) {
+        app::reset::rotate(static_cast<int>(delta), nowMs);  // cancels; no click
         return;
     }
     if (!displayOk) {
@@ -465,6 +475,11 @@ void handleButtonEvent(core::ButtonFsm::Event event, uint32_t nowMs) {
     }
     if (event == Event::Pressed && buzzerEnabled) {
         hal::buzzer::beep(nowMs);
+    }
+    // The factory-reset gesture (plan-step8.md §3.5): the confirmation takes every button
+    // event while it is shown; a very long press that opens it goes nowhere else.
+    if (app::reset::button(event, nowMs)) {
+        return;
     }
 
     if (!displayOk) {
@@ -515,7 +530,14 @@ void handleSwipe(core::Swipe swipe, uint32_t nowMs) {
         return;
     }
     util::logPrintf("TOUCH swipe=%s\n", core::swipeName(swipe));
-    if (!app::idle::input(app::idle::Source::Swipe, nowMs) || !displayOk) {
+    if (!app::idle::input(app::idle::Source::Swipe, nowMs)) {
+        return;
+    }
+    if (app::reset::captures()) {
+        app::reset::swipe(nowMs);  // cancels; the page stays
+        return;
+    }
+    if (!displayOk) {
         return;
     }
     // Swipe left = next page, swipe right = previous page (wrapping); ignored while the
@@ -653,6 +675,20 @@ void loop() {
     handleEncoder(nowMs);
     handleButton(nowMs);
     handleTouch(nowMs);
+    // After the inputs: arming, the reset timeout and its countdown. A confirmed reset shows
+    // "Resetting..." and goes through the delayed factory-reset path in handleWebRequests().
+    app::reset::loop(nowMs);
+    if (app::reset::takeConfirmed()) {
+        if (displayOk) {
+            ui::showResetting();
+        }
+        // A pending web reboot becomes the reset; a pending web reset keeps its time.
+        if (pendingSystem != net::web::SystemRequest::FactoryReset) {
+            pendingSystem = net::web::SystemRequest::FactoryReset;
+            pendingSystemAtMs = nowMs + kSystemRequestDelayMs;  // also lets "Resetting..." render
+            pendingSystemSource = "button";
+        }
+    }
     hal::buzzer::loop(nowMs);
     net::wifi::loop(nowMs);
     handleWebRequests(nowMs);
@@ -662,6 +698,9 @@ void loop() {
     // After ha::loop() (its call results), before the view. A toast wakes the screen (Q8-9).
     if (app::control::loop(nowMs)) {
         app::idle::keepAwake(app::idle::Source::Toast, nowMs);
+    }
+    if (app::reset::captures()) {
+        app::idle::keepAwake(app::idle::Source::Reset, nowMs);  // logs only on a wake
     }
     // After every input, the config re-read and the toast, so a wake applies in this pass.
     if (displayOk) {

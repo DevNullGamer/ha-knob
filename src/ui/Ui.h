@@ -42,12 +42,20 @@ void begin(uint32_t nowMs);
 // (below). Also hides the toast after 3 s and closes the Select list after 8 s without input.
 void tick(uint32_t nowMs);
 
-// Screen precedence (highest first): boot, setup, Select list, pages. Step 8 adds its reset
-// confirmation between boot and setup.
+// Screen precedence (highest first): boot, reset confirmation, setup, Select list, pages.
+
+// Factory-reset confirmation (plan-step8.md Q8-12, driven by app::reset): shows the
+// confirmation with the seconds left (the label is set only when the number changes).
+// Ignored before begin().
+void showResetConfirm(uint32_t secondsLeft);
+// The confirmation's "Resetting..." state; stays until the reboot.
+void showResetting();
+// Leaves the confirmation (back to the screen below it). No-op when it is not shown.
+void hideResetConfirm();
 
 // Pages (plan-step6.md §3.7, Q6-1): a ring of the control pages (or the NoControls page
 // while there are none) followed by the Status page. Navigation is ignored while the boot
-// screen, the setup screen or the Select list is shown.
+// screen, the reset confirmation, the setup screen or the Select list is shown.
 //
 // Sets the number of controls. A control page stays selected while its index is still in
 // range (else the first page is), the Status page stays the Status page.
@@ -57,7 +65,7 @@ bool nextPage();
 bool previousPage();
 // Index of the selected control page; -1 for the Status and the NoControls page.
 int controlPage();
-// True while the pages take input (not the boot or the setup screen, no Select list);
+// True while the pages take input (not the boot, reset or setup screen, no Select list);
 // rotation and presses act on a control page only then.
 bool pagesActive();
 // True while the Status page is selected.
@@ -67,7 +75,7 @@ void showControl(const core::presenter::ControlView &view);
 
 // Select list (plan-step7.md Q7-9): the control titles plus "Status", the current page
 // selected. Logs `UI select open`, `UI select choose=<i>` (1-based control page),
-// `UI select status`, `UI select cancel reason=<long|idle|config|setup>`.
+// `UI select status`, `UI select cancel reason=<long|idle|config|setup|reset>`.
 //
 // Opens the list while the pages are active and there is at least one control; `titles`
 // has one entry per control (presenter::titleFor). False if it did not open.

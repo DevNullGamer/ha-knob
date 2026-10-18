@@ -12,12 +12,13 @@
 //
 // Serial lines:
 //   IDLE wake by=<encoder|swipe|button> consumed=1   an input woke the screen and was dropped
-//   IDLE wake by=<config|toast> consumed=0           a config save / toast woke the screen
+//   IDLE wake by=<config|toast|reset> consumed=0     a config save / toast / the reset
+//                                                    confirmation woke the screen
 //   DISP level=<on|dim|off> pct=<n>                  the panel setting applied (on a change)
 namespace app {
 namespace idle {
 
-enum class Source : uint8_t { Encoder, Swipe, Button, Config, Toast };
+enum class Source : uint8_t { Encoder, Swipe, Button, Config, Toast, Reset };
 
 // device.dim_after_s / off_after_s / brightness / dim_level; counts as activity. After
 // boot and every config re-read (loop() applies a brightness change).
@@ -31,7 +32,8 @@ bool input(Source source, uint32_t nowMs);
 // gesture that did).
 bool button(core::ButtonFsm::Event event, uint32_t nowMs);
 
-// Non-input activity (Config, Toast): wakes the screen, nothing is swallowed.
+// Non-input activity (Config, Toast, Reset): wakes the screen, nothing is swallowed. Logs
+// only when it woke the screen, so it may be called every pass (the reset confirmation).
 void keepAwake(Source source, uint32_t nowMs);
 
 // Every loop pass after the inputs, the config re-read and the toasts (so a wake applies

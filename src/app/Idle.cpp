@@ -22,6 +22,7 @@ const char *sourceName(Source source) {
         case Source::Button: return "button";
         case Source::Config: return "config";
         case Source::Toast: return "toast";
+        case Source::Reset: return "reset";
     }
     return "?";
 }

@@ -1,7 +1,5 @@
 # CLAUDE.md
 
-Guidance for AI assistants working in this repository.
-
 ## Project
 
 HA Knob: Home Assistant controller firmware for the LilyGo T-Encoder Pro (ESP32-S3R8,
@@ -39,7 +37,7 @@ line, not only on `BOOT`.
   Hardware glue lives in `src/`.
 - `test/native/test_*/`: Unity host tests. `test/embedded/` is reserved for on-device tests.
 - `src/main.cpp` is wiring only: it polls the HAL modules, logs, and forwards to `ui::`
-  and `src/app/*` (`app::control`, `app::idle`).
+  and `src/app/*` (`app::control`, `app::idle`, `app::reset`).
 - `src/hal/*`: one namespace per device (`hal::display`, `hal::touch`, `hal::encoder`,
   `hal::button`, `hal::buzzer`); single hardware instance each, state is file-local.
 - `src/ui/*`: `ui::` screen manager plus `ui/screens/*`. All LVGL calls happen on the main
@@ -64,7 +62,7 @@ line, not only on `BOOT`.
   main loop only. `src/net/WebServer` (`net::web`): ESPAsyncWebServer routes.
 - `lib/core/src/ha/`: `HaUrl` (the only URL parser; ConfigModel's `parseUrlEndpoint` is an
   alias of it), `HaProtocol` (message builders + classifier), `HaSession` (clock-injected
-  state machine over a `Transport` interface; fake in native tests). `src/ha/HaClient` (`ha::`) wires the session to `src/ha/WsTransport` (own
+  state machine over a `Transport`; fake in native tests). `src/ha/HaClient` (`ha::`) wires the session to `src/ha/WsTransport` (own
   WebSocket client on `WiFiClient`) and logs; main loop only, like all HA socket I/O. Never
   enable `coalesce_messages`. The token lives only in `ConfigStore` and the session.
 - `lib/core/src/ha/EntityAttrs` is the only attribute model (typed fields for exactly
@@ -72,8 +70,8 @@ line, not only on `BOOT`.
   `subscribe_entities` a/c/r events (max 64 entities). `parseMessage` always uses a filter
   and `NestingLimit(kMaxNesting = 20)`; use `kMaxNesting` for every HA parse.
   Long-lived core containers take an injected allocator (`util::StdAllocator` over
-  `ArduinoJson::Allocator*`, nullptr = heap; build elements with the container's
-  allocator); the session passes its allocator (PSRAM) to its `EntityStore`.
+  `ArduinoJson::Allocator*`, nullptr = heap; build elements with it); the session passes
+  its PSRAM allocator to its `EntityStore`.
 - `util/JsonScan`, `ha/EntityCatalog` (Step 6.3): the get_states result is scanned and
   built in budgeted slices (each `result` element parsed alone with a filter;
   `catalogToJson` is host only); never parse it whole with ArduinoJson.
@@ -88,7 +86,7 @@ line, not only on `BOOT`.
   CSRF (`application/json` + `X-HAKnob: 1`), body limit (16 KB), Basic auth check. Every
   request passes it in the server middleware. Never add CORS headers.
 - Web UI (`data/`): vanilla JS, no build step, DOM text via `textContent` only (no
-  `innerHTML`), no inline scripts or styles (the CSP forbids them). Clients always send
+  `innerHTML`), no inline scripts or styles (CSP). Clients always send
   whole config sections (section replace is literal), `ssid` in every `wifi` section, `url`,
   `ca_pem` and `tls_insecure` in every `ha` section (absent = reset to `""`/`false`), and
   the Wi-Fi password together with the SSID (`null` = open).
@@ -106,7 +104,8 @@ line, not only on `BOOT`.
   `begin(40000000)`. LVGL flush areas must be rounded to even x1/y1 and even width/height
   (done in an `LV_EVENT_INVALIDATE_AREA` handler).
 - **IO0 is the encoder push button and the BOOT strapping pin**: holding the knob during
-  reset enters download mode. Never use a hold-at-boot gesture for features.
+  reset enters download mode. No hold-at-boot gestures; the reset hold arms only
+  after `hal::button::releaseSeen()`, never `isDown()`.
 - **Never call `Serial.setDebugOutput(true)`, and never define `CONFIG_ASYNC_TCP_DEBUG` or
   `ASYNCWEBSERVER_LOG_DEBUG`**: they route library/ESP-IDF output into the USB serial
   without the `logPrintf` protection below (and blocking writes from the `async_tcp` task).
@@ -158,7 +157,7 @@ Binding rules distilled from the step history. Reasons, measurements and edge ca
   404; paths are compared with their full length (decoded NUL -> 404).
 - HA session: states, backoff and timeouts in DESIGN-NOTES "Step 5". `auth_failed` never
   reconnects by itself (only a new URL/token or `POST /api/ha/retry`).
-- HaSession (Step 6.4, DESIGN-NOTES "Step 6.4"): an id-set change while Subscribing/Ready
+- HaSession (DESIGN-NOTES "Step 6.4"): an id-set change while Subscribing/Ready
   unsubscribes + resubscribes on the same connection (stays Ready); only events of the
   active or pending subscribe id reach `entities()`. The get_states result is taken over
   via `Transport::retainText` (never parsed whole) and built in `tick()` slices;
@@ -169,7 +168,7 @@ Binding rules distilled from the step history. Reasons, measurements and edge ca
   `recv(MSG_PEEK | MSG_DONTWAIT)`. Messages are assembled in PSRAM (limit 4 MB, larger /
   binary ones dropped); messages > 256 KB are parsed envelope-only. Every read with data
   calls `onRxProgress`; mid-message silence for 15 s -> `rx_stalled`. `retainText` hands
-  over only the buffer being delivered to `onText` (detach, no copy, freed via the provider).
+  over only the buffer being delivered to `onText` (detached, no copy).
 - HaClient (Step 6.5): `main` passes the controls' unique entity ids on every
   `ha::configure`. get_states only via `ha::requestStates()`; the catalog JSON is built
   once into a `shared_ptr<const std::string>` (`ha::catalogJson()`, only while the fetch is
@@ -198,8 +197,9 @@ Binding rules distilled from the step history. Reasons, measurements and edge ca
   per loop-pass batch (`Acceleration::onDetents`).
 - HA-supplied text in logs only via `core::util::logSafe`. HB worst case 275 of 318
   chars (DESIGN-NOTES "Step 8.3"): recount before adding a field.
-- Every input passes `app::idle` first (false = only a wake: no action, no click); beeps
-  only via `hal::buzzer::beep` / `click` (never shorten).
+- Input passes `app::idle` first (false = wake only: no action, no click); while
+  `app::reset::captures()`, input goes only to `app::reset`. Beeps only via
+  `hal::buzzer::beep` / `click` (never shorten).
 - `-DHAKNOB_TEST_INPUT` (env `t-encoder-pro-test`) only: `TIN` input, `BUZ` log, all in
   `#if`; `xtensa-esp32s3-elf-strings firmware.elf | grep -c 'TIN '` / `'BUZ ms='`: 0 normally.
 

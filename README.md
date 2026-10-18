@@ -130,15 +130,15 @@ ENC d=<+1|-1> count=<n>                  one line per detent, clockwise = +1 (-1
 BTN down                                 debounced press (the buzzer clicks if device.buzzer, unless the press only wakes the screen)
 BTN up + BTN short                       release before 600 ms
 BTN long                                 held 600 ms (fired while held; no "short" after it)
-BTN verylong                             held 10 s
+BTN verylong                             held 10 s (opens the factory-reset confirmation)
 BTN up                                   release after long / verylong
 TOUCH swipe=<left|right>                 horizontal swipe (taps are ignored)
 IDLE wake by=<encoder|swipe|button> consumed=1   an input woke the dimmed / dark screen and did nothing else
-IDLE wake by=<config|toast> consumed=0   a config save or a notice woke the screen
+IDLE wake by=<config|toast|reset> consumed=0   a config save, a notice or the reset confirmation woke the screen
 DISP level=<on|dim|off> pct=<n>          screen level / brightness applied (on a change, and once at boot)
 UI page=<i>/<n> | no_controls | status   page shown after a swipe, the Select list, or a long press without controls
 UI select open | choose=<i> | status     Select list opened / control page i or Status chosen
-UI select cancel reason=<long|idle|config|setup>   Select list closed without a change
+UI select cancel reason=<long|idle|config|setup|reset>   Select list closed without a change
 UI view page=<i>/<n> value=<v><unit> state=<text> arc=<v>[<min>,<max>]|- dimmed=<0|1> unconfirmed=<0|1> title=<t> banner=<0|1>   the shown control page changed (unconfirmed=1: a turned value HA has not confirmed yet; banner=1: HA not connected, state = the reason)
 UI toast text=<t>                        a control notice shown to the user for 3 s
 CTL press page=<i> press=<press>         short press on control page i
@@ -148,6 +148,10 @@ HA call ok id=<n> ms=<rtt> | HA call failed id=<n> error=<code>: <message> | HA 
 HA calls dropped n=<k> reason=connection_lost   unanswered calls when the connection ended
 TIN <cmd> | TIN bad <cmd>                test build only (see Test input)
 BUZ ms=<n> started=<0|1>                 test build only (see Test input)
+RST open                                 factory-reset confirmation shown (very long press)
+RST cancel reason=<rotate|swipe|timeout> confirmation closed, nothing erased
+RST ignored reason=not_armed             very long press before the button was first seen released
+RST confirm                              confirmed by a short press (then SYS factory reset src=button)
 HB up=<s> psram=<bytes> flash=<bytes> touch=<..> count=<n> ctl=<controls> cfg=<defaults|loaded> wifi=<off|ap|sta|ap_sta> ip=<ip> ha=<state> heap=<bytes> heap_min=<bytes> loopmax=<ms> ent=<n>/<ids> cat=<state> stack=<bytes> psram_free=<bytes> disp=<on|dim|off>   every 5 s
 WIFI ap ssid=<HA-Knob-XXXX> ip=192.168.4.1   setup access point up
 WIFI ap off                              setup access point shut down
@@ -194,7 +198,7 @@ HA catalog failed error=<e>              states_too_large / states_no_memory / s
 HA state=<state>[ ha_version=<v>][ error=<error>][ retry_in_ms=<ms>]   every state change
 HA retry                                 web UI Retry accepted
 WEB entities refresh requested           POST /api/ha/entities/refresh accepted
-SYS reboot | SYS factory reset           performed by the main loop just after the response
+SYS reboot | SYS factory reset src=<web|button>   performed by the main loop 750 ms after the request / confirmation
 ```
 
 A failed TLS connect is also accompanied by one to three core lines such as
@@ -572,6 +576,7 @@ station is not connected.
 | Long press | Opens the Select list; without controls: toggles the No controls / Status page |
 | Rotation | Control page: changes the value (see Control); Status page: the encoder count |
 | Short press | Control page: the control's press action (see Control) |
+| Very long press (10 s) | Factory-reset confirmation (see Factory reset), on every screen |
 | Tap | Never does anything |
 
 **Select list** (long press): the control titles plus "Status", the current page selected.
@@ -654,9 +659,26 @@ Presses: `toggle` = `<domain>.toggle` (climate: `turn_on` when off, else `turn_o
 | Input | Rule |
 |---|---|
 | Encoder | One count per detent, counted on arrival at a rest state (00/11); bounce, half-turns back and invalid jumps never count |
-| Button | 30 ms debounce; short press < 600 ms (on release); long press at 600 ms (once, while held); very long press at 10 s |
+| Button | 30 ms debounce; short press < 600 ms (on release); long press at 600 ms (once, while held); very long press at 10 s (factory reset, only after the button was seen released once since boot) |
 | Swipe | Horizontal travel >= 80 px, finger down for <= 700 ms, and \|dx\| >= 2 x \|dy\| |
 | Acceleration (`device.accel`) | Detents < 40 ms apart x4, < 80 ms x2, else x1 (per loop-pass batch) |
+
+## Factory reset
+
+Hold the knob for 10 s **while the device is running**; holding it during power-on or reset
+enters download mode instead (IO0 is the BOOT strapping pin, see Hardware notes). The Select
+list appears at 0.6 s (it closes again), then the confirmation screen at 10 s with a 300 ms
+beep (if `device.buzzer`): "Factory reset?", "Press to erase all settings", "Turn to cancel"
+and a 10 s countdown. Releasing the knob does nothing; a short press confirms ("Resetting...",
+then the reset and a reboot 750 ms later); turning, a swipe or the 10 s timeout cancel and
+return to the previous screen. A long press while it is shown is ignored. The confirmation
+works on every screen (also Setup, Status and Select) and keeps the screen awake; on a
+dimmed or dark screen the hold only wakes it, so hold again.
+
+The gesture only counts after the button has been seen released (30 ms up) once since boot,
+so a knob held since reset never opens it. The reset is the same as `POST
+/api/factory-reset`: the config and every secret are erased except the setup AP password
+(`ap_pw`), and the device restarts in setup mode.
 
 ## Fonts
 
@@ -737,13 +759,13 @@ Licences:
 partitions.csv    flash layout (NVS 64 KB, OTA app0/app1, LittleFS, coredump)
 include/          board_pins.h (GPIO map), lv_conf.h (LVGL config), version.h
 src/main.cpp      setup()/loop() wiring only
-src/app/          Control (turns / presses -> HA calls, notices), Idle (screen dim / off, wake gate)
+src/app/          Control (turns / presses -> HA calls, notices), Idle (screen dim / off, wake gate), Reset (factory-reset gesture)
 src/hal/          Display, Touch, Encoder, Button, Buzzer, PsramAllocator (hardware glue)
 src/config/       ConfigStore (NVS persistence, mutex)
 src/util/         Log.h (non-blocking serial logging)
 src/net/          WifiManager (STA, setup AP, captive DNS, mDNS), WebServer (REST API, static files)
 src/ha/           HaClient (HaSession wiring, logging), WsTransport (WebSocket client on WiFiClient / WiFiClientSecure)
-src/ui/           Ui (screen manager, pages, toast), Widgets, screens/ (Boot, Setup, Status, Control, NoControls, Select), fonts/ (generated)
+src/ui/           Ui (screen manager, pages, toast), Widgets, screens/ (Boot, Setup, Status, Control, NoControls, Select, Reset), fonts/ (generated)
 data/             web UI (index.html, app.js, style.css), flashed with uploadfs
 lib/core/         pure C++17 logic, no Arduino/ESP headers, unit-tested on the host
   src/config/     ConfigModel (schema, JSON, validation, redaction, patch merge)

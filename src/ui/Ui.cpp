@@ -10,6 +10,7 @@
 #include "ui/screens/BootScreen.h"
 #include "ui/screens/ControlScreen.h"
 #include "ui/screens/NoControlsScreen.h"
+#include "ui/screens/ResetScreen.h"
 #include "ui/screens/SelectScreen.h"
 #include "ui/screens/SetupScreen.h"
 #include "ui/screens/StatusScreen.h"
@@ -42,6 +43,7 @@ lv_obj_t *setupScr = nullptr;
 lv_obj_t *controlScr = nullptr;
 lv_obj_t *noControlsScr = nullptr;
 lv_obj_t *selectScr = nullptr;
+lv_obj_t *resetScr = nullptr;
 lv_obj_t *toastLabel = nullptr;  // on lv_layer_top(), over every screen
 bool toastVisible = false;
 uint32_t toastStartMs = 0;
@@ -50,13 +52,16 @@ bool begun = false;            // begin() ran
 bool booting = false;
 uint32_t bootStartMs = 0;
 bool wantSetup = false;
+bool wantReset = false;          // the factory-reset confirmation is shown
+uint32_t shownResetSeconds = 0;  // its countdown label (0 = not set since it opened)
 
 core::ui::PageRing pages;     // the selected page
 core::ui::SelectModel select;  // the Select list (its last item is "Status")
 
-// The screen to show after boot, by precedence: setup, Select list, the selected page.
-// (Step 8 puts its reset confirmation first.)
+// The screen to show after boot, by precedence: reset confirmation, setup, Select list,
+// the selected page.
 lv_obj_t *targetScreen() {
+    if (wantReset) return resetScr;
     if (wantSetup) return setupScr;
     if (select.isOpen()) return selectScr;
     if (pages.onStatus()) return statusScr;
@@ -64,7 +69,7 @@ lv_obj_t *targetScreen() {
 }
 
 // The pages are shown and take navigation (nothing of higher precedence is shown).
-bool canNavigate() { return !booting && !wantSetup && !select.isOpen(); }
+bool canNavigate() { return !booting && !wantReset && !wantSetup && !select.isOpen(); }
 
 lv_obj_t *createToast() {
     lv_obj_t *label = lv_label_create(lv_layer_top());
@@ -96,6 +101,7 @@ void begin(uint32_t nowMs) {
     controlScr = controlScreen::create();
     noControlsScr = noControlsScreen::create();
     selectScr = selectScreen::create();
+    resetScr = resetScreen::create();
     toastLabel = createToast();
     lv_obj_t *defaultScr = lv_screen_active();  // empty screen made by lv_display_create()
     lv_screen_load(bootScr);
@@ -206,6 +212,31 @@ void selectCancel(const char *reason) {
     select.close();
     util::logPrintf("UI select cancel reason=%s\n", reason);
 }
+
+void showResetConfirm(uint32_t secondsLeft) {
+    if (!begun) {
+        return;
+    }
+    if (!wantReset) {
+        wantReset = true;
+        shownResetSeconds = 0;
+        resetScreen::showQuestion();
+    }
+    if (secondsLeft != shownResetSeconds) {
+        shownResetSeconds = secondsLeft;
+        resetScreen::setSecondsLeft(secondsLeft);
+    }
+}
+
+void showResetting() {
+    if (!begun) {
+        return;
+    }
+    wantReset = true;
+    resetScreen::showResetting();
+}
+
+void hideResetConfirm() { wantReset = false; }
 
 void showToast(const std::string &text, uint32_t nowMs) {
     if (!begun) {
